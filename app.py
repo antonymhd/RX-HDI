@@ -1,70 +1,85 @@
 import streamlit as st
 import pandas as pd
 
-# Konfigurasi Halaman Web
+# 1. Konfigurasi Halaman Web
 st.set_page_config(
     page_title="Warehouse 2D Racking System",
     page_icon="📦",
     layout="wide"
 )
 
-# Custom Styling CSS Tingkat Lanjut untuk Pewarnaan & Ukuran Font Button
+# 2. Custom CSS untuk Membuat Grid Kotak Presisi Berwarna Solid (Persis Excel/WMS)
 st.markdown("""
 <style>
-    /* Mengatur ukuran & font tombol grid */
-    div[data-testid="stPopover"] > button {
-        width: 100% !important;
-        height: 40px !important;
-        font-weight: 800 !important;
-        font-size: 11px !important;
-        padding: 0px !important;
-        border-radius: 6px !important;
-        border: 1px solid #444 !important;
-        margin: 0px !important;
+    /* Styling Container Grid Utama */
+    .block-container {
+        padding-top: 1.5rem !important;
+        padding-bottom: 2rem !important;
     }
     
-    /* Sembunyikan ikon panah kecil bawaan popover */
-    div[data-testid="stPopover"] span[data-testid="stIcon"] {
-        display: none !important;
+    /* Custom Styling Tombol Rak Matriks */
+    div.stButton > button {
+        width: 100% !important;
+        height: 42px !important;
+        font-size: 15px !important;
+        font-weight: 900 !important;
+        border-radius: 4px !important;
+        padding: 0px !important;
+        margin: 0px !important;
+        border: 1px solid #1e293b !important;
+        display: flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        transition: transform 0.1s ease;
+    }
+    div.stButton > button:hover {
+        transform: scale(1.08);
+        border: 2px solid #ffffff !important;
+        z-index: 10;
     }
 
-    /* Warna Tombol Berdasarkan Status Class Custom */
-    .btn-critical div[data-testid="stPopover"] > button {
-        background-color: #d90429 !important;
-        color: #ffffff !important;
-    }
-    .btn-warning div[data-testid="stPopover"] > button {
-        background-color: #ffb703 !important;
+    /* Warna Background Solid Berdasarkan Indikator Status Rak */
+    /* OK (1-2 SKU) -> Hijau Soft */
+    .btn-ok div.stButton > button {
+        background-color: #22c55e !important;
         color: #000000 !important;
     }
-    .btn-ok div[data-testid="stPopover"] > button {
-        background-color: #2a9d8f !important;
+    /* WARNING (3 SKU) -> Kuning Oranye */
+    .btn-warning div.stButton > button {
+        background-color: #f59e0b !important;
+        color: #000000 !important;
+    }
+    /* CRITICAL (>=4 SKU) -> Merah Menyala */
+    .btn-critical div.stButton > button {
+        background-color: #ef4444 !important;
         color: #ffffff !important;
     }
-    .btn-empty div[data-testid="stPopover"] > button {
-        background-color: #4a5568 !important;
-        color: #e2e8f0 !important;
+    /* EMPTY (0 SKU) -> Abu-abu */
+    .btn-empty div.stButton > button {
+        background-color: #e2e8f0 !important;
+        color: #64748b !important;
     }
-    .btn-match div[data-testid="stPopover"] > button {
+    /* MATCH (Hasil Cari) -> Biru */
+    .btn-match div.stButton > button {
         background-color: #0284c7 !important;
         color: #ffffff !important;
     }
 
-    /* Memperbesar Font Angka Baris 1-28 di Bawah Matrix */
-    .baris-number {
-        font-size: 16px !important;
+    /* Header Angka Baris 1-28 di Bagian Bawah Grid */
+    .baris-header {
+        font-size: 15px !important;
         font-weight: bold !important;
         text-align: center !important;
-        color: #f8fafc !important;
-        margin-top: 8px !important;
+        color: #38bdf8 !important;
+        margin-top: 10px !important;
     }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("📦 Visualisasi Grid Racking Gudang (2D Matrix)")
-st.caption("Klik pada kotak koordinat rak untuk melihat detail slot pallet (1-44) dan produk di dalamnya.")
+st.caption("Setiap sel menampilkan jumlah variasi SKU/Barang. Klik kotak mana saja untuk membuka rincian slot pallet.")
 
-# Function Load Data Excel
+# 3. Load Data Master Excel
 @st.cache_data(ttl=60)
 def load_data():
     file_path = "Racking Pallet Pivoted.xlsx" 
@@ -75,18 +90,18 @@ def load_data():
 try:
     df = load_data()
 except Exception as e:
-    st.error(f"⚠️ Gagal memuat data master. Pastikan file Excel tersedia! Error: {e}")
+    st.error(f"⚠️ Gagal memuat data master. Pastikan file Excel tersedia di repository! Error: {e}")
     st.stop()
 
 # Deteksi otomatis nama kolom produk
 product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 
-# Filter & Search Sidebar
+# 4. Sidebar Filter & Legenda
 st.sidebar.header("🔍 Pencarian & Filter")
 search_query = st.sidebar.text_input("Cari Nama Barang / Part Number:", "").strip()
 
 st.sidebar.divider()
-st.sidebar.header("🎨 Indikator Warna Status")
+st.sidebar.header("🎨 Indikator Warna & Pallet")
 st.sidebar.markdown("""
 - 🟢 **Hijau (1–2 SKU):** Ideal / Sesuai SOP
 - 🟡 **Kuning (3 SKU):** Warning / Perlu Diatur
@@ -96,7 +111,7 @@ st.sidebar.markdown("""
 - ❌ **Merah Silang:** Area Tidak Ada Rak
 """)
 
-# Fungsi untuk memeriksa apakah rak tersedia secara fisik
+# 5. Cek Ketersediaan Rak Fisik (Sesuai Layout Gudang Real)
 def is_rack_exist(kolom, baris):
     if kolom == 'F' and baris < 5:
         return False
@@ -104,7 +119,7 @@ def is_rack_exist(kolom, baris):
         return False
     return True
 
-# Menghitung Ringkasan Matriks Gudang
+# 6. Pemrosesan Data Matriks
 def process_matrix_data(df, search_term, prod_col):
     kolom_list = ['G', 'F', 'E', 'D', 'C', 'B', 'A']
     baris_list = list(range(1, 29))
@@ -127,7 +142,6 @@ def process_matrix_data(df, search_term, prod_col):
             empty_slots = len(sub) - filled
             usable_space = 0 if empty_slots <= 1 else empty_slots
             
-            # Match search
             is_match = False
             if search_term and prod_col in sub.columns:
                 is_match = sub[prod_col].astype(str).str.contains(search_term, case=False, na=False).any() or \
@@ -152,7 +166,29 @@ def process_matrix_data(df, search_term, prod_col):
 
 matrix_info, total_critical, total_kosong, kolom_list, baris_list = process_matrix_data(df, search_query, product_col)
 
-# Metric Summary Cards
+# 7. Modal Pop-up Dialog untuk Menampilkan Detail Saat Sel Diklik
+@st.dialog("📦 Rincian Detail Rak", width="large")
+def show_rack_detail(k, b, info):
+    st.subheader(f"📍 Lokasi Racking: {k} - Baris {b}")
+    col_a, col_b, col_c = st.columns(3)
+    col_a.metric("Jumlah Variasi SKU", f"{info['sku_cnt']} SKU")
+    col_b.metric("Pallet Terisi", f"{info['filled']} / 44 Slot")
+    col_c.metric("Space Kosong", f"{info['usable_space']} Slot")
+    st.divider()
+    
+    if info['sku_cnt'] > 0:
+        st.write("### 📋 Ringkasan Produk & Jumlah Pallet:")
+        rekap = info['df_sub'][product_col].value_counts().reset_index()
+        rekap.columns = ['Nama Produk', 'Jumlah Pallet']
+        st.dataframe(rekap, use_container_width=True, hide_index=True)
+        
+        with st.expander("🔍 Detail Seluruh Slot Pallet (1–44)"):
+            available_cols = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'No Lot', product_col, 'Status'] if c in info['df_sub'].columns]
+            st.dataframe(info['df_sub'][available_cols], use_container_width=True, hide_index=True)
+    else:
+        st.success("✅ Baris ini 100% KOSONG. Siap digunakan untuk lokasi penempatan Inbound!")
+
+# 8. Metric Cards Dashboard Upper Section
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
 col_m1.metric("Total Baris Racking Aktif", "156 Baris")
 col_m2.metric("Baris Status Kritis (≥4 SKU)", f"{total_critical} Baris", delta_color="inverse")
@@ -161,66 +197,48 @@ col_m4.metric("Ketersediaan Space", "Siap Inbound" if total_kosong > 0 else "Pen
 
 st.divider()
 
-# Render Grid Matriks 2D (Kolom G-A vs Baris 1-28)
+# 9. Render Grid Matriks 2D (G-A x 1-28) dengan Warna Solid Presisi
 for k in kolom_list:
     cols = st.columns([0.6] + [1] * 28)
-    cols[0].markdown(f"### **{k}**") # Label Kolom Racking G-A
+    cols[0].markdown(f"### **{k}**") # Label Kolom Rak G - A
     
     for idx, b in enumerate(baris_list):
         info = matrix_info[(k, b)]
         
-        # Area yang tidak ada rak fisiknya
+        # Sembunyikan area yang tidak ada raknya secara fisik
         if not info['exist']:
-            cols[idx + 1].markdown("<h4 style='text-align: center; color: #ef4444; margin:0;'>❌</h4>", unsafe_allow_html=True)
+            cols[idx + 1].markdown("<div style='text-align:center; color:#ef4444; font-size:14px; font-weight:bold; margin-top:8px;'>❌</div>", unsafe_allow_html=True)
             continue
             
         sku_cnt = info['sku_cnt']
         is_match = info['is_match']
         
-        # Tentukan Teks & CSS Class Warna Tombol
+        # Tentukan Teks Label Angka & Class Warna Solid
         if is_match:
-            btn_label = f"{sku_cnt} SKU"
+            btn_text = f"{sku_cnt}"
             css_class = "btn-match"
         elif sku_cnt >= 4:
-            btn_label = f"{sku_cnt} SKU"
+            btn_text = f"{sku_cnt}"
             css_class = "btn-critical"
         elif sku_cnt == 3:
-            btn_label = f"3 SKU"
+            btn_text = f"3"
             css_class = "btn-warning"
         elif sku_cnt in [1, 2]:
-            btn_label = f"{sku_cnt} SKU"
+            btn_text = f"{sku_cnt}"
             css_class = "btn-ok"
         else:
-            btn_label = f"Kosong"
+            btn_text = "0"
             css_class = "btn-empty"
             
-        # Popover Detail saat Sel Diklik dengan Pembungkus Class CSS Warna
+        # Render Tombol Warna Solid Interaktif
         with cols[idx + 1]:
             st.markdown(f'<div class="{css_class}">', unsafe_allow_html=True)
-            with st.popover(btn_label, use_container_width=True):
-                st.subheader(f"📍 Location: Racking {k} - Baris {b}")
-                st.write(f"**Variasi SKU:** {sku_cnt} Jenis | **Terisi:** {info['filled']} Pallet | **Space Kosong:** {info['usable_space']} Slot")
-                st.divider()
-                
-                if sku_cnt > 0:
-                    st.write("**Ringkasan Barang di Baris Ini:**")
-                    rekap = info['df_sub'][product_col].value_counts().reset_index()
-                    rekap.columns = ['Nama Produk', 'Jumlah Pallet']
-                    st.dataframe(rekap, use_container_width=True, hide_index=True)
-                    
-                    with st.expander("📋 Rincian Slot Pallet (1–44)"):
-                        available_cols = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'No Lot', product_col, 'Status'] if c in info['df_sub'].columns]
-                        st.dataframe(
-                            info['df_sub'][available_cols],
-                            use_container_width=True,
-                            hide_index=True
-                        )
-                else:
-                    st.success("✅ Baris ini 100% KOSONG. Boleh digunakan untuk penempatan Inbound!")
+            if st.button(btn_text, key=f"btn_{k}_{b}"):
+                show_rack_detail(k, b, info)
             st.markdown('</div>', unsafe_allow_html=True)
 
-# Label Nomor Baris (1-28) di Bawah Grid dengan Font Diperbesar
+# 10. Header Angka Baris (1-28) di Bawah Grid
 cols_bottom = st.columns([0.6] + [1] * 28)
-cols_bottom[0].write("") # Spasi offset label kolom
+cols_bottom[0].write("")
 for idx, b in enumerate(baris_list):
-    cols_bottom[idx + 1].markdown(f'<div class="baris-number">{b}</div>', unsafe_allow_html=True)
+    cols_bottom[idx + 1].markdown(f'<div class="baris-header">{b}</div>', unsafe_allow_html=True)
