@@ -26,10 +26,12 @@ st.title("📦 Visualisasi Grid Racking Gudang (2D Matrix)")
 st.caption("Klik pada kotak koordinat rak untuk melihat detail slot pallet (1-44) dan produk di dalamnya.")
 
 # Function Load Data Excel
-@st.cache_data(ttl=60) # Cache direfresh setiap 60 detik
+@st.cache_data(ttl=60)
 def load_data():
-    file_path = "Racking Pallet Pivoted.xlsx" # Atau sesuaikan path file Excel Anda
+    file_path = "Racking Pallet Pivoted.xlsx" 
     df = pd.read_excel(file_path, sheet_name="Racking HDI")
+    # Bersihkan spasi tambahan pada nama kolom
+    df.columns = df.columns.astype(str).str.strip()
     return df
 
 try:
@@ -37,6 +39,9 @@ try:
 except Exception as e:
     st.error(f"⚠️ Gagal memuat data master. Pastikan file Excel tersedia! Error: {e}")
     st.stop()
+
+# Deteksi otomatis nama kolom produk ('Nama Produk' atau 'Nama Barang')
+product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 
 # Filter & Search Sidebar
 st.sidebar.header("🔍 Pencarian & Filter")
@@ -53,7 +58,7 @@ st.sidebar.markdown("""
 """)
 
 # Menghitung Ringkasan Matriks Gudang
-def process_matrix_data(df, search_term):
+def process_matrix_data(df, search_term, prod_col):
     kolom_list = ['G', 'F', 'E', 'D', 'C', 'B', 'A']
     baris_list = list(range(1, 29))
     
@@ -65,16 +70,16 @@ def process_matrix_data(df, search_term):
         for b in baris_list:
             sub = df[(df['Kolom'] == k) & (df['Baris'] == b)]
             
-            prods = sub['Nama Barang'].dropna().unique()
+            prods = sub[prod_col].dropna().unique() if prod_col in sub.columns else []
             sku_cnt = len(prods)
-            filled = sub['Part Number'].notna().sum()
+            filled = sub['Part Number'].notna().sum() if 'Part Number' in sub.columns else 0
             empty_slots = len(sub) - filled
             usable_space = 0 if empty_slots <= 1 else empty_slots
             
             # Match search
             is_match = False
-            if search_term:
-                is_match = sub['Nama Barang'].str.contains(search_term, case=False, na=False).any() or \
+            if search_term and prod_col in sub.columns:
+                is_match = sub[prod_col].astype(str).str.contains(search_term, case=False, na=False).any() or \
                            sub['Part Number'].astype(str).str.contains(search_term, case=False, na=False).any()
             
             if sku_cnt >= 4:
@@ -93,7 +98,7 @@ def process_matrix_data(df, search_term):
             
     return matrix_info, total_critical, total_kosong, kolom_list, baris_list
 
-matrix_info, total_critical, total_kosong, kolom_list, baris_list = process_matrix_data(df, search_query)
+matrix_info, total_critical, total_kosong, kolom_list, baris_list = process_matrix_data(df, search_query, product_col)
 
 # Metric Summary Cards
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
@@ -135,13 +140,15 @@ for k in kolom_list:
                 
                 if sku_cnt > 0:
                     st.write("**Ringkasan Barang di Baris Ini:**")
-                    rekap = info['df_sub']['Nama Barang'].value_counts().reset_index()
+                    rekap = info['df_sub'][product_col].value_counts().reset_index()
                     rekap.columns = ['Nama Produk', 'Jumlah Pallet']
                     st.dataframe(rekap, use_container_width=True, hide_index=True)
                     
                     with st.expander("📋 Rincian Slot Pallet (1–44)"):
+                        # Pilih kolom yang tersedia
+                        available_cols = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'No Lot', product_col, 'Status'] if c in info['df_sub'].columns]
                         st.dataframe(
-                            info['df_sub'][['Pallet Ke', 'Part Number', 'No Lot', 'Nama Barang', 'Status']],
+                            info['df_sub'][available_cols],
                             use_container_width=True,
                             hide_index=True
                         )
