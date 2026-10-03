@@ -23,7 +23,7 @@ def load_data():
 try:
     df = load_data()
 except Exception as e:
-    st.error(f"⚠️️ Gagal memuat data master! Error: {e}")
+    st.error(f"⚠ Gagal memuat data master! Error: {e}")
     st.stop()
 
 product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
@@ -48,12 +48,16 @@ def is_rack_exist(kolom, baris):
     if kolom == 'G' and baris < 17: return False
     return True
 
-# 5. Hitung Data Matriks
+# 5. Hitung Data Matriks & Kumpulkan Lokasi Spesifik
 def process_matrix_data(df, search_term, prod_col):
     kolom_list = ['G', 'F', 'E', 'D', 'C', 'B', 'A']
     baris_list = list(range(1, 29))
     matrix_info = {}
     total_critical = total_kosong = 0
+    
+    # List untuk menyimpan informasi bubble
+    lokasi_kritis = []
+    lokasi_kosong = []
     
     for k in kolom_list:
         for b in baris_list:
@@ -71,17 +75,21 @@ def process_matrix_data(df, search_term, prod_col):
                 is_match = sub[prod_col].astype(str).str.contains(search_term, case=False, na=False).any() or \
                            sub['Part Number'].astype(str).str.contains(search_term, case=False, na=False).any()
             
-            if sku >= 4: total_critical += 1
-            elif sku == 0: total_kosong += 1
+            if sku >= 4: 
+                total_critical += 1
+                lokasi_kritis.append(f"{k}{b}")
+            elif sku == 0: 
+                total_kosong += 1
+                lokasi_kosong.append(f"{k}{b}")
                 
             matrix_info[(k, b)] = {
                 'exist': True, 'sku_cnt': sku, 'filled': filled,
                 'usable_space': max(0, len(sub) - filled), 'prods': prods,
                 'df_sub': sub, 'is_match': is_match
             }
-    return matrix_info, total_critical, total_kosong, kolom_list, baris_list
+    return matrix_info, total_critical, total_kosong, kolom_list, baris_list, lokasi_kritis, lokasi_kosong
 
-matrix_info, total_critical, total_kosong, kolom_list, baris_list = process_matrix_data(df, search_query, product_col)
+matrix_info, total_critical, total_kosong, kolom_list, baris_list, lokasi_kritis, lokasi_kosong = process_matrix_data(df, search_query, product_col)
 
 # 6. Modal Pop-up (Dialog Detail)
 @st.dialog("📦 Rincian Detail Rak", width="large")
@@ -104,30 +112,38 @@ def show_rack_detail(k, b, info):
     else:
         st.success("✅ Baris ini KOSONG. Siap digunakan untuk Inbound!")
 
-# 7. Dashboard Metrics Atas
+# 7. Dashboard Metrics Atas (DENGAN FITUR BUBBLE TOOLTIP)
+teks_kritis = ", ".join(lokasi_kritis) if lokasi_kritis else "Semua baris aman."
+teks_kosong = ", ".join(lokasi_kosong) if lokasi_kosong else "Tidak ada yang 100% kosong."
+
 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-col_m1.metric("Total Baris Racking Aktif", "156 Baris")
-col_m2.metric("Baris Status Kritis (≥4 SKU)", f"{total_critical} Baris")
-col_m3.metric("Baris Kosong Total", f"{total_kosong} Baris")
-col_m4.metric("Ketersediaan Space", "Siap Inbound" if total_kosong > 0 else "Penuh")
+
+col_m1.metric("Total Baris Racking Aktif", "156 Baris", 
+              help="Total ketersediaan blok/baris rak fisik yang ada di dalam layout gudang saat ini.")
+
+col_m2.metric("Baris Status Kritis (≥4 SKU)", f"{total_critical} Baris", 
+              help=f"🚨 **Lokasi Rak Bercampur (Perlu Relokasi):**\n\n{teks_kritis}")
+
+col_m3.metric("Baris Kosong Total", f"{total_kosong} Baris", 
+              help=f"✅ **Lokasi Siap Pakai (Kosong 100%):**\n\n{teks_kosong}")
+
+col_m4.metric("Ketersediaan Space", "Siap Inbound" if total_kosong > 0 else "Penuh", 
+              help="Status keseluruhan gudang. 'Siap Inbound' jika masih ada baris yang kosong total.")
 
 st.divider()
 
 # =========================================================================
-# 8. SISTEM INJEKSI WARNA BARU (ANTI-GAGAL) & UKURAN IKON DIPERBESAR
+# 8. SISTEM INJEKSI WARNA BARU & UKURAN IKON DIPERBESAR
 # =========================================================================
-# CSS Umum untuk bentuk tombol (Persegi Besar)
 dynamic_css = """
-/* Perbesar ukuran layar grid utama */
 .block-container { max-width: 98% !important; }
 
-/* Mengatur bentuk tombol agar menjadi persegi besar (mirip font A-G) */
 div[class^="st-key-box_"] button {
     aspect-ratio: 1/1 !important;
     width: 100% !important;
-    min-width: 40px !important;    /* UKURAN DIPERBESAR */
-    min-height: 40px !important;   /* UKURAN DIPERBESAR */
-    font-size: 20px !important;    /* FONT DIPERBESAR SEUKURAN H3 */
+    min-width: 40px !important;
+    min-height: 40px !important;
+    font-size: 20px !important;
     font-weight: 900 !important;
     padding: 0px !important;
     margin: 0px !important;
@@ -142,24 +158,22 @@ div[class^="st-key-box_"] button:hover {
     border: 2px solid #000 !important;
     z-index: 10;
 }
-/* Penyelarasan Layout */
 div[data-testid="stColumn"] { padding-left: 0.2rem !important; padding-right: 0.2rem !important; }
 """
 
-# Menyuntikkan warna secara spesifik ke masing-masing "Kunci" kotak
+# Menyuntikkan warna secara spesifik ke masing-masing kotak
 for k in kolom_list:
     for b in baris_list:
         info = matrix_info.get((k, b))
         if not info or not info['exist']: continue
         
         sku = info['sku_cnt']
-        if info['is_match']: bg, txt = "#38bdf8", "#000000"       # Biru
-        elif sku >= 4: bg, txt = "#ef4444", "#ffffff"             # Merah
-        elif sku == 3: bg, txt = "#fde047", "#000000"             # Kuning
-        elif sku in [1, 2]: bg, txt = "#86efac", "#000000"        # Hijau
-        else: bg, txt = "#e2e8f0", "#94a3b8"                      # Abu-abu
+        if info['is_match']: bg, txt = "#38bdf8", "#000000"       
+        elif sku >= 4: bg, txt = "#ef4444", "#ffffff"             
+        elif sku == 3: bg, txt = "#fde047", "#000000"             
+        elif sku in [1, 2]: bg, txt = "#86efac", "#000000"        
+        else: bg, txt = "#e2e8f0", "#94a3b8"                      
         
-        # Injeksi kelas unik untuk setiap kotak! (Tidak akan meleset)
         dynamic_css += f"\n.st-key-box_{k}_{b} button {{ background-color: {bg} !important; color: {txt} !important; }}"
 
 st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
@@ -168,20 +182,17 @@ st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
 # 9. RENDER GRID (KOLOM & TOMBOL)
 # =========================================================================
 for k in kolom_list:
-    # Gap="small" agar kotak-kotak merapat dengan rapi
     cols = st.columns([0.6] + [1] * 28, gap="small")
-    cols[0].markdown(f"### **{k}**") # Huruf Rak
+    cols[0].markdown(f"### **{k}**") 
     
     for idx, b in enumerate(baris_list):
         info = matrix_info[(k, b)]
         
         if not info['exist']:
-            # Area Kosong Fisik
             cols[idx + 1].markdown("<div style='text-align:center; color:#ef4444; font-size:16px; margin-top:10px;'>❌</div>", unsafe_allow_html=True)
             continue
             
         with cols[idx + 1]:
-            # Membuat container dengan "key" unik yang terhubung langsung dengan CSS warna di atas
             with st.container(key=f"box_{k}_{b}"):
                 btn_text = f"{info['sku_cnt']}"
                 if st.button(btn_text, key=f"btn_{k}_{b}", use_container_width=True):
