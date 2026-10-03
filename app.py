@@ -8,24 +8,55 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom Styling CSS agar tombol berbentuk badge rapi & berwarna
+# Custom Styling CSS Tingkat Lanjut untuk Pewarnaan & Ukuran Font Button
 st.markdown("""
 <style>
-    /* Styling Tombol Popover Grid */
+    /* Mengatur ukuran & font tombol grid */
     div[data-testid="stPopover"] > button {
         width: 100% !important;
-        height: 42px !important;
-        font-weight: bold !important;
+        height: 40px !important;
+        font-weight: 800 !important;
         font-size: 11px !important;
         padding: 0px !important;
         border-radius: 6px !important;
-        border: 1px solid #d0d7de !important;
-        white-space: nowrap !important;
+        border: 1px solid #444 !important;
+        margin: 0px !important;
     }
     
-    /* Menghilangkan panah dropdown bawaan st.popover */
+    /* Sembunyikan ikon panah kecil bawaan popover */
     div[data-testid="stPopover"] span[data-testid="stIcon"] {
         display: none !important;
+    }
+
+    /* Warna Tombol Berdasarkan Status Class Custom */
+    .btn-critical div[data-testid="stPopover"] > button {
+        background-color: #d90429 !important;
+        color: #ffffff !important;
+    }
+    .btn-warning div[data-testid="stPopover"] > button {
+        background-color: #ffb703 !important;
+        color: #000000 !important;
+    }
+    .btn-ok div[data-testid="stPopover"] > button {
+        background-color: #2a9d8f !important;
+        color: #ffffff !important;
+    }
+    .btn-empty div[data-testid="stPopover"] > button {
+        background-color: #4a5568 !important;
+        color: #e2e8f0 !important;
+    }
+    .btn-match div[data-testid="stPopover"] > button {
+        background-color: #0284c7 !important;
+        color: #ffffff !important;
+    }
+
+    /* Memperbesar Font Angka Baris 1-28 di Bawah Matrix */
+    .baris-number {
+        font-size: 16px !important;
+        font-weight: bold !important;
+        text-align: center !important;
+        color: #f8fafc !important;
+        margin-top: 8px !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -62,7 +93,7 @@ st.sidebar.markdown("""
 - 🔴 **Merah (≥4 SKU):** Kritis / Produk Bercampur
 - ⚪ **Abu-Abu (0 SKU):** Baris Kosong Total
 - 🔵 **Biru:** Hasil Pencarian Produk
-- ⬛ **Satu Strip (-):** Area Tidak Ada Rak
+- ❌ **Merah Silang:** Area Tidak Ada Rak
 """)
 
 # Fungsi untuk memeriksa apakah rak tersedia secara fisik
@@ -140,26 +171,32 @@ for k in kolom_list:
         
         # Area yang tidak ada rak fisiknya
         if not info['exist']:
-            cols[idx + 1].caption("❌")
+            cols[idx + 1].markdown("<h4 style='text-align: center; color: #ef4444; margin:0;'>❌</h4>", unsafe_allow_html=True)
             continue
             
         sku_cnt = info['sku_cnt']
         is_match = info['is_match']
         
-        # Tentukan Teks & Indikator Warna Tombol
+        # Tentukan Teks & CSS Class Warna Tombol
         if is_match:
-            btn_label = f"🔵 {sku_cnt} SKU"
+            btn_label = f"{sku_cnt} SKU"
+            css_class = "btn-match"
         elif sku_cnt >= 4:
-            btn_label = f"🔴 {sku_cnt} SKU"
+            btn_label = f"{sku_cnt} SKU"
+            css_class = "btn-critical"
         elif sku_cnt == 3:
-            btn_label = f"🟡 3 SKU"
+            btn_label = f"3 SKU"
+            css_class = "btn-warning"
         elif sku_cnt in [1, 2]:
-            btn_label = f"🟢 {sku_cnt} SKU"
+            btn_label = f"{sku_cnt} SKU"
+            css_class = "btn-ok"
         else:
-            btn_label = f"⚪ Kosong"
+            btn_label = f"Kosong"
+            css_class = "btn-empty"
             
-        # Popover Detail saat Sel Diklik
+        # Popover Detail saat Sel Diklik dengan Pembungkus Class CSS Warna
         with cols[idx + 1]:
+            st.markdown(f'<div class="{css_class}">', unsafe_allow_html=True)
             with st.popover(btn_label, use_container_width=True):
                 st.subheader(f"📍 Location: Racking {k} - Baris {b}")
                 st.write(f"**Variasi SKU:** {sku_cnt} Jenis | **Terisi:** {info['filled']} Pallet | **Space Kosong:** {info['usable_space']} Slot")
@@ -180,8 +217,10 @@ for k in kolom_list:
                         )
                 else:
                     st.success("✅ Baris ini 100% KOSONG. Boleh digunakan untuk penempatan Inbound!")
+            st.markdown('</div>', unsafe_allow_html=True)
 
-# Label Nomor Baris (1-28) di Bawah Grid
+# Label Nomor Baris (1-28) di Bawah Grid dengan Font Diperbesar
 cols_bottom = st.columns([0.6] + [1] * 28)
+cols_bottom[0].write("") # Spasi offset label kolom
 for idx, b in enumerate(baris_list):
-    cols_bottom[idx + 1].caption(f"**{b}**")
+    cols_bottom[idx + 1].markdown(f'<div class="baris-number">{b}</div>', unsafe_allow_html=True)
