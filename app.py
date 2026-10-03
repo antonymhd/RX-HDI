@@ -116,7 +116,8 @@ def show_rack_detail(k, b, info):
 teks_kritis = ", ".join(lokasi_kritis) if lokasi_kritis else "Semua baris aman."
 teks_kosong = ", ".join(lokasi_kosong) if lokasi_kosong else "Tidak ada yang 100% kosong."
 
-col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+# Ubah dari 4 kolom menjadi 3 kolom
+col_m1, col_m2, col_m3 = st.columns(3)
 
 col_m1.metric("Total Baris Racking Aktif", "156 Baris", 
               help="Total ketersediaan blok/baris rak fisik yang ada di dalam layout gudang saat ini.")
@@ -126,9 +127,6 @@ col_m2.metric("Baris Status Kritis (≥4 SKU)", f"{total_critical} Baris",
 
 col_m3.metric("Baris Kosong Total", f"{total_kosong} Baris", 
               help=f"✅ **Lokasi Siap Pakai (Kosong 100%):**\n\n{teks_kosong}")
-
-col_m4.metric("Ketersediaan Space", "Siap Inbound" if total_kosong > 0 else "Penuh", 
-              help="Status keseluruhan gudang. 'Siap Inbound' jika masih ada baris yang kosong total.")
 
 st.divider()
 
