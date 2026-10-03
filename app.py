@@ -134,6 +134,44 @@ st.divider()
 # 8. SISTEM INJEKSI WARNA BARU & UKURAN IKON DIPERBESAR
 # =========================================================================
 dynamic_css = """
+/* ========================================================================= */
+/* TWEAK RESPONSIVE UNTUK MOBILE / HP (ANTI-BERANTAKAN)                      */
+/* ========================================================================= */
+
+/* Memaksa baris kolom untuk tetap menyamping dan bisa di-swipe ke kiri/kanan */
+div[data-testid="stHorizontalBlock"] {
+    flex-wrap: nowrap !important;
+    overflow-x: auto !important;
+    -webkit-overflow-scrolling: touch !important; /* Animasi scroll halus di iPhone/Android */
+    padding-bottom: 8px !important;
+}
+
+/* Mempercantik bentuk Scrollbar Horizontal */
+div[data-testid="stHorizontalBlock"]::-webkit-scrollbar {
+    height: 5px;
+}
+div[data-testid="stHorizontalBlock"]::-webkit-scrollbar-thumb {
+    background-color: #94a3b8;
+    border-radius: 10px;
+}
+
+/* Mencegah layar HP memaksa kotak-kotak turun ke bawah */
+@media (max-width: 768px) {
+    div[data-testid="stColumn"] {
+        flex: 0 0 auto !important; 
+        width: auto !important;
+        min-width: 44px !important; /* Mengunci lebar kotak agar tidak gepeng di HP */
+    }
+    
+    /* Menyesuaikan ukuran huruf Rak (A-G) di sebelah kiri saat di HP */
+    div[data-testid="stColumn"]:nth-child(1) {
+        min-width: 30px !important; 
+    }
+    div[data-testid="stColumn"]:nth-child(1) h3 {
+        font-size: 18px !important;
+        margin-top: 10px !important;
+    }
+}
 .block-container { max-width: 98% !important; }
 
 div[class^="st-key-box_"] button {
