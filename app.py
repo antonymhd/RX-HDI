@@ -1,17 +1,16 @@
 import streamlit as st
 import pandas as pd
-import json
 
 # 1. Konfigurasi Web
 st.set_page_config(
     page_title="Warehouse 2D Racking System",
     page_icon="📦",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
 st.title("📦 Visualisasi Grid Racking Gudang (2D Matrix)")
-st.caption("Tampilan layaknya Tabel Periodik. Akan mengecil otomatis agar muat di layar HP tanpa perlu scroll.")
+st.caption("Kotak berbentuk persegi mewakili jumlah SKU pallet. Geser ke kiri-kanan (di HP) untuk melihat area ujung rak.")
 
 # 2. Load Data Master
 @st.cache_data(ttl=60)
@@ -32,9 +31,10 @@ product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 # 3. Sidebar
 st.sidebar.header("🔍 Pencarian & Filter")
 search_query = st.sidebar.text_input("Cari Nama Barang / Part Number:", "").strip()
+
 st.sidebar.divider()
+st.sidebar.header("🎨 Indikator Warna")
 st.sidebar.markdown("""
-🎨 **Indikator Warna**
 - 🟢 **Hijau (1–2 SKU):** Aman / Ideal
 - 🟡 **Kuning (3 SKU):** Warning
 - 🔴 **Merah (≥4 SKU):** Kritis
@@ -89,7 +89,7 @@ def process_matrix_data(df, search_term, prod_col):
 
 matrix_info, total_critical, total_kosong, kolom_list, baris_list, lokasi_kritis, lokasi_kosong = process_matrix_data(df, search_query, product_col)
 
-# 6. Modal Pop-up
+# 6. Modal Pop-up (Dialog Detail)
 @st.dialog("📦 Rincian Detail Rak", width="large")
 def show_rack_detail(k, b, info):
     st.subheader(f"📍 Lokasi Racking: {k} - Baris {b}")
@@ -104,160 +104,122 @@ def show_rack_detail(k, b, info):
         rekap = info['df_sub'][product_col].value_counts().reset_index()
         rekap.columns = ['Nama Produk', 'Jumlah Pallet']
         st.dataframe(rekap, use_container_width=True, hide_index=True)
+        with st.expander("🔍 Lihat Detail Seluruh Slot (1-44)"):
+             avail = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'No Lot', product_col, 'Status'] if c in info['df_sub'].columns]
+             st.dataframe(info['df_sub'][avail], use_container_width=True, hide_index=True)
     else:
         st.success("✅ Baris ini KOSONG. Siap digunakan untuk Inbound!")
 
 # 7. Dashboard Metrics
-teks_kritis = ", ".join(lokasi_kritis) if lokasi_kritis else "Aman."
-teks_kosong = ", ".join(lokasi_kosong) if lokasi_kosong else "Tidak ada yang kosong."
+teks_kritis = ", ".join(lokasi_kritis) if lokasi_kritis else "Semua baris aman."
+teks_kosong = ", ".join(lokasi_kosong) if lokasi_kosong else "Tidak ada yang 100% kosong."
 
 col_m1, col_m2, col_m3 = st.columns(3)
 col_m1.metric("Total Baris Racking Aktif", "156 Baris")
-col_m2.metric("Baris Status Kritis", f"{total_critical} Baris", help=f"🚨 Kritis:\n{teks_kritis}")
-col_m3.metric("Baris Kosong Total", f"{total_kosong} Baris", help=f"✅ Kosong:\n{teks_kosong}")
+col_m2.metric("Baris Status Kritis", f"{total_critical} Baris", help=f"🚨 Kritis:\n\n{teks_kritis}")
+col_m3.metric("Baris Kosong Total", f"{total_kosong} Baris", help=f"✅ Kosong:\n\n{teks_kosong}")
 st.divider()
 
 # =========================================================================
-# 8. SISTEM TABEL PERIODIK DENGAN HORIZONTAL SCROLL (UNTUK HP)
+# 8. CSS KHUSUS (SCROLL HORIZONTAL DI HP & KOTAK PERSEGI)
 # =========================================================================
-st.markdown("""
-<style>
-/* Melebarkan layar penuh dan menghilangkan padding bawaan Streamlit yang berlebihan */
-.block-container { 
-    max-width: 100% !important; 
-    padding-top: 1rem !important; 
-    padding-left: 0.5rem !important; 
-    padding-right: 0.5rem !important;
+dynamic_css = """
+/* Lebar penuh */
+.block-container { max-width: 98% !important; padding-top: 1rem !important; }
+
+/* KUNCI SCROLL HORIZONTAL DI HP */
+/* Memaksa elemen baris (st.columns) agar tidak menumpuk ke bawah, tapi ke samping dan bisa digeser */
+div[data-testid="stHorizontalBlock"] {
+    flex-wrap: nowrap !important;
+    overflow-x: auto !important;
+    overflow-y: hidden !important;
+    -webkit-overflow-scrolling: touch !important;
+    padding-bottom: 8px !important;
 }
 
-/* WADAH UTAMA: Memaksa Scroll Horizontal di Layar Kecil */
-.scroll-wrapper {
-    width: 100%;
-    overflow-x: auto; /* Mengaktifkan scroll kiri-kanan jika konten terlalu lebar */
-    overflow-y: hidden; /* Mencegah scroll atas-bawah di dalam tabel */
-    -webkit-overflow-scrolling: touch; /* Efek licin/halus saat digeser pakai jari di HP */
-    padding-bottom: 10px;
+/* KUNCI AGAR KOTAK TIDAK GEPENG DI HP */
+div[data-testid="stColumn"] {
+    min-width: 40px !important; /* Lebar minimal kotak terkunci di 40px */
+    padding-left: 2px !important; 
+    padding-right: 2px !important;
 }
 
-/* Mempercantik Scrollbar di HP/Browser */
-.scroll-wrapper::-webkit-scrollbar { height: 8px; }
-.scroll-wrapper::-webkit-scrollbar-thumb { background-color: #94a3b8; border-radius: 4px; }
-
-/* CSS Grid Rigid (Peta Denah yang Tidak Bisa Dihancurkan) */
-.periodic-grid {
-    display: grid;
-    grid-template-columns: 30px repeat(28, minmax(35px, 1fr)); /* Lebar Minimal Kotak = 35px */
-    gap: 4px;
-    min-width: 1100px; /* KUNCI UTAMA: Memaksa Grid tetap lebar, memicu Scroll di HP */
-    margin-bottom: 5px;
-}
-
-/* Huruf Rak (A-G) di sebelah kiri */
-.row-label {
+/* Khusus kolom pertama (Huruf Rak A-G) */
+div[data-testid="stColumn"]:nth-child(1) {
+    min-width: 30px !important;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-weight: 900;
-    font-size: 18px;
-    color: #cbd5e1;
 }
 
-/* Memodifikasi semua tombol st.button di dalam grid */
-.periodic-grid button {
+/* Bentuk tombol (Persegi Besar) */
+div[class^="st-key-box_"] button {
     aspect-ratio: 1/1 !important;
     width: 100% !important;
-    min-height: 35px !important; /* Tinggi kotak tetap proporsional */
+    min-width: 36px !important;
+    min-height: 36px !important;
+    font-size: 16px !important;
+    font-weight: 900 !important;
     padding: 0px !important;
     margin: 0px !important;
-    border-radius: 4px !important;
     border: 1px solid #475569 !important;
+    border-radius: 4px !important;
     display: flex !important;
     align-items: center !important;
     justify-content: center !important;
-    font-weight: 900 !important;
-    font-size: 16px !important; /* Font tetap besar */
 }
-.periodic-grid button:hover {
+div[class^="st-key-box_"] button:hover {
+    transform: scale(1.15);
     border: 2px solid #fff !important;
-    transform: scale(1.1);
-    z-index: 99;
+    z-index: 10;
 }
+"""
 
-/* Penomoran baris 1-28 di bawah grid */
-.col-label {
-    display: flex;
-    justify-content: center;
-    font-weight: 900;
-    font-size: 14px;
-    color: #38bdf8;
-    margin-top: 5px;
-}
-</style>
-""", unsafe_allow_html=True)
-
-# Membuat String CSS Dinamis untuk Warna Kotak
-color_css = ""
-
-# =========================================================================
-# 9. RENDER GRID (BUNGKUS DENGAN WRAPPER SCROLL)
-# =========================================================================
-
-# Buka Wadah Scroll Horizontal
-st.markdown('<div class="scroll-wrapper">', unsafe_allow_html=True)
-
+# Injeksi warna dinamis per kotak
 for k in kolom_list:
-    # Buka Baris Grid
-    st.markdown('<div class="periodic-grid">', unsafe_allow_html=True)
+    for b in baris_list:
+        info = matrix_info.get((k, b))
+        if not info or not info['exist']: continue
+        
+        sku = info['sku_cnt']
+        if info['is_match']: bg, txt = "#38bdf8", "#000000"       
+        elif sku >= 4: bg, txt = "#ef4444", "#ffffff"             
+        elif sku == 3: bg, txt = "#fde047", "#000000"             
+        elif sku in [1, 2]: bg, txt = "#86efac", "#000000"        
+        else: bg, txt = "#e2e8f0", "#94a3b8"                      
+        
+        dynamic_css += f"\n.st-key-box_{k}_{b} button {{ background-color: {bg} !important; color: {txt} !important; }}"
+
+st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
+
+# =========================================================================
+# 9. RENDER GRID
+# =========================================================================
+for k in kolom_list:
+    cols = st.columns([0.6] + [1] * 28, gap="small")
     
-    # Render Huruf Rak A-G
-    st.markdown(f'<div class="row-label">{k}</div>', unsafe_allow_html=True)
-    
-    # 28 Kolom Streamlit untuk Tombol
-    cols = st.columns(28) 
+    # Render Huruf Rak A-G di kolom pertama
+    with cols[0]:
+        st.markdown(f"<div style='font-size:18px; font-weight:900; color:#cbd5e1; margin-top:8px;'>{k}</div>", unsafe_allow_html=True)
     
     for idx, b in enumerate(baris_list):
         info = matrix_info[(k, b)]
         
-        with cols[idx]:
+        with cols[idx + 1]:
             if not info['exist']:
-                st.markdown("<div style='text-align:center; color:#ef4444; font-size:16px; padding-top:20%;'>❌</div>", unsafe_allow_html=True)
-            else:
-                sku = info['sku_cnt']
-                # Pewarnaan
-                if info['is_match']: bg, txt = "#38bdf8", "#000000"
-                elif sku >= 4: bg, txt = "#ef4444", "#ffffff"
-                elif sku == 3: bg, txt = "#fde047", "#000000"
-                elif sku in [1, 2]: bg, txt = "#86efac", "#000000"
-                else: bg, txt = "#e2e8f0", "#94a3b8"
+                st.markdown("<div style='text-align:center; color:#ef4444; font-size:14px; margin-top:10px;'>❌</div>", unsafe_allow_html=True)
+                continue
                 
-                color_css += f".st-key-btn_{k}_{b} button {{ background-color: {bg} !important; color: {txt} !important; }}\n"
-                
-                # Render Tombol
-                if st.button(str(sku), key=f"btn_{k}_{b}", use_container_width=True):
+            with st.container(key=f"box_{k}_{b}"):
+                btn_text = f"{info['sku_cnt']}"
+                if st.button(btn_text, key=f"btn_{k}_{b}", use_container_width=True):
                     show_rack_detail(k, b, info)
-                    
-    # Tutup Baris Grid
-    st.markdown('</div>', unsafe_allow_html=True)
 
-# Render Penomoran Bawah (1-28) di dalam Grid Terakhir
-st.markdown('<div class="periodic-grid">', unsafe_allow_html=True)
-st.markdown('<div></div>', unsafe_allow_html=True) # Spasi kosong untuk huruf
-for b in baris_list:
-    st.markdown(f'<div class="col-label">{b}</div>', unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
-
-# Tutup Wadah Scroll Horizontal
-st.markdown('</div>', unsafe_allow_html=True)
-
-# 10. Terapkan Warna CSS
-st.markdown(f"<style>{color_css}</style>", unsafe_allow_html=True)
-
-# 10. Terapkan Warna CSS
-st.markdown(f"<style>{color_css}</style>", unsafe_allow_html=True)
-
-# 11. Render Penomoran Bawah (1-28)
-st.markdown('<div class="col-label-grid">', unsafe_allow_html=True)
-st.markdown('<div></div>', unsafe_allow_html=True) # Spasi kosong untuk huruf
-for b in baris_list:
-    st.markdown(f'<div class="col-label">{b}</div>', unsafe_allow_html=True)
-st.markdown('</div>', unsafe_allow_html=True)
+# 10. Baris Nomor (1-28) di Bawah
+cols_bottom = st.columns([0.6] + [1] * 28, gap="small")
+with cols_bottom[0]:
+    st.write("") # Kosong untuk kolom huruf
+    
+for idx, b in enumerate(baris_list):
+    with cols_bottom[idx + 1]:
+        st.markdown(f"<div style='text-align:center; font-weight:900; color:#0ea5e9; font-size:16px; margin-top:5px;'>{b}</div>", unsafe_allow_html=True)
