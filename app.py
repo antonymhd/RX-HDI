@@ -28,17 +28,12 @@ except Exception as e:
 
 product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 
-# 3. Sidebar (DIPERBARUI DENGAN DROPDOWN SELECTBOX)
+# 3. Sidebar (Dengan Dropdown Pencarian)
 st.sidebar.header("🔍 Pencarian & Filter")
-
-# Mengambil daftar unik nama produk dari Excel, buang yang kosong (NaN), lalu urutkan abjad
 daftar_barang = sorted(df[product_col].dropna().astype(str).unique().tolist())
 daftar_pilihan = ["-- Tampilkan Semua --"] + daftar_barang
 
-# Menampilkan Dropdown yang bisa diketik
 pilihan_pencarian = st.sidebar.selectbox("Pilih / Ketik Nama Barang:", options=daftar_pilihan)
-
-# Menentukan kata kunci pencarian
 search_query = "" if pilihan_pencarian == "-- Tampilkan Semua --" else pilihan_pencarian
 
 st.sidebar.divider()
@@ -57,7 +52,7 @@ def is_rack_exist(kolom, baris):
     if kolom == 'G' and baris < 17: return False
     return True
 
-# 5. Hitung Data Matriks
+# 5. Hitung Data Matriks & Kapasitas Dinamis
 def process_matrix_data(df, search_term, prod_col):
     kolom_list = ['G', 'F', 'E', 'D', 'C', 'B', 'A']
     baris_list = list(range(1, 29))
@@ -72,14 +67,23 @@ def process_matrix_data(df, search_term, prod_col):
                 matrix_info[(k, b)] = {'exist': False}
                 continue
                 
+            # PENENTUAN KAPASITAS MAX BERDASARKAN NOMOR BARIS RAK
+            max_slot = 31 if b <= 16 else 44
+            
             sub = df[(df['Kolom'] == k) & (df['Baris'] == b)]
             prods = sub[prod_col].dropna().unique() if prod_col in sub.columns else []
             sku = len(prods)
             filled = sub['Part Number'].notna().sum() if 'Part Number' in sub.columns else 0
             
+            # Mencegah error jika data di excel melebihi kapasitas (misal di baris 1-16 tercatat 32 data)
+            if filled > max_slot: 
+                filled = max_slot 
+                
+            usable_space = max_slot - filled
+            if usable_space < 0: usable_space = 0
+            
             is_match = False
             if search_term and prod_col in sub.columns:
-                # Menggunakan regex=False agar kebal terhadap simbol aneh di nama produk
                 match_prod = sub[prod_col].astype(str).str.contains(search_term, case=False, na=False, regex=False).any()
                 match_part = False
                 if 'Part Number' in sub.columns:
@@ -96,21 +100,24 @@ def process_matrix_data(df, search_term, prod_col):
                 
             matrix_info[(k, b)] = {
                 'exist': True, 'sku_cnt': sku, 'filled': filled,
-                'usable_space': max(0, len(sub) - filled), 'prods': prods,
+                'usable_space': usable_space, 'max_slot': max_slot, 'prods': prods,
                 'df_sub': sub, 'is_match': is_match
             }
     return matrix_info, total_critical, total_kosong, kolom_list, baris_list, lokasi_kritis, lokasi_kosong
 
 matrix_info, total_critical, total_kosong, kolom_list, baris_list, lokasi_kritis, lokasi_kosong = process_matrix_data(df, search_query, product_col)
 
-# 6. Modal Pop-up (Dialog Detail)
+# 6. Modal Pop-up (Menampilkan kapasitas secara dinamis)
 @st.dialog("📦 Rincian Detail Rak", width="large")
 def show_rack_detail(k, b, info):
     st.subheader(f"📍 Lokasi Racking: {k} - Baris {b}")
     c1, c2, c3 = st.columns(3)
     c1.metric("Variasi SKU", f"{info['sku_cnt']} Jenis")
-    c2.metric("Pallet Terisi", f"{info['filled']} / 44")
+    
+    # Menampilkan max_slot secara dinamis (31 atau 44)
+    c2.metric("Pallet Terisi", f"{info['filled']} / {info['max_slot']}")
     c3.metric("Space Kosong", f"{info['usable_space']} Slot")
+    
     st.divider()
     
     if info['sku_cnt'] > 0:
@@ -118,7 +125,7 @@ def show_rack_detail(k, b, info):
         rekap = info['df_sub'][product_col].value_counts().reset_index()
         rekap.columns = ['Nama Produk', 'Jumlah Pallet']
         st.dataframe(rekap, use_container_width=True, hide_index=True)
-        with st.expander("🔍 Lihat Detail Seluruh Slot (1-44)"):
+        with st.expander(f"🔍 Lihat Detail Seluruh Slot (1-{info['max_slot']})"):
              avail = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'No Lot', product_col, 'Status'] if c in info['df_sub'].columns]
              st.dataframe(info['df_sub'][avail], use_container_width=True, hide_index=True)
     else:
@@ -135,26 +142,22 @@ col_m3.metric("Baris Kosong Total", f"{total_kosong} Baris", help=f"✅ Kosong:\
 st.divider()
 
 # =========================================================================
-# 8. OPTIMASI CSS (SUPER RINGAN & HEADER TIDAK TERPOTONG)
+# 8. OPTIMASI CSS 
 # =========================================================================
 dynamic_css = """
-/* Memastikan header atas aman dari bar hitam */
 .block-container { 
     max-width: 98% !important; 
     padding-top: 3.5rem !important; 
     padding-bottom: 2rem !important; 
 }
 
-/* Mencegah kolom hancur ke bawah di HP */
 div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
 div[data-testid="stColumn"] { padding-left: 2px !important; padding-right: 2px !important; }
 
-/* Huruf Rak A-G di kiri diselaraskan ke tengah vertikal */
 div[data-testid="stColumn"]:nth-child(1) {
     display: flex; align-items: center; justify-content: center;
 }
 
-/* Desain Kotak Angka (Aspect Ratio Persegi) */
 div[class^="st-key-btn_"] button {
     aspect-ratio: 1/1 !important;
     width: 100% !important;
@@ -176,7 +179,6 @@ div[class^="st-key-btn_"] button:hover {
 }
 """
 
-# OPTIMASI RENDER WARNA (Batch Processing)
 color_map = {
     'match': {"bg": "#38bdf8", "txt": "#000000", "selectors": []},
     'critical': {"bg": "#ef4444", "txt": "#ffffff", "selectors": []},
@@ -212,7 +214,7 @@ def render_grid_area(title, start_baris, end_baris):
     st.markdown(f"### {title}")
     
     subset_baris = list(range(start_baris, end_baris + 1))
-    total_kolom = 16  # Kunci agar ukuran kotak antar Area 1 dan Area 2 tetap sama
+    total_kolom = 16  
     
     for k in kolom_list:
         cols = st.columns([0.6] + [1] * total_kolom, gap="small")
@@ -225,14 +227,12 @@ def render_grid_area(title, start_baris, end_baris):
             
             with cols[idx + 1]:
                 if not info['exist']:
-                    # MENGHILANGKAN TANDA X (Dibiarkan kosong melompong / negative space)
                     st.write("") 
                 else:
                     btn_text = f"{info['sku_cnt']}"
                     if st.button(btn_text, key=f"btn_{k}_{b}", use_container_width=True):
                         show_rack_detail(k, b, info)
                             
-    # Render Penomoran Bawah (1-16 / 17-28)
     cols_bottom = st.columns([0.6] + [1] * total_kolom, gap="small")
     with cols_bottom[0]:
         st.write("")
@@ -244,10 +244,12 @@ def render_grid_area(title, start_baris, end_baris):
 # =========================================================================
 # 10. EKSEKUSI PEMBAGIAN 2 AREA RAK
 # =========================================================================
-render_grid_area("📍 Area 1: Rak Nomor 1 - 16", 1, 16)
+# Area 1: Kapasitas Maksimal 31 Slot per baris rak
+render_grid_area("📍 Area 1: Rak Nomor 1 - 16 (Kapasitas: 31 Slot/Baris)", 1, 16)
 
 st.write("")
 st.divider()
 st.write("")
 
-render_grid_area("📍 Area 2: Rak Nomor 17 - 28", 17, 28)
+# Area 2: Kapasitas Maksimal 44 Slot per baris rak
+render_grid_area("📍 Area 2: Rak Nomor 17 - 28 (Kapasitas: 44 Slot/Baris)", 17, 28)
