@@ -10,7 +10,7 @@ st.set_page_config(
 )
 
 st.title("📦 Visualisasi Grid Racking Gudang (2D Matrix)")
-st.caption("Matriks bergerak serentak. Geser layar (swipe) ke kiri/kanan di dalam kotak matriks untuk melihat area ujung.")
+st.caption("Klik pada kotak untuk melihat rincian isi slot pallet.")
 
 # 2. Load Data Master
 @st.cache_data(ttl=60)
@@ -121,53 +121,33 @@ col_m3.metric("Baris Kosong Total", f"{total_kosong} Baris", help=f"✅ Kosong:\
 st.divider()
 
 # =========================================================================
-# 8. CSS KHUSUS (SCROLL SERENTAK DALAM SATU WADAH)
+# 8. CSS KHUSUS (MENCEGAH KOLOM TURUN DI HP & KOTAK PERSEGI)
 # =========================================================================
 dynamic_css = """
 .block-container { max-width: 98% !important; padding-top: 1rem !important; }
 
-/* 1. CONTAINER INDUK: Mengaktifkan Scroll Horizontal Serentak */
-.st-key-grid_wrapper {
-    overflow-x: auto !important;
-    overflow-y: hidden !important;
-    -webkit-overflow-scrolling: touch !important;
-    padding-bottom: 15px !important;
-    padding-top: 10px !important;
-}
-
-/* Memaksa elemen di dalam container agar selebar matriks penuh (1100px) */
-.st-key-grid_wrapper > div {
-    min-width: 1150px !important; 
-}
-
-/* 2. MENCEGAH SCROLL INDIVIDUAL PADA SETIAP BARIS */
-.st-key-grid_wrapper div[data-testid="stHorizontalBlock"] {
+/* Mencegah kolom hancur ke bawah di HP */
+div[data-testid="stHorizontalBlock"] {
     flex-wrap: nowrap !important;
-    overflow-x: hidden !important; /* Matikan scroll per baris */
-    padding-bottom: 5px !important;
 }
 
-/* 3. KUNCI AGAR KOTAK TIDAK GEPENG DI HP */
 div[data-testid="stColumn"] {
-    min-width: 38px !important; 
     padding-left: 2px !important; 
     padding-right: 2px !important;
 }
+
+/* Huruf Rak A-G di kiri diselaraskan ke tengah vertikal */
 div[data-testid="stColumn"]:nth-child(1) {
-    min-width: 30px !important;
     display: flex;
     align-items: center;
     justify-content: center;
 }
 
-/* 4. BENTUK TOMBOL PERSEGI */
+/* Desain Kotak Angka */
 div[class^="st-key-box_"] button {
     aspect-ratio: 1/1 !important;
     width: 100% !important;
-    min-width: 35px !important;
-    min-height: 35px !important;
-    font-size: 16px !important;
-    font-weight: 900 !important;
+    min-width: 22px !important;
     padding: 0px !important;
     margin: 0px !important;
     border: 1px solid #475569 !important;
@@ -175,6 +155,8 @@ div[class^="st-key-box_"] button {
     display: flex !important;
     align-items: center !important;
     justify-content: center !important;
+    font-size: clamp(10px, 1.2vw, 16px) !important;
+    font-weight: 900 !important;
 }
 div[class^="st-key-box_"] button:hover {
     transform: scale(1.15);
@@ -201,37 +183,56 @@ for k in kolom_list:
 st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
 
 # =========================================================================
-# 9. RENDER GRID (DIBUNGKUS DALAM SATU CONTAINER INDUK)
+# 9. FUNGSI RENDER GRID (BISA DIGUNAKAN BERULANG)
 # =========================================================================
-
-# MEMBUAT WADAH INDUK AGAR BERGERAK SERENTAK
-with st.container(key="grid_wrapper"):
+def render_grid_area(title, start_baris, end_baris):
+    st.markdown(f"### {title}")
+    
+    # List baris yang akan dirender (misal 1-16 atau 17-28)
+    subset_baris = list(range(start_baris, end_baris + 1))
+    
+    # Kita kunci total kolom selalu 16 agar ukuran kotak Area 1 dan Area 2 persis sama!
+    total_kolom = 16 
     
     for k in kolom_list:
-        cols = st.columns([0.6] + [1] * 28, gap="small")
+        cols = st.columns([0.6] + [1] * total_kolom, gap="small")
         
-        # Render Huruf Rak A-G
+        # Label Rak A-G
         with cols[0]:
-            st.markdown(f"<div style='font-size:18px; font-weight:900; color:#cbd5e1; margin-top:8px;'>{k}</div>", unsafe_allow_html=True)
-        
-        for idx, b in enumerate(baris_list):
+            st.markdown(f"<div style='font-size:16px; font-weight:900; color:#cbd5e1;'>{k}</div>", unsafe_allow_html=True)
+            
+        # Loop Baris
+        for idx, b in enumerate(subset_baris):
             info = matrix_info[(k, b)]
             
             with cols[idx + 1]:
                 if not info['exist']:
-                    st.markdown("<div style='text-align:center; color:#ef4444; font-size:14px; margin-top:10px;'>❌</div>", unsafe_allow_html=True)
-                    continue
-                    
-                with st.container(key=f"box_{k}_{b}"):
-                    btn_text = f"{info['sku_cnt']}"
-                    if st.button(btn_text, key=f"btn_{k}_{b}", use_container_width=True):
-                        show_rack_detail(k, b, info)
-
-    # Render Baris Nomor (1-28) di Bawah dalam wadah yang SAMA
-    cols_bottom = st.columns([0.6] + [1] * 28, gap="small")
+                    st.markdown("<div style='text-align:center; color:#ef4444; font-size:clamp(10px, 1.2vw, 14px);'>❌</div>", unsafe_allow_html=True)
+                else:
+                    with st.container(key=f"box_{k}_{b}"):
+                        btn_text = f"{info['sku_cnt']}"
+                        if st.button(btn_text, key=f"btn_{k}_{b}", use_container_width=True):
+                            show_rack_detail(k, b, info)
+                            
+    # Render Penomoran Bawah
+    cols_bottom = st.columns([0.6] + [1] * total_kolom, gap="small")
     with cols_bottom[0]:
-        st.write("") 
+        st.write("")
         
-    for idx, b in enumerate(baris_list):
+    for idx, b in enumerate(subset_baris):
         with cols_bottom[idx + 1]:
-            st.markdown(f"<div style='text-align:center; font-weight:900; color:#0ea5e9; font-size:16px; margin-top:5px;'>{b}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='text-align:center; font-weight:900; color:#0ea5e9; font-size:clamp(10px, 1.2vw, 16px); margin-top:5px;'>{b}</div>", unsafe_allow_html=True)
+
+# =========================================================================
+# 10. EKSEKUSI PEMBAGIAN 2 AREA
+# =========================================================================
+
+# Merender Area 1 (Baris 1 - 16)
+render_grid_area("📍 Area 1: Rak Nomor 1 - 16", 1, 16)
+
+st.write("")
+st.divider()
+st.write("")
+
+# Merender Area 2 (Baris 17 - 28)
+render_grid_area("📍 Area 2: Rak Nomor 17 - 28", 17, 28)
