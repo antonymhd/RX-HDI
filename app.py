@@ -10,7 +10,7 @@ st.set_page_config(
 )
 
 st.title("📦 Visualisasi Grid Racking Gudang (2D Matrix)")
-st.caption("Kotak berbentuk persegi mewakili jumlah SKU pallet. Geser ke kiri-kanan (di HP) untuk melihat area ujung rak.")
+st.caption("Matriks bergerak serentak. Geser layar (swipe) ke kiri/kanan di dalam kotak matriks untuk melihat area ujung.")
 
 # 2. Load Data Master
 @st.cache_data(ttl=60)
@@ -121,30 +121,38 @@ col_m3.metric("Baris Kosong Total", f"{total_kosong} Baris", help=f"✅ Kosong:\
 st.divider()
 
 # =========================================================================
-# 8. CSS KHUSUS (SCROLL HORIZONTAL DI HP & KOTAK PERSEGI)
+# 8. CSS KHUSUS (SCROLL SERENTAK DALAM SATU WADAH)
 # =========================================================================
 dynamic_css = """
-/* Lebar penuh */
 .block-container { max-width: 98% !important; padding-top: 1rem !important; }
 
-/* KUNCI SCROLL HORIZONTAL DI HP */
-/* Memaksa elemen baris (st.columns) agar tidak menumpuk ke bawah, tapi ke samping dan bisa digeser */
-div[data-testid="stHorizontalBlock"] {
-    flex-wrap: nowrap !important;
+/* 1. CONTAINER INDUK: Mengaktifkan Scroll Horizontal Serentak */
+.st-key-grid_wrapper {
     overflow-x: auto !important;
     overflow-y: hidden !important;
     -webkit-overflow-scrolling: touch !important;
-    padding-bottom: 8px !important;
+    padding-bottom: 15px !important;
+    padding-top: 10px !important;
 }
 
-/* KUNCI AGAR KOTAK TIDAK GEPENG DI HP */
+/* Memaksa elemen di dalam container agar selebar matriks penuh (1100px) */
+.st-key-grid_wrapper > div {
+    min-width: 1150px !important; 
+}
+
+/* 2. MENCEGAH SCROLL INDIVIDUAL PADA SETIAP BARIS */
+.st-key-grid_wrapper div[data-testid="stHorizontalBlock"] {
+    flex-wrap: nowrap !important;
+    overflow-x: hidden !important; /* Matikan scroll per baris */
+    padding-bottom: 5px !important;
+}
+
+/* 3. KUNCI AGAR KOTAK TIDAK GEPENG DI HP */
 div[data-testid="stColumn"] {
-    min-width: 40px !important; /* Lebar minimal kotak terkunci di 40px */
+    min-width: 38px !important; 
     padding-left: 2px !important; 
     padding-right: 2px !important;
 }
-
-/* Khusus kolom pertama (Huruf Rak A-G) */
 div[data-testid="stColumn"]:nth-child(1) {
     min-width: 30px !important;
     display: flex;
@@ -152,12 +160,12 @@ div[data-testid="stColumn"]:nth-child(1) {
     justify-content: center;
 }
 
-/* Bentuk tombol (Persegi Besar) */
+/* 4. BENTUK TOMBOL PERSEGI */
 div[class^="st-key-box_"] button {
     aspect-ratio: 1/1 !important;
     width: 100% !important;
-    min-width: 36px !important;
-    min-height: 36px !important;
+    min-width: 35px !important;
+    min-height: 35px !important;
     font-size: 16px !important;
     font-weight: 900 !important;
     padding: 0px !important;
@@ -193,33 +201,37 @@ for k in kolom_list:
 st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
 
 # =========================================================================
-# 9. RENDER GRID
+# 9. RENDER GRID (DIBUNGKUS DALAM SATU CONTAINER INDUK)
 # =========================================================================
-for k in kolom_list:
-    cols = st.columns([0.6] + [1] * 28, gap="small")
-    
-    # Render Huruf Rak A-G di kolom pertama
-    with cols[0]:
-        st.markdown(f"<div style='font-size:18px; font-weight:900; color:#cbd5e1; margin-top:8px;'>{k}</div>", unsafe_allow_html=True)
-    
-    for idx, b in enumerate(baris_list):
-        info = matrix_info[(k, b)]
-        
-        with cols[idx + 1]:
-            if not info['exist']:
-                st.markdown("<div style='text-align:center; color:#ef4444; font-size:14px; margin-top:10px;'>❌</div>", unsafe_allow_html=True)
-                continue
-                
-            with st.container(key=f"box_{k}_{b}"):
-                btn_text = f"{info['sku_cnt']}"
-                if st.button(btn_text, key=f"btn_{k}_{b}", use_container_width=True):
-                    show_rack_detail(k, b, info)
 
-# 10. Baris Nomor (1-28) di Bawah
-cols_bottom = st.columns([0.6] + [1] * 28, gap="small")
-with cols_bottom[0]:
-    st.write("") # Kosong untuk kolom huruf
+# MEMBUAT WADAH INDUK AGAR BERGERAK SERENTAK
+with st.container(key="grid_wrapper"):
     
-for idx, b in enumerate(baris_list):
-    with cols_bottom[idx + 1]:
-        st.markdown(f"<div style='text-align:center; font-weight:900; color:#0ea5e9; font-size:16px; margin-top:5px;'>{b}</div>", unsafe_allow_html=True)
+    for k in kolom_list:
+        cols = st.columns([0.6] + [1] * 28, gap="small")
+        
+        # Render Huruf Rak A-G
+        with cols[0]:
+            st.markdown(f"<div style='font-size:18px; font-weight:900; color:#cbd5e1; margin-top:8px;'>{k}</div>", unsafe_allow_html=True)
+        
+        for idx, b in enumerate(baris_list):
+            info = matrix_info[(k, b)]
+            
+            with cols[idx + 1]:
+                if not info['exist']:
+                    st.markdown("<div style='text-align:center; color:#ef4444; font-size:14px; margin-top:10px;'>❌</div>", unsafe_allow_html=True)
+                    continue
+                    
+                with st.container(key=f"box_{k}_{b}"):
+                    btn_text = f"{info['sku_cnt']}"
+                    if st.button(btn_text, key=f"btn_{k}_{b}", use_container_width=True):
+                        show_rack_detail(k, b, info)
+
+    # Render Baris Nomor (1-28) di Bawah dalam wadah yang SAMA
+    cols_bottom = st.columns([0.6] + [1] * 28, gap="small")
+    with cols_bottom[0]:
+        st.write("") 
+        
+    for idx, b in enumerate(baris_list):
+        with cols_bottom[idx + 1]:
+            st.markdown(f"<div style='text-align:center; font-weight:900; color:#0ea5e9; font-size:16px; margin-top:5px;'>{b}</div>", unsafe_allow_html=True)
