@@ -209,9 +209,9 @@ def render_grid_area(title, start_baris, end_baris):
         for idx, b in enumerate(subset_baris):
             info = matrix_info[(k, b)]
             
-            with cols[idx + 1]:
+           with cols[idx + 1]:
                 if not info['exist']:
-                    st.markdown("<div style='text-align:center; color:#ef4444; font-size:clamp(10px, 1.2vw, 14px);'>❌</div>", unsafe_allow_html=True)
+                    st.write("") # Membiarkan area tanpa rak menjadi ruang kosong (negative space)
                 else:
                     # Dirender langsung tanpa pembungkus ekstra! (Sangat mengurangi lag)
                     btn_text = f"{info['sku_cnt']}"
