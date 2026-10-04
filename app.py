@@ -124,7 +124,7 @@ st.divider()
 # 8. OPTIMASI CSS (SUPER RINGAN & HEADER TIDAK TERPOTONG)
 # =========================================================================
 dynamic_css = """
-/* DIPERBAIKI: padding-top 3.5rem agar judul tidak terpotong navbar atas */
+/* Memastikan header atas aman dari bar hitam */
 .block-container { 
     max-width: 98% !important; 
     padding-top: 3.5rem !important; 
@@ -140,7 +140,7 @@ div[data-testid="stColumn"]:nth-child(1) {
     display: flex; align-items: center; justify-content: center;
 }
 
-/* Desain Kotak Angka */
+/* Desain Kotak Angka (Aspect Ratio Persegi) */
 div[class^="st-key-btn_"] button {
     aspect-ratio: 1/1 !important;
     width: 100% !important;
@@ -162,7 +162,7 @@ div[class^="st-key-btn_"] button:hover {
 }
 """
 
-# OPTIMASI RENDER WARNA (Batch Processing agar browser tidak lag)
+# OPTIMASI RENDER WARNA (Batch Processing)
 color_map = {
     'match': {"bg": "#38bdf8", "txt": "#000000", "selectors": []},
     'critical': {"bg": "#ef4444", "txt": "#ffffff", "selectors": []},
@@ -192,13 +192,13 @@ for group in color_map.values():
 st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
 
 # =========================================================================
-# 9. FUNGSI RENDER GRID (TANPA WRAPPER EXTRA = LEBIH CEPAT)
+# 9. FUNGSI RENDER GRID AREA
 # =========================================================================
 def render_grid_area(title, start_baris, end_baris):
     st.markdown(f"### {title}")
     
     subset_baris = list(range(start_baris, end_baris + 1))
-    total_kolom = 16 
+    total_kolom = 16  # Kunci agar ukuran kotak antar Area 1 dan Area 2 tetap sama
     
     for k in kolom_list:
         cols = st.columns([0.6] + [1] * total_kolom, gap="small")
@@ -209,16 +209,16 @@ def render_grid_area(title, start_baris, end_baris):
         for idx, b in enumerate(subset_baris):
             info = matrix_info[(k, b)]
             
-           with cols[idx + 1]:
+            with cols[idx + 1]:
                 if not info['exist']:
-                    st.write("") # Membiarkan area tanpa rak menjadi ruang kosong (negative space)
+                    # MENGHILANGKAN TANDA X (Dibiarkan kosong melompong / negative space)
+                    st.write("") 
                 else:
-                    # Dirender langsung tanpa pembungkus ekstra! (Sangat mengurangi lag)
                     btn_text = f"{info['sku_cnt']}"
                     if st.button(btn_text, key=f"btn_{k}_{b}", use_container_width=True):
                         show_rack_detail(k, b, info)
                             
-    # Render Penomoran Bawah
+    # Render Penomoran Bawah (1-16 / 17-28)
     cols_bottom = st.columns([0.6] + [1] * total_kolom, gap="small")
     with cols_bottom[0]:
         st.write("")
@@ -228,7 +228,7 @@ def render_grid_area(title, start_baris, end_baris):
             st.markdown(f"<div style='text-align:center; font-weight:900; color:#0ea5e9; font-size:clamp(10px, 1.2vw, 16px); margin-top:5px;'>{b}</div>", unsafe_allow_html=True)
 
 # =========================================================================
-# 10. EKSEKUSI PEMBAGIAN 2 AREA
+# 10. EKSEKUSI PEMBAGIAN 2 AREA RAK
 # =========================================================================
 render_grid_area("📍 Area 1: Rak Nomor 1 - 16", 1, 16)
 
