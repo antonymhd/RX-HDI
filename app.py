@@ -121,30 +121,27 @@ col_m3.metric("Baris Kosong Total", f"{total_kosong} Baris", help=f"✅ Kosong:\
 st.divider()
 
 # =========================================================================
-# 8. CSS KHUSUS (MENCEGAH KOLOM TURUN DI HP & KOTAK PERSEGI)
+# 8. OPTIMASI CSS (SUPER RINGAN & HEADER TIDAK TERPOTONG)
 # =========================================================================
 dynamic_css = """
-.block-container { max-width: 98% !important; padding-top: 1rem !important; }
+/* DIPERBAIKI: padding-top 3.5rem agar judul tidak terpotong navbar atas */
+.block-container { 
+    max-width: 98% !important; 
+    padding-top: 3.5rem !important; 
+    padding-bottom: 2rem !important; 
+}
 
 /* Mencegah kolom hancur ke bawah di HP */
-div[data-testid="stHorizontalBlock"] {
-    flex-wrap: nowrap !important;
-}
-
-div[data-testid="stColumn"] {
-    padding-left: 2px !important; 
-    padding-right: 2px !important;
-}
+div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
+div[data-testid="stColumn"] { padding-left: 2px !important; padding-right: 2px !important; }
 
 /* Huruf Rak A-G di kiri diselaraskan ke tengah vertikal */
 div[data-testid="stColumn"]:nth-child(1) {
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    display: flex; align-items: center; justify-content: center;
 }
 
 /* Desain Kotak Angka */
-div[class^="st-key-box_"] button {
+div[class^="st-key-btn_"] button {
     aspect-ratio: 1/1 !important;
     width: 100% !important;
     min-width: 22px !important;
@@ -158,50 +155,57 @@ div[class^="st-key-box_"] button {
     font-size: clamp(10px, 1.2vw, 16px) !important;
     font-weight: 900 !important;
 }
-div[class^="st-key-box_"] button:hover {
+div[class^="st-key-btn_"] button:hover {
     transform: scale(1.15);
     border: 2px solid #fff !important;
     z-index: 10;
 }
 """
 
-# Injeksi warna dinamis per kotak
+# OPTIMASI RENDER WARNA (Batch Processing agar browser tidak lag)
+color_map = {
+    'match': {"bg": "#38bdf8", "txt": "#000000", "selectors": []},
+    'critical': {"bg": "#ef4444", "txt": "#ffffff", "selectors": []},
+    'warning': {"bg": "#fde047", "txt": "#000000", "selectors": []},
+    'ideal': {"bg": "#86efac", "txt": "#000000", "selectors": []},
+    'empty': {"bg": "#e2e8f0", "txt": "#94a3b8", "selectors": []}
+}
+
 for k in kolom_list:
     for b in baris_list:
         info = matrix_info.get((k, b))
         if not info or not info['exist']: continue
         
         sku = info['sku_cnt']
-        if info['is_match']: bg, txt = "#38bdf8", "#000000"       
-        elif sku >= 4: bg, txt = "#ef4444", "#ffffff"             
-        elif sku == 3: bg, txt = "#fde047", "#000000"             
-        elif sku in [1, 2]: bg, txt = "#86efac", "#000000"        
-        else: bg, txt = "#e2e8f0", "#94a3b8"                      
+        selector = f".st-key-btn_{k}_{b} button"
         
-        dynamic_css += f"\n.st-key-box_{k}_{b} button {{ background-color: {bg} !important; color: {txt} !important; }}"
+        if info['is_match']: color_map['match']['selectors'].append(selector)
+        elif sku >= 4: color_map['critical']['selectors'].append(selector)
+        elif sku == 3: color_map['warning']['selectors'].append(selector)
+        elif sku in [1, 2]: color_map['ideal']['selectors'].append(selector)
+        else: color_map['empty']['selectors'].append(selector)
+
+for group in color_map.values():
+    if group['selectors']:
+        dynamic_css += f"\n{', '.join(group['selectors'])} {{ background-color: {group['bg']} !important; color: {group['txt']} !important; }}"
 
 st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
 
 # =========================================================================
-# 9. FUNGSI RENDER GRID (BISA DIGUNAKAN BERULANG)
+# 9. FUNGSI RENDER GRID (TANPA WRAPPER EXTRA = LEBIH CEPAT)
 # =========================================================================
 def render_grid_area(title, start_baris, end_baris):
     st.markdown(f"### {title}")
     
-    # List baris yang akan dirender (misal 1-16 atau 17-28)
     subset_baris = list(range(start_baris, end_baris + 1))
-    
-    # Kita kunci total kolom selalu 16 agar ukuran kotak Area 1 dan Area 2 persis sama!
     total_kolom = 16 
     
     for k in kolom_list:
         cols = st.columns([0.6] + [1] * total_kolom, gap="small")
         
-        # Label Rak A-G
         with cols[0]:
             st.markdown(f"<div style='font-size:16px; font-weight:900; color:#cbd5e1;'>{k}</div>", unsafe_allow_html=True)
             
-        # Loop Baris
         for idx, b in enumerate(subset_baris):
             info = matrix_info[(k, b)]
             
@@ -209,10 +213,10 @@ def render_grid_area(title, start_baris, end_baris):
                 if not info['exist']:
                     st.markdown("<div style='text-align:center; color:#ef4444; font-size:clamp(10px, 1.2vw, 14px);'>❌</div>", unsafe_allow_html=True)
                 else:
-                    with st.container(key=f"box_{k}_{b}"):
-                        btn_text = f"{info['sku_cnt']}"
-                        if st.button(btn_text, key=f"btn_{k}_{b}", use_container_width=True):
-                            show_rack_detail(k, b, info)
+                    # Dirender langsung tanpa pembungkus ekstra! (Sangat mengurangi lag)
+                    btn_text = f"{info['sku_cnt']}"
+                    if st.button(btn_text, key=f"btn_{k}_{b}", use_container_width=True):
+                        show_rack_detail(k, b, info)
                             
     # Render Penomoran Bawah
     cols_bottom = st.columns([0.6] + [1] * total_kolom, gap="small")
@@ -226,13 +230,10 @@ def render_grid_area(title, start_baris, end_baris):
 # =========================================================================
 # 10. EKSEKUSI PEMBAGIAN 2 AREA
 # =========================================================================
-
-# Merender Area 1 (Baris 1 - 16)
 render_grid_area("📍 Area 1: Rak Nomor 1 - 16", 1, 16)
 
 st.write("")
 st.divider()
 st.write("")
 
-# Merender Area 2 (Baris 17 - 28)
 render_grid_area("📍 Area 2: Rak Nomor 17 - 28", 17, 28)
