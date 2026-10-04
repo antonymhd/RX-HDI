@@ -28,9 +28,18 @@ except Exception as e:
 
 product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 
-# 3. Sidebar
+# 3. Sidebar (DIPERBARUI DENGAN DROPDOWN SELECTBOX)
 st.sidebar.header("🔍 Pencarian & Filter")
-search_query = st.sidebar.text_input("Cari Nama Barang / Part Number:", "").strip()
+
+# Mengambil daftar unik nama produk dari Excel, buang yang kosong (NaN), lalu urutkan abjad
+daftar_barang = sorted(df[product_col].dropna().astype(str).unique().tolist())
+daftar_pilihan = ["-- Tampilkan Semua --"] + daftar_barang
+
+# Menampilkan Dropdown yang bisa diketik
+pilihan_pencarian = st.sidebar.selectbox("Pilih / Ketik Nama Barang:", options=daftar_pilihan)
+
+# Menentukan kata kunci pencarian
+search_query = "" if pilihan_pencarian == "-- Tampilkan Semua --" else pilihan_pencarian
 
 st.sidebar.divider()
 st.sidebar.header("🎨 Indikator Warna")
@@ -70,8 +79,13 @@ def process_matrix_data(df, search_term, prod_col):
             
             is_match = False
             if search_term and prod_col in sub.columns:
-                is_match = sub[prod_col].astype(str).str.contains(search_term, case=False, na=False).any() or \
-                           sub['Part Number'].astype(str).str.contains(search_term, case=False, na=False).any()
+                # Menggunakan regex=False agar kebal terhadap simbol aneh di nama produk
+                match_prod = sub[prod_col].astype(str).str.contains(search_term, case=False, na=False, regex=False).any()
+                match_part = False
+                if 'Part Number' in sub.columns:
+                    match_part = sub['Part Number'].astype(str).str.contains(search_term, case=False, na=False, regex=False).any()
+                
+                is_match = match_prod or match_part
             
             if sku >= 4: 
                 total_critical += 1
