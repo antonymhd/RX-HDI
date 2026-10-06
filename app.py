@@ -13,14 +13,15 @@ st.set_page_config(
 
 # 2. Koneksi ke Google Sheets menggunakan GSheetsConnection
 conn = st.connection("gsheets", type=GSheetsConnection)
-SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/edit?gid=0#gid=0"
+# Bersihkan URL dari embel-embel "?gid=..." di belakangnya agar tidak bentrok
+SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/edit"
 
 # --- FUNGSI LOAD DATA MASTER ---
 @st.cache_data(ttl=5) # Dipercepat menjadi 5 detik agar responsif setelah input form
 def load_data():
     try:
-        # Menarik data dari tab "Racking HDI"
-        df = conn.read(spreadsheet=SPREADSHEET_URL, worksheet="Racking HDI")
+        # Gunakan %20 untuk menggantikan spasi pada teks "Racking HDI"
+        df = conn.read(spreadsheet=SPREADSHEET_URL, worksheet="Racking%20HDI")
         df.columns = df.columns.astype(str).str.strip()
         return df
     except Exception as e:
@@ -30,8 +31,8 @@ def load_data():
 # --- FUNGSI LOAD LOG TRANSAKSI ---
 def load_log():
     try:
-        # Menarik data dari tab "Log Transaksi"
-        return conn.read(spreadsheet=SPREADSHEET_URL, worksheet="Log Transaksi")
+        # Gunakan %20 untuk menggantikan spasi pada teks "Log Transaksi"
+        return conn.read(spreadsheet=SPREADSHEET_URL, worksheet="Log%20Transaksi")
     except Exception as e:
         return pd.DataFrame(columns=["Timestamp", "Tipe Transaksi", "Nama Barang", "Rak", "Qty"])
 
@@ -268,7 +269,7 @@ elif menu == "📝 Form Transaksi":
                 log_baru = pd.concat([log_lama, new_row], ignore_index=True)
                 
                 # 5. Tulis ulang (Push) ke Google Sheets!
-                conn.update(worksheet="Log Transaksi", data=log_baru)
+                conn.update(worksheet="Log%20Transaksi", data=log_baru)
                 
                 st.success(f"✅ Transaksi berhasil dicatat! ({tipe_clean} | {qty} Pallet | {barang_dipilih} di Rak {rak_tujuan})")
                 
