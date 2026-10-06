@@ -1,7 +1,5 @@
 import streamlit as st
 import pandas as pd
-from datetime import datetime
-from streamlit_gsheets import GSheetsConnection
 
 # 1. Konfigurasi Web
 st.set_page_config(
@@ -11,30 +9,24 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 2. Koneksi Resmi ke Google Sheets
-conn = st.connection("gsheets", type=GSheetsConnection)
-SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/edit"
-
-@st.cache_data(ttl=5) 
+# 2. Load Data Master LANGSUNG DARI GOOGLE SHEETS (Publik CSV)
+@st.cache_data(ttl=30)
 def load_data():
     try:
-        df = conn.read(spreadsheet=SPREADSHEET_URL, worksheet="Racking HDI")
+        # Link CSV publik untuk tab "Racking HDI"
+        sheet_url = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/export?format=csv&gid=0"
+        df = pd.read_csv(sheet_url)
         df.columns = df.columns.astype(str).str.strip()
         return df
     except Exception as e:
-        st.error(f"⚠ Gagal memuat data master! Error: {e}")
+        st.error(f"⚠ Gagal memuat data master! Pastikan link Google Sheets sudah disetting Public. Error: {e}")
         st.stop()
 
-def load_log():
-    try:
-        df_log = conn.read(spreadsheet=SPREADSHEET_URL, worksheet="Log Transaksi")
-        if df_log.empty:
-            return pd.DataFrame(columns=["Timestamp", "Tipe Transaksi", "Nama Barang", "Rak", "Qty"])
-        return df_log
-    except Exception:
-        return pd.DataFrame(columns=["Timestamp", "Tipe Transaksi", "Nama Barang", "Rak", "Qty"])
+try:
+    df = load_data()
+except Exception:
+    st.stop()
 
-df = load_data()
 product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 daftar_barang = sorted(df[product_col].dropna().astype(str).unique().tolist())
 kolom_list = ['G', 'F', 'E', 'D', 'C', 'B', 'A']
@@ -45,13 +37,11 @@ def is_rack_exist(kolom, baris):
     if kolom == 'G' and baris < 17: return False
     return True
 
-daftar_rak = [f"{k}{b}" for k in kolom_list for b in baris_list if is_rack_exist(k, b)]
-
 # =========================================================================
-# A. SIDEBAR - NAVIGASI MULTI-HALAMAN
+# A. SIDEBAR - NAVIGASI MENU
 # =========================================================================
 st.sidebar.title("📌 Navigasi Menu")
-menu = st.sidebar.radio("Pilih Halaman:", ["🏠 Dashboard 2D", "📝 Form Transaksi"])
+menu = st.sidebar.radio("Pilih Halaman:", ["🏠 Dashboard 2D", "📝 Form Transaksi (In/Out)"])
 st.sidebar.divider()
 
 if menu == "🏠 Dashboard 2D":
@@ -220,48 +210,19 @@ if menu == "🏠 Dashboard 2D":
     st.write("")
     render_grid_area("📍 Area 2: Rak Nomor 17 - 28 (Kapasitas: 44 Slot/Baris)", 17, 28)
 
-elif menu == "📝 Form Transaksi":
+elif menu == "📝 Form Transaksi (In/Out)":
     # =========================================================================
-    # C. HALAMAN 2: FORM TRANSAKSI (MINI WMS) AKTIF PENUH
+    # C. HALAMAN 2: FORM TRANSAKSI BERBASIS GOOGLE FORM EMBED
     # =========================================================================
-    st.title("📝 Form Transaksi Gudang")
-    st.caption("Catat barang masuk (Inbound) dan barang keluar (Outbound) ke dalam sistem.")
+    st.title("📝 Form Transaksi Gudang (Inbound / Outbound)")
+    st.caption("Catat pergerakan barang langsung dari halaman ini. Data akan otomatis masuk ke Google Sheets.")
     
-    with st.container(border=True):
-        st.subheader("Form Data Pallet")
-        
-        tipe_trx = st.radio("Tipe Pergerakan:", ["INBOUND (Barang Masuk) ⬇️", "OUTBOUND (Barang Keluar) ⬆️"])
-        tipe_clean = "INBOUND" if "INBOUND" in tipe_trx else "OUTBOUND"
-        
-        barang_dipilih = st.selectbox("Nama Barang:", options=daftar_barang)
-        rak_tujuan = st.selectbox("Lokasi Rak (Tujuan/Asal):", options=daftar_rak)
-        qty = st.number_input("Jumlah Pallet (Qty):", min_value=1, step=1)
-        
-        submitted = st.button("💾 Simpan Transaksi", use_container_width=True, type="primary")
-
-        if submitted:
-            waktu_sekarang = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            new_row = pd.DataFrame([{
-                "Timestamp": waktu_sekarang,
-                "Tipe Transaksi": tipe_clean,
-                "Nama Barang": barang_dipilih,
-                "Rak": rak_tujuan,
-                "Qty": qty
-            }])
-            
-            try:
-                log_lama = load_log()
-                log_baru = pd.concat([log_lama, new_row], ignore_index=True)
-                conn.update(worksheet="Log Transaksi", data=log_baru)
-                st.success(f"✅ Transaksi berhasil dicatat! ({tipe_clean} | {qty} Pallet | {barang_dipilih} di Rak {rak_tujuan})")
-                st.cache_data.clear()
-            except Exception as e:
-                st.error(f"❌ Gagal menyimpan transaksi. Pastikan kunci Secrets JSON Anda valid. Error: {e}")
-
-    st.divider()
-    st.subheader("📜 Riwayat Transaksi Terbaru")
-    log_sekarang = load_log()
-    if not log_sekarang.empty:
-        st.dataframe(log_sekarang.tail(5).iloc[::-1], use_container_width=True, hide_index=True)
-    else:
-        st.info("Belum ada transaksi tercatat.")
+    st.info("💡 **Petunjuk:** Silakan isi form di bawah ini untuk mencatat transaksi barang masuk atau keluar.")
+    
+    # Masukkan link Google Form Anda di bawah ini jika sudah membuatnya, 
+    # atau biarkan placeholder ini untuk dihubungkan nanti.
+    google_form_url = "https://docs.google.com/forms/d/e/1FAIpQLSc.../viewform?embedded=true"
+    
+    st.markdown(f"""
+        <iframe src="{google_form_url}" width="100%" height="800" frameborder="0" marginheight="0" marginwidth="0">Memuat…</iframe>
+    """, unsafe_allow_html=True)
