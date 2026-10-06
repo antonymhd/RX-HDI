@@ -13,13 +13,9 @@ st.title("📦 Visualisasi Grid Racking Gudang (2D Matrix)")
 st.caption("Klik pada kotak untuk melihat rincian isi slot pallet.")
 
 # 2. Load Data Master (LIVE DARI GOOGLE SHEETS)
-# ttl=60 artinya Streamlit akan mengecek update terbaru di Google Sheets setiap 1 menit!
 @st.cache_data(ttl=60)
 def load_data():
-    # Menggunakan URL Export CSV khusus
     sheet_url = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/export?format=csv&gid=0"
-    
-    # Menggunakan read_csv agar proses rendering 10x lebih ringan dari Excel
     df = pd.read_csv(sheet_url)
     df.columns = df.columns.astype(str).str.strip()
     return df
@@ -56,7 +52,7 @@ def is_rack_exist(kolom, baris):
     if kolom == 'G' and baris < 17: return False
     return True
 
-# 5. Hitung Data Matriks & Kapasitas Dinamis
+# 5. Hitung Data Matriks & Kapasitas Dinamis (DIPERBAIKI)
 def process_matrix_data(df, search_term, prod_col):
     kolom_list = ['G', 'F', 'E', 'D', 'C', 'B', 'A']
     baris_list = list(range(1, 29))
@@ -71,17 +67,19 @@ def process_matrix_data(df, search_term, prod_col):
                 matrix_info[(k, b)] = {'exist': False}
                 continue
                 
-            # Penentuan Kapasitas Maksimal (Baris 1-16 max 31, sisanya max 44)
             max_slot = 31 if b <= 16 else 44
             
             sub = df[(df['Kolom'] == k) & (df['Baris'] == b)]
+            
+            # MEMOTONG DATA AGAR TIDAK MELEBIHI MAX SLOT!
+            # Jika baris data di Excel lebih dari kapasitas, kita hanya ambil sejumlah max_slot
+            if len(sub) > max_slot:
+                sub = sub.head(max_slot)
+                
             prods = sub[prod_col].dropna().unique() if prod_col in sub.columns else []
             sku = len(prods)
             filled = sub['Part Number'].notna().sum() if 'Part Number' in sub.columns else 0
             
-            if filled > max_slot: 
-                filled = max_slot 
-                
             usable_space = max_slot - filled
             if usable_space < 0: usable_space = 0
             
@@ -110,7 +108,7 @@ def process_matrix_data(df, search_term, prod_col):
 
 matrix_info, total_critical, total_kosong, kolom_list, baris_list, lokasi_kritis, lokasi_kosong = process_matrix_data(df, search_query, product_col)
 
-# 6. Modal Pop-up 
+# 6. Modal Pop-up (DIPERBAIKI)
 @st.dialog("📦 Rincian Detail Rak", width="large")
 def show_rack_detail(k, b, info):
     st.subheader(f"📍 Lokasi Racking: {k} - Baris {b}")
@@ -123,9 +121,11 @@ def show_rack_detail(k, b, info):
     
     if info['sku_cnt'] > 0:
         st.write("### 📋 Ringkasan Produk:")
+        # Menghitung produk berdasarkan DataFrame yang sudah dipotong (maksimal 31/44)
         rekap = info['df_sub'][product_col].value_counts().reset_index()
         rekap.columns = ['Nama Produk', 'Jumlah Pallet']
         st.dataframe(rekap, use_container_width=True, hide_index=True)
+        
         with st.expander(f"🔍 Lihat Detail Seluruh Slot (1-{info['max_slot']})"):
              avail = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'No Lot', product_col, 'Status'] if c in info['df_sub'].columns]
              st.dataframe(info['df_sub'][avail], use_container_width=True, hide_index=True)
