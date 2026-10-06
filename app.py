@@ -12,7 +12,7 @@ st.set_page_config(
 )
 
 # URL Web App dari Google Apps Script Anda (Ganti dengan link /exec Anda)
-WEB_APP_URL = "MASUKKAN_URL_WEB_APP_APPS_SCRIPT_ANDA_DI_SINI"
+WEB_APP_URL = "https://script.google.com/macros/s/AKfycbxt87dT2QAotNQyU7kQlBxFObxH37eH6uqqWwjJTBNgowk-pcNON4B6BOTWpwvkr2PYfg/exec"
 
 # 2. Load Data Master LANGSUNG DARI GOOGLE SHEETS (Publik CSV)
 @st.cache_data(ttl=30)
