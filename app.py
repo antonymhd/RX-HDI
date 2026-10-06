@@ -1,5 +1,7 @@
 import streamlit as st
 import pandas as pd
+from datetime import datetime
+import requests
 
 # 1. Konfigurasi Web
 st.set_page_config(
@@ -9,18 +11,28 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# URL Web App dari Google Apps Script Anda (Ganti dengan link /exec Anda)
+WEB_APP_URL = "MASUKKAN_URL_WEB_APP_APPS_SCRIPT_ANDA_DI_SINI"
+
 # 2. Load Data Master LANGSUNG DARI GOOGLE SHEETS (Publik CSV)
 @st.cache_data(ttl=30)
 def load_data():
     try:
-        # Link CSV publik untuk tab "Racking HDI"
         sheet_url = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/export?format=csv&gid=0"
         df = pd.read_csv(sheet_url)
         df.columns = df.columns.astype(str).str.strip()
         return df
     except Exception as e:
-        st.error(f"⚠ Gagal memuat data master! Pastikan link Google Sheets sudah disetting Public. Error: {e}")
+        st.error(f"⚠ Gagal memuat data master! Error: {e}")
         st.stop()
+
+@st.cache_data(ttl=5)
+def load_log():
+    try:
+        log_url = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/export?format=csv&sheet=Log%20Transaksi"
+        return pd.read_csv(log_url)
+    except Exception:
+        return pd.DataFrame(columns=["Timestamp", "Tipe Transaksi", "Nama Barang", "Rak", "Qty"])
 
 try:
     df = load_data()
@@ -37,6 +49,8 @@ def is_rack_exist(kolom, baris):
     if kolom == 'G' and baris < 17: return False
     return True
 
+daftar_rak = [f"{k}{b}" for k in kolom_list for b in baris_list if is_rack_exist(k, b)]
+
 # =========================================================================
 # A. SIDEBAR - NAVIGASI MENU
 # =========================================================================
@@ -45,9 +59,6 @@ menu = st.sidebar.radio("Pilih Halaman:", ["🏠 Dashboard 2D", "📝 Form Trans
 st.sidebar.divider()
 
 if menu == "🏠 Dashboard 2D":
-    # =========================================================================
-    # B. HALAMAN 1: DASHBOARD VISUAL 2D
-    # =========================================================================
     st.title("📦 Visualisasi Grid Racking Gudang (2D Matrix)")
     st.caption("Klik pada kotak untuk melihat rincian isi slot pallet.")
 
@@ -211,18 +222,42 @@ if menu == "🏠 Dashboard 2D":
     render_grid_area("📍 Area 2: Rak Nomor 17 - 28 (Kapasitas: 44 Slot/Baris)", 17, 28)
 
 elif menu == "📝 Form Transaksi (In/Out)":
-    # =========================================================================
-    # C. HALAMAN 2: FORM TRANSAKSI BERBASIS GOOGLE FORM EMBED
-    # =========================================================================
     st.title("📝 Form Transaksi Gudang (Inbound / Outbound)")
-    st.caption("Catat pergerakan barang langsung dari halaman ini. Data akan otomatis masuk ke Google Sheets.")
+    st.caption("Catat pergerakan barang masuk dan keluar langsung dari sini secara real-time.")
     
-    st.info("💡 **Petunjuk:** Silakan isi form di bawah ini untuk mencatat transaksi barang masuk atau keluar.")
-    
-    # Masukkan link Google Form Anda di bawah ini jika sudah membuatnya, 
-    # atau biarkan placeholder ini untuk dihubungkan nanti.
-    google_form_url = "https://docs.google.com/forms/d/e/1FAIpQLSc.../viewform?embedded=true"
-    
-    st.markdown(f"""
-        <iframe src="{google_form_url}" width="100%" height="800" frameborder="0" marginheight="0" marginwidth="0">Memuat…</iframe>
-    """, unsafe_allow_html=True)
+    with st.form("form_transaksi"):
+        tipe_trx = st.selectbox("Tipe Pergerakan:", ["INBOUND (Barang Masuk)", "OUTBOUND (Barang Keluar)"])
+        barang_pilihan = st.selectbox("Pilih Nama Barang:", options=daftar_barang)
+        rak_pilihan = st.selectbox("Pilih Lokasi Rak:", options=daftar_rak)
+        qty_input = st.number_input("Jumlah Pallet (Qty):", min_value=1, step=1)
+        
+        submitted = st.form_submit_button("💾 Simpan Transaksi", type="primary")
+        
+        if submitted:
+            if WEB_APP_URL == "MASUKKAN_URL_WEB_APP_APPS_SCRIPT_ANDA_DI_SINI":
+                st.error("⚠ Harap masukkan URL Web App Apps Script Anda ke dalam variabel `WEB_APP_URL` di kode program.")
+            else:
+                payload = {
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "tipe": "IN" if "INBOUND" in tipe_trx else "OUT",
+                    "barang": barang_pilihan,
+                    "rak": rak_pilihan,
+                    "qty": qty_input
+                }
+                try:
+                    response = requests.post(WEB_APP_URL, json=payload)
+                    if response.status_code == 200:
+                        st.success(f"✅ Transaksi Berhasil Dicatat! ({payload['tipe']} | {qty_input} Pallet | Rak {rak_pilihan})")
+                        st.cache_data.clear()
+                    else:
+                        st.error("❌ Gagal mengirim data ke Google Sheets.")
+                except Exception as e:
+                    st.error(f"Terjadi kesalahan koneksi: {e}")
+
+    st.divider()
+    st.subheader("📜 Riwayat Transaksi Terbaru")
+    log_df = load_log()
+    if not log_df.empty:
+        st.dataframe(log_df.tail(5).iloc[::-1], use_container_width=True, hide_index=True)
+    else:
+        st.info("Belum ada transaksi tercatat.")
