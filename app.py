@@ -12,23 +12,27 @@ st.set_page_config(
 st.title("📦 Visualisasi Grid Racking Gudang (2D Matrix)")
 st.caption("Klik pada kotak untuk melihat rincian isi slot pallet.")
 
-# 2. Load Data Master
+# 2. Load Data Master (LIVE DARI GOOGLE SHEETS)
+# ttl=60 artinya Streamlit akan mengecek update terbaru di Google Sheets setiap 1 menit!
 @st.cache_data(ttl=60)
 def load_data():
-    file_path = "Racking Pallet Pivoted.xlsx" 
-    df = pd.read_excel(file_path, sheet_name="Racking HDI")
+    # Menggunakan URL Export CSV khusus
+    sheet_url = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/export?format=csv&gid=0"
+    
+    # Menggunakan read_csv agar proses rendering 10x lebih ringan dari Excel
+    df = pd.read_csv(sheet_url)
     df.columns = df.columns.astype(str).str.strip()
     return df
 
 try:
     df = load_data()
 except Exception as e:
-    st.error(f"⚠ Gagal memuat data master! Error: {e}")
+    st.error(f"⚠ Gagal memuat data! Pastikan link Google Sheets Anda sudah disetting ke 'Siapa saja yang memiliki link'. Error: {e}")
     st.stop()
 
 product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 
-# 3. Sidebar (Dengan Dropdown Pencarian)
+# 3. Sidebar (Pencarian Cerdas / Dropdown)
 st.sidebar.header("🔍 Pencarian & Filter")
 daftar_barang = sorted(df[product_col].dropna().astype(str).unique().tolist())
 daftar_pilihan = ["-- Tampilkan Semua --"] + daftar_barang
@@ -67,7 +71,7 @@ def process_matrix_data(df, search_term, prod_col):
                 matrix_info[(k, b)] = {'exist': False}
                 continue
                 
-            # PENENTUAN KAPASITAS MAX BERDASARKAN NOMOR BARIS RAK
+            # Penentuan Kapasitas Maksimal (Baris 1-16 max 31, sisanya max 44)
             max_slot = 31 if b <= 16 else 44
             
             sub = df[(df['Kolom'] == k) & (df['Baris'] == b)]
@@ -75,7 +79,6 @@ def process_matrix_data(df, search_term, prod_col):
             sku = len(prods)
             filled = sub['Part Number'].notna().sum() if 'Part Number' in sub.columns else 0
             
-            # Mencegah error jika data di excel melebihi kapasitas (misal di baris 1-16 tercatat 32 data)
             if filled > max_slot: 
                 filled = max_slot 
                 
@@ -107,14 +110,12 @@ def process_matrix_data(df, search_term, prod_col):
 
 matrix_info, total_critical, total_kosong, kolom_list, baris_list, lokasi_kritis, lokasi_kosong = process_matrix_data(df, search_query, product_col)
 
-# 6. Modal Pop-up (Menampilkan kapasitas secara dinamis)
+# 6. Modal Pop-up 
 @st.dialog("📦 Rincian Detail Rak", width="large")
 def show_rack_detail(k, b, info):
     st.subheader(f"📍 Lokasi Racking: {k} - Baris {b}")
     c1, c2, c3 = st.columns(3)
     c1.metric("Variasi SKU", f"{info['sku_cnt']} Jenis")
-    
-    # Menampilkan max_slot secara dinamis (31 atau 44)
     c2.metric("Pallet Terisi", f"{info['filled']} / {info['max_slot']}")
     c3.metric("Space Kosong", f"{info['usable_space']} Slot")
     
@@ -244,12 +245,10 @@ def render_grid_area(title, start_baris, end_baris):
 # =========================================================================
 # 10. EKSEKUSI PEMBAGIAN 2 AREA RAK
 # =========================================================================
-# Area 1: Kapasitas Maksimal 31 Slot per baris rak
 render_grid_area("📍 Area 1: Rak Nomor 1 - 16 (Kapasitas: 31 Slot/Baris)", 1, 16)
 
 st.write("")
 st.divider()
 st.write("")
 
-# Area 2: Kapasitas Maksimal 44 Slot per baris rak
 render_grid_area("📍 Area 2: Rak Nomor 17 - 28 (Kapasitas: 44 Slot/Baris)", 17, 28)
