@@ -13,14 +13,12 @@ st.set_page_config(
 
 # 2. Koneksi Resmi ke Google Sheets
 conn = st.connection("gsheets", type=GSheetsConnection)
-# Link dibersihkan dari query parameters tambahan
 SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/edit"
 
 @st.cache_data(ttl=5) 
 def load_data():
     try:
-        # Menggunakan konektor rahasia untuk membaca tab master
-        df = conn.read(spreadsheet=SPREADSHEET_URL, worksheet="Racking%20HDI")
+        df = conn.read(spreadsheet=SPREADSHEET_URL, worksheet="Racking HDI")
         df.columns = df.columns.astype(str).str.strip()
         return df
     except Exception as e:
@@ -29,8 +27,7 @@ def load_data():
 
 def load_log():
     try:
-        # Menggunakan konektor rahasia untuk membaca tab Log Transaksi
-        df_log = conn.read(spreadsheet=SPREADSHEET_URL, worksheet="Log%20Transaksi")
+        df_log = conn.read(spreadsheet=SPREADSHEET_URL, worksheet="Log Transaksi")
         if df_log.empty:
             return pd.DataFrame(columns=["Timestamp", "Tipe Transaksi", "Nama Barang", "Rak", "Qty"])
         return df_log
@@ -243,10 +240,7 @@ elif menu == "📝 Form Transaksi":
         submitted = st.button("💾 Simpan Transaksi", use_container_width=True, type="primary")
 
         if submitted:
-            # 1. Tarik waktu sistem secara realtime
             waktu_sekarang = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            
-            # 2. Siapkan data baru untuk di push
             new_row = pd.DataFrame([{
                 "Timestamp": waktu_sekarang,
                 "Tipe Transaksi": tipe_clean,
@@ -256,28 +250,18 @@ elif menu == "📝 Form Transaksi":
             }])
             
             try:
-                # 3. Minta bot mengambil data lama di tab Log Transaksi
                 log_lama = load_log()
-                
-                # 4. Tambahkan transaksi baru ini ke baris paling bawah
                 log_baru = pd.concat([log_lama, new_row], ignore_index=True)
-                
-                # 5. Tulis / Timpa ulang Google Sheets dengan data yang sudah di-update
-                conn.update(worksheet="Log%20Transaksi", data=log_baru)
-                
+                conn.update(worksheet="Log Transaksi", data=log_baru)
                 st.success(f"✅ Transaksi berhasil dicatat! ({tipe_clean} | {qty} Pallet | {barang_dipilih} di Rak {rak_tujuan})")
-                
-                # Bersihkan memori cache agar tabel Dashboard langsung me-refresh
                 st.cache_data.clear()
             except Exception as e:
                 st.error(f"❌ Gagal menyimpan transaksi. Pastikan kunci Secrets JSON Anda valid. Error: {e}")
 
-    # Menampilkan 5 riwayat transaksi terakhir di bagian bawah
     st.divider()
     st.subheader("📜 Riwayat Transaksi Terbaru")
     log_sekarang = load_log()
     if not log_sekarang.empty:
-        # Menampilkan 5 data terakhir secara terbalik (terbaru di atas)
         st.dataframe(log_sekarang.tail(5).iloc[::-1], use_container_width=True, hide_index=True)
     else:
         st.info("Belum ada transaksi tercatat.")
