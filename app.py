@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
+from streamlit_gsheets import GSheetsConnection
 
 # 1. Konfigurasi Web
 st.set_page_config(
@@ -10,27 +11,30 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- FUNGSI LOAD DATA (KEMBALI KE METODE CSV YANG STABIL) ---
-@st.cache_data(ttl=10)
+# 2. Koneksi Resmi ke Google Sheets
+conn = st.connection("gsheets", type=GSheetsConnection)
+# Link dibersihkan dari query parameters tambahan
+SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/edit"
+
+@st.cache_data(ttl=5) 
 def load_data():
     try:
-        # Membaca tab "Racking HDI" menggunakan param &sheet=
-        url_master = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/export?format=csv&sheet=Racking%20HDI"
-        df = pd.read_csv(url_master)
+        # Menggunakan konektor rahasia untuk membaca tab master
+        df = conn.read(spreadsheet=SPREADSHEET_URL, worksheet="Racking%20HDI")
         df.columns = df.columns.astype(str).str.strip()
         return df
     except Exception as e:
         st.error(f"⚠ Gagal memuat data master! Error: {e}")
         st.stop()
 
-@st.cache_data(ttl=10)
 def load_log():
     try:
-        # Membaca tab "Log Transaksi" 
-        url_log = "https://docs.google.com/spreadsheets/d/1rPODgznxi5QxPWk6paIK0-SsTPwIByJPcGYZ8YAUEwc/export?format=csv&sheet=Log%20Transaksi"
-        return pd.read_csv(url_log)
+        # Menggunakan konektor rahasia untuk membaca tab Log Transaksi
+        df_log = conn.read(spreadsheet=SPREADSHEET_URL, worksheet="Log%20Transaksi")
+        if df_log.empty:
+            return pd.DataFrame(columns=["Timestamp", "Tipe Transaksi", "Nama Barang", "Rak", "Qty"])
+        return df_log
     except Exception:
-        # Jika kosong/gagal, kembalikan dataframe kosong
         return pd.DataFrame(columns=["Timestamp", "Tipe Transaksi", "Nama Barang", "Rak", "Qty"])
 
 df = load_data()
@@ -47,13 +51,16 @@ def is_rack_exist(kolom, baris):
 daftar_rak = [f"{k}{b}" for k in kolom_list for b in baris_list if is_rack_exist(k, b)]
 
 # =========================================================================
-# A. SIDEBAR - NAVIGASI
+# A. SIDEBAR - NAVIGASI MULTI-HALAMAN
 # =========================================================================
 st.sidebar.title("📌 Navigasi Menu")
 menu = st.sidebar.radio("Pilih Halaman:", ["🏠 Dashboard 2D", "📝 Form Transaksi"])
 st.sidebar.divider()
 
 if menu == "🏠 Dashboard 2D":
+    # =========================================================================
+    # B. HALAMAN 1: DASHBOARD VISUAL 2D
+    # =========================================================================
     st.title("📦 Visualisasi Grid Racking Gudang (2D Matrix)")
     st.caption("Klik pada kotak untuk melihat rincian isi slot pallet.")
 
@@ -127,7 +134,9 @@ if menu == "🏠 Dashboard 2D":
         c1.metric("Variasi SKU", f"{info['sku_cnt']} Jenis")
         c2.metric("Pallet Terisi", f"{info['filled']} / {info['max_slot']}")
         c3.metric("Space Kosong", f"{info['usable_space']} Slot")
+        
         st.divider()
+        
         if info['sku_cnt'] > 0:
             st.write("### 📋 Ringkasan Produk:")
             rekap = info['df_sub'][product_col].value_counts().reset_index()
@@ -139,10 +148,13 @@ if menu == "🏠 Dashboard 2D":
         else:
             st.success("✅ Baris ini KOSONG. Siap digunakan untuk Inbound!")
 
+    teks_kritis = ", ".join(lokasi_kritis) if lokasi_kritis else "Semua baris aman."
+    teks_kosong = ", ".join(lokasi_kosong) if lokasi_kosong else "Tidak ada yang 100% kosong."
+
     col_m1, col_m2, col_m3 = st.columns(3)
     col_m1.metric("Total Baris Racking Aktif", "156 Baris")
-    col_m2.metric("Baris Status Kritis", f"{total_critical} Baris")
-    col_m3.metric("Baris Kosong Total", f"{total_kosong} Baris")
+    col_m2.metric("Baris Status Kritis", f"{total_critical} Baris", help=f"🚨 Kritis:\n\n{teks_kritis}")
+    col_m3.metric("Baris Kosong Total", f"{total_kosong} Baris", help=f"✅ Kosong:\n\n{teks_kosong}")
     st.divider()
 
     dynamic_css = """
@@ -168,6 +180,7 @@ if menu == "🏠 Dashboard 2D":
             if not info or not info['exist']: continue
             sku = info['sku_cnt']
             selector = f".st-key-btn_{k}_{b} button"
+            
             if info['is_match']: color_map['match']['selectors'].append(selector)
             elif sku >= 4: color_map['critical']['selectors'].append(selector)
             elif sku == 3: color_map['warning']['selectors'].append(selector)
@@ -184,6 +197,7 @@ if menu == "🏠 Dashboard 2D":
         st.markdown(f"### {title}")
         subset_baris = list(range(start_baris, end_baris + 1))
         total_kolom = 16  
+        
         for k in kolom_list:
             cols = st.columns([0.6] + [1] * total_kolom, gap="small")
             with cols[0]:
@@ -210,12 +224,18 @@ if menu == "🏠 Dashboard 2D":
     render_grid_area("📍 Area 2: Rak Nomor 17 - 28 (Kapasitas: 44 Slot/Baris)", 17, 28)
 
 elif menu == "📝 Form Transaksi":
+    # =========================================================================
+    # C. HALAMAN 2: FORM TRANSAKSI (MINI WMS) AKTIF PENUH
+    # =========================================================================
     st.title("📝 Form Transaksi Gudang")
     st.caption("Catat barang masuk (Inbound) dan barang keluar (Outbound) ke dalam sistem.")
     
     with st.container(border=True):
         st.subheader("Form Data Pallet")
+        
         tipe_trx = st.radio("Tipe Pergerakan:", ["INBOUND (Barang Masuk) ⬇️", "OUTBOUND (Barang Keluar) ⬆️"])
+        tipe_clean = "INBOUND" if "INBOUND" in tipe_trx else "OUTBOUND"
+        
         barang_dipilih = st.selectbox("Nama Barang:", options=daftar_barang)
         rak_tujuan = st.selectbox("Lokasi Rak (Tujuan/Asal):", options=daftar_rak)
         qty = st.number_input("Jumlah Pallet (Qty):", min_value=1, step=1)
@@ -223,14 +243,41 @@ elif menu == "📝 Form Transaksi":
         submitted = st.button("💾 Simpan Transaksi", use_container_width=True, type="primary")
 
         if submitted:
-            # Peringatan karena belum ada kredensial Google
-            st.warning("⚠️ Fitur 'Simpan' ke Google Sheets saat ini dinonaktifkan karena membutuhkan konfigurasi Kunci Keamanan Google (Service Account) di Streamlit Secrets.")
-            st.info("💡 Solusi Alternatif Termudah: Buat **Google Form** yang terhubung langsung ke tab 'Log Transaksi' Anda. Data akan masuk secara otomatis tanpa perlu *coding* keamanan!")
+            # 1. Tarik waktu sistem secara realtime
+            waktu_sekarang = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            # 2. Siapkan data baru untuk di push
+            new_row = pd.DataFrame([{
+                "Timestamp": waktu_sekarang,
+                "Tipe Transaksi": tipe_clean,
+                "Nama Barang": barang_dipilih,
+                "Rak": rak_tujuan,
+                "Qty": qty
+            }])
+            
+            try:
+                # 3. Minta bot mengambil data lama di tab Log Transaksi
+                log_lama = load_log()
+                
+                # 4. Tambahkan transaksi baru ini ke baris paling bawah
+                log_baru = pd.concat([log_lama, new_row], ignore_index=True)
+                
+                # 5. Tulis / Timpa ulang Google Sheets dengan data yang sudah di-update
+                conn.update(worksheet="Log%20Transaksi", data=log_baru)
+                
+                st.success(f"✅ Transaksi berhasil dicatat! ({tipe_clean} | {qty} Pallet | {barang_dipilih} di Rak {rak_tujuan})")
+                
+                # Bersihkan memori cache agar tabel Dashboard langsung me-refresh
+                st.cache_data.clear()
+            except Exception as e:
+                st.error(f"❌ Gagal menyimpan transaksi. Pastikan kunci Secrets JSON Anda valid. Error: {e}")
 
+    # Menampilkan 5 riwayat transaksi terakhir di bagian bawah
     st.divider()
     st.subheader("📜 Riwayat Transaksi Terbaru")
     log_sekarang = load_log()
     if not log_sekarang.empty:
-        st.dataframe(log_sekarang.tail(10).iloc[::-1], use_container_width=True, hide_index=True)
+        # Menampilkan 5 data terakhir secara terbalik (terbaru di atas)
+        st.dataframe(log_sekarang.tail(5).iloc[::-1], use_container_width=True, hide_index=True)
     else:
-        st.info("Belum ada transaksi tercatat di Google Sheets.")
+        st.info("Belum ada transaksi tercatat.")
