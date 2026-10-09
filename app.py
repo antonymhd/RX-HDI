@@ -35,8 +35,13 @@ uploaded_file = st.sidebar.file_uploader("Upload File Stok (.csv)", type=["csv"]
 if uploaded_file is not None:
     if st.sidebar.button("🚀 Sinkronisasi ke Firebase", use_container_width=True, type="primary"):
         with st.spinner("Mengirim ratusan data ke Firebase..."):
-            try:
-                df_upload = pd.read_csv(uploaded_file)
+            # Kita tambahkan deteksi titik koma dan penanganan jika error koma
+                try:
+                    df_upload = pd.read_csv(uploaded_file, sep=";")
+                except Exception:
+                    uploaded_file.seek(0)
+                    df_upload = pd.read_csv(uploaded_file, sep=",")
+                
                 df_upload.columns = df_upload.columns.astype(str).str.strip()
                 
                 batch = db.batch()
