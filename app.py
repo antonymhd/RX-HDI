@@ -126,9 +126,12 @@ def show_rack_detail(k, b, info):
         rekap.columns = ['Nama Produk', 'Jumlah Pallet']
         st.dataframe(rekap, use_container_width=True, hide_index=True)
         
-        with st.expander(f"🔍 Lihat Detail Seluruh Slot (1-{info['max_slot']})"):
-             avail = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'No Lot', product_col, 'Status'] if c in info['df_sub'].columns]
-             st.dataframe(info['df_sub'][avail], use_container_width=True, hide_index=True)
+        with st.expander("🔍 Lihat Detail Seluruh Slot (1-31)"):
+    # ... (kode lainnya) ...
+    
+    df_tabel = df_filter[['Pallet Ke', 'Part Number', 'Lot Number', 'Nama Produk', 'In', 'Sisa', 'Status']]
+    
+    st.dataframe(df_tabel)
     else:
         st.success("✅ Baris ini KOSONG. Siap digunakan untuk Inbound!")
 
