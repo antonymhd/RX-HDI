@@ -126,12 +126,22 @@ def show_rack_detail(k, b, info):
         rekap.columns = ['Nama Produk', 'Jumlah Pallet']
         st.dataframe(rekap, use_container_width=True, hide_index=True)
         
-        with st.expander("🔍 Lihat Detail Seluruh Slot (1-31)"):
-    # ... (kode lainnya) ...
-    
-    df_tabel = df_filter[['Pallet Ke', 'Part Number', 'Lot Number', 'Nama Produk', 'In', 'Sisa', 'Status']]
-    
-    st.dataframe(df_tabel)
+        with st.expander(f"🔍 Lihat Detail Seluruh Slot (1-{info['max_slot']})"):
+             # =========================================================
+             # DI SINI PERUBAHANNYA: Menambahkan 'In', 'Out', dan 'Sisa'
+             # =========================================================
+             avail = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'No Lot', product_col, 'In', 'Out', 'Sisa', 'Status'] if c in info['df_sub'].columns]
+             
+             # Format data sedikit agar angka tampil cantik dan rapi (menghapus desimal .0 jika ada)
+             df_tampil = info['df_sub'][avail].copy()
+             for col in ['In', 'Out', 'Sisa']:
+                 if col in df_tampil.columns:
+                     # Mengubah angka NaN menjadi 0 agar rapi, lalu membuang desimal
+                     df_tampil[col] = pd.to_numeric(df_tampil[col], errors='coerce').fillna(0).astype(int)
+                     # Jika Sisa = 0 tapi status kosong, sembunyikan angkanya
+                     df_tampil[col] = df_tampil[col].replace(0, "")
+             
+             st.dataframe(df_tampil, use_container_width=True, hide_index=True)
     else:
         st.success("✅ Baris ini KOSONG. Siap digunakan untuk Inbound!")
 
