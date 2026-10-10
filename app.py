@@ -28,96 +28,110 @@ st.title("📦 Visualisasi Grid Racking Gudang (Firebase)")
 st.caption("Mode Mandiri (Stand-alone). Data ditarik dan disimpan di Firebase.")
 
 # ==========================================================
-# 3. SIDEBAR: UPLOADER DATA
+# 3. SIDEBAR: TOMBOL REFRESH (UMUM)
 # ==========================================================
-st.sidebar.header("📤 Update Data Harian")
-st.sidebar.caption("Upload file CSV dari susunan Excel Anda untuk memperbarui visualisasi.")
+# Tombol ini diletakkan di luar area rahasia agar semua orang bisa me-refresh layar
+if st.sidebar.button("🔄 Refresh Layar Visualisasi", use_container_width=True):
+    st.cache_data.clear()
+    st.rerun()
 
-uploaded_file = st.sidebar.file_uploader("Upload File Stok (.csv)", type=["csv"])
+st.sidebar.divider()
 
-if uploaded_file is not None:
-    if st.sidebar.button("🚀 Sinkronisasi ke Firebase", use_container_width=True, type="primary"):
-        with st.spinner("Mengirim data ke Firebase..."):
-            try:
-                # Coba baca dengan pemisah titik koma (;) dulu, jika gagal pakai koma (,)
+# ==========================================================
+# 4. SIDEBAR: AKSES ADMIN (KUNCI RAHASIA)
+# ==========================================================
+st.sidebar.header("🔐 Akses Khusus Admin")
+st.sidebar.caption("Masukkan kunci untuk Update / Hapus data.")
+
+# SILAKAN UBAH PASSWORD INI SESUAI KEINGINAN ANDA:
+KUNCI_RAHASIA = "admin123"
+
+kunci_input = st.sidebar.text_input("Kunci Rahasia:", type="password")
+
+if kunci_input == KUNCI_RAHASIA:
+    st.sidebar.success("✅ Akses Diberikan")
+    
+    # --- FITUR UPLOAD (HANYA MUNCUL JIKA KUNCI BENAR) ---
+    st.sidebar.divider()
+    st.sidebar.subheader("📤 Update Data Harian")
+    uploaded_file = st.sidebar.file_uploader("Upload File Stok (.csv)", type=["csv"])
+
+    if uploaded_file is not None:
+        if st.sidebar.button("🚀 Sinkronisasi ke Firebase", use_container_width=True, type="primary"):
+            with st.spinner("Mengirim data ke Firebase..."):
                 try:
-                    df_upload = pd.read_csv(uploaded_file, sep=";")
-                except Exception:
-                    uploaded_file.seek(0)
-                    df_upload = pd.read_csv(uploaded_file, sep=",")
-                
-                # Bersihkan nama kolom dari spasi dan karakter aneh bawaan Excel (\ufeff)
-                df_upload.columns = df_upload.columns.str.replace('\ufeff', '').str.strip()
-                
+                    try:
+                        df_upload = pd.read_csv(uploaded_file, sep=";")
+                    except Exception:
+                        uploaded_file.seek(0)
+                        df_upload = pd.read_csv(uploaded_file, sep=",")
+                    
+                    df_upload.columns = df_upload.columns.str.replace('\ufeff', '').str.strip()
+                    
+                    batch = db.batch()
+                    count = 0
+                    
+                    for index, row in df_upload.iterrows():
+                        kolom = str(row.get('Kolom', '')).strip()
+                        baris = row.get('Baris')
+                        pallet = row.get('Pallet Ke')
+                        
+                        if pd.notna(kolom) and pd.notna(baris) and pd.notna(pallet):
+                            try:
+                                b_int = int(float(baris))
+                                p_int = int(float(pallet))
+                                doc_id = f"{kolom}{b_int}-{p_int}"
+                                
+                                doc_ref = db.collection('visualisasi_rak').document(doc_id)
+                                data_dict = {str(k): (v if pd.notna(v) else "") for k, v in row.to_dict().items()}
+                                batch.set(doc_ref, data_dict)
+                                
+                                count += 1
+                                if count % 400 == 0:
+                                    batch.commit()
+                                    batch = db.batch()
+                            except ValueError:
+                                continue
+                                
+                    batch.commit()
+                    st.sidebar.success(f"✅ {count} Pallet berhasil di-update!")
+                    
+                    st.cache_data.clear()
+                    time.sleep(1.5)
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.sidebar.error(f"Gagal mengunggah data: {e}")
+
+    # --- FITUR HAPUS SEMUA DATA (HANYA MUNCUL JIKA KUNCI BENAR) ---
+    st.sidebar.divider()
+    st.sidebar.subheader("⚠️ Zona Bahaya")
+    if st.sidebar.button("🗑️ Hapus Semua Data", type="primary", use_container_width=True):
+        with st.spinner("Menyapu bersih seluruh data..."):
+            try:
+                docs = db.collection('visualisasi_rak').stream()
                 batch = db.batch()
                 count = 0
                 
-                for index, row in df_upload.iterrows():
-                    kolom = str(row.get('Kolom', '')).strip()
-                    baris = row.get('Baris')
-                    pallet = row.get('Pallet Ke')
-                    
-                    if pd.notna(kolom) and pd.notna(baris) and pd.notna(pallet):
-                        try:
-                            b_int = int(float(baris))
-                            p_int = int(float(pallet))
-                            doc_id = f"{kolom}{b_int}-{p_int}"
-                            
-                            doc_ref = db.collection('visualisasi_rak').document(doc_id)
-                            data_dict = {str(k): (v if pd.notna(v) else "") for k, v in row.to_dict().items()}
-                            batch.set(doc_ref, data_dict)
-                            
-                            count += 1
-                            if count % 400 == 0:
-                                batch.commit()
-                                batch = db.batch()
-                        except ValueError:
-                            continue
-                            
+                for doc in docs:
+                    batch.delete(doc.reference)
+                    count += 1
+                    if count % 400 == 0:
+                        batch.commit()
+                        batch = db.batch()
+                        
                 batch.commit()
-                st.sidebar.success(f"✅ {count} Pallet berhasil di-update!")
-                
-                # Bersihkan cache dan paksa refresh layar
+                st.sidebar.success(f"✅ {count} data berhasil dihapus permanen!")
                 st.cache_data.clear()
                 time.sleep(1.5)
                 st.rerun()
                 
             except Exception as e:
-                st.sidebar.error(f"Gagal mengunggah data: {e}")
+                st.sidebar.error(f"Gagal menghapus data: {e}")
 
-st.sidebar.divider()
-
-# ==========================================================
-# 4. SIDEBAR: REFRESH & HAPUS DATA
-# ==========================================================
-if st.sidebar.button("🔄 Refresh Data Visualisasi"):
-    st.cache_data.clear()
-    st.rerun()
-
-st.sidebar.divider()
-st.sidebar.subheader("⚠️ Zona Bahaya")
-if st.sidebar.button("🗑️ Hapus Semua Data", type="primary"):
-    with st.spinner("Menyapu bersih seluruh data..."):
-        try:
-            docs = db.collection('visualisasi_rak').stream()
-            batch = db.batch()
-            count = 0
-            
-            for doc in docs:
-                batch.delete(doc.reference)
-                count += 1
-                if count % 400 == 0:
-                    batch.commit()
-                    batch = db.batch()
-                    
-            batch.commit()
-            st.sidebar.success(f"✅ {count} data berhasil dihapus permanen!")
-            st.cache_data.clear()
-            time.sleep(1.5)
-            st.rerun()
-            
-        except Exception as e:
-            st.sidebar.error(f"Gagal menghapus data: {e}")
+elif kunci_input != "":
+    # Jika user mengetik sesuatu tapi salah
+    st.sidebar.error("❌ Kunci salah. Akses ditolak.")
 
 st.sidebar.divider()
 
@@ -131,7 +145,6 @@ def load_data_from_firebase():
     if data:
         df = pd.DataFrame(data)
         
-        # Konversi tipe data agar stabil
         if 'Baris' in df.columns:
             df['Baris'] = pd.to_numeric(df['Baris'], errors='coerce').fillna(0).astype(int)
         if 'Pallet Ke' in df.columns:
@@ -147,7 +160,7 @@ def load_data_from_firebase():
 df = load_data_from_firebase()
 
 if df.empty:
-    st.warning("Data visualisasi masih kosong. Silakan upload file CSV Anda di menu samping kiri.")
+    st.warning("Data visualisasi masih kosong. Silakan masuk sebagai Admin di menu sebelah kiri untuk mengunggah file CSV stok Anda.")
     st.stop()
 
 product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
@@ -250,7 +263,7 @@ def show_rack_detail(k, b, info):
     if info['sku_cnt'] > 0:
         st.write("### 📋 Ringkasan Produk:")
         
-        # --- PERBAIKAN: Saring data agar hanya menampilkan pallet yang memiliki Nama Produk ---
+        # Menyembunyikan baris produk yang kosong
         df_terisi = info['df_sub'][info['df_sub'][product_col].astype(str).str.strip() != ""]
         
         rekap = df_terisi[product_col].value_counts().reset_index()
