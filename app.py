@@ -249,17 +249,18 @@ def show_rack_detail(k, b, info):
     
     if info['sku_cnt'] > 0:
         st.write("### 📋 Ringkasan Produk:")
-        rekap = info['df_sub'][product_col].value_counts().reset_index()
+        
+        # --- PERBAIKAN: Saring data agar hanya menampilkan pallet yang memiliki Nama Produk ---
+        df_terisi = info['df_sub'][info['df_sub'][product_col].astype(str).str.strip() != ""]
+        
+        rekap = df_terisi[product_col].value_counts().reset_index()
         rekap.columns = ['Nama Produk', 'Jumlah Pallet']
         st.dataframe(rekap, use_container_width=True, hide_index=True)
         
-        with st.expander(f"🔍 Lihat Detail Seluruh Slot (1-{info['max_slot']})"):
-            avail = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'No Lot', product_col, 'In', 'Out', 'Sisa', 'Status'] if c in info['df_sub'].columns]
-            df_tampil = info['df_sub'][avail].copy()
+        with st.expander(f"🔍 Lihat Detail Pallet Terisi"):
+            avail = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'No Lot', product_col, 'In', 'Out', 'Sisa', 'Status'] if c in df_terisi.columns]
+            df_tampil = df_terisi[avail].copy()
             
-            # ----------------------------------------------------
-            # INI DIA BARIS KODE BARU UNTUK MENGURUTKAN PALLET:
-            # ----------------------------------------------------
             if 'Pallet Ke' in df_tampil.columns:
                 df_tampil = df_tampil.sort_values(by='Pallet Ke', ascending=True)
             
