@@ -257,6 +257,12 @@ def show_rack_detail(k, b, info):
             avail = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', 'No Lot', product_col, 'In', 'Out', 'Sisa', 'Status'] if c in info['df_sub'].columns]
             df_tampil = info['df_sub'][avail].copy()
             
+            # ----------------------------------------------------
+            # INI DIA BARIS KODE BARU UNTUK MENGURUTKAN PALLET:
+            # ----------------------------------------------------
+            if 'Pallet Ke' in df_tampil.columns:
+                df_tampil = df_tampil.sort_values(by='Pallet Ke', ascending=True)
+            
             for col in ['In', 'Out', 'Sisa']:
                 if col in df_tampil.columns:
                     df_tampil[col] = pd.to_numeric(df_tampil[col], errors='coerce').fillna(0).astype(int)
@@ -286,72 +292,4 @@ div[data-testid="stColumn"]:nth-child(1) { display: flex; align-items: center; j
 div[class^="st-key-btn_"] button {
     aspect-ratio: 1/1 !important; width: 100% !important; min-width: 22px !important;
     padding: 0px !important; margin: 0px !important; border: 1px solid #475569 !important;
-    border-radius: 4px !important; display: flex !important; align-items: center !important;
-    justify-content: center !important; font-size: clamp(10px, 1.2vw, 16px) !important; font-weight: 900 !important;
-}
-div[class^="st-key-btn_"] button:hover { transform: scale(1.15); border: 2px solid #fff !important; z-index: 10; }
-"""
-
-color_map = {
-    'match': {"bg": "#38bdf8", "txt": "#000000", "selectors": []},
-    'critical': {"bg": "#ef4444", "txt": "#ffffff", "selectors": []},
-    'warning': {"bg": "#fde047", "txt": "#000000", "selectors": []},
-    'ideal': {"bg": "#86efac", "txt": "#000000", "selectors": []},
-    'empty': {"bg": "#e2e8f0", "txt": "#94a3b8", "selectors": []}
-}
-
-for k in kolom_list:
-    for b in baris_list:
-        info = matrix_info.get((k, b))
-        if not info or not info['exist']: continue
-        
-        sku = info['sku_cnt']
-        selector = f".st-key-btn_{k}_{b} button"
-        
-        if info['is_match']: color_map['match']['selectors'].append(selector)
-        elif sku >= 4: color_map['critical']['selectors'].append(selector)
-        elif sku == 3: color_map['warning']['selectors'].append(selector)
-        elif sku in [1, 2]: color_map['ideal']['selectors'].append(selector)
-        else: color_map['empty']['selectors'].append(selector)
-
-for group in color_map.values():
-    if group['selectors']:
-        dynamic_css += f"\n{', '.join(group['selectors'])} {{ background-color: {group['bg']} !important; color: {group['txt']} !important; }}"
-
-st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
-
-# ==========================================================
-# 10. RENDER GRID AREA
-# ==========================================================
-def render_grid_area(title, start_baris, end_baris):
-    st.markdown(f"### {title}")
-    subset_baris = list(range(start_baris, end_baris + 1))
-    total_kolom = 16  
-    
-    for k in kolom_list:
-        cols = st.columns([0.6] + [1] * total_kolom, gap="small")
-        with cols[0]:
-            st.markdown(f"<div style='font-size:16px; font-weight:900; color:#cbd5e1;'>{k}</div>", unsafe_allow_html=True)
-            
-        for idx, b in enumerate(subset_baris):
-            info = matrix_info[(k, b)]
-            with cols[idx + 1]:
-                if not info['exist']:
-                    st.write("") 
-                else:
-                    if st.button(f"{info['sku_cnt']}", key=f"btn_{k}_{b}", use_container_width=True):
-                        show_rack_detail(k, b, info)
-                            
-    cols_bottom = st.columns([0.6] + [1] * total_kolom, gap="small")
-    with cols_bottom[0]:
-        st.write("")
-        
-    for idx, b in enumerate(subset_baris):
-        with cols_bottom[idx + 1]:
-            st.markdown(f"<div style='text-align:center; font-weight:900; color:#0ea5e9; font-size:clamp(10px, 1.2vw, 16px); margin-top:5px;'>{b}</div>", unsafe_allow_html=True)
-
-render_grid_area("📍 Area 1: Rak Nomor 1 - 16 (Kapasitas: 31 Slot/Baris)", 1, 16)
-st.write("")
-st.divider()
-st.write("")
-render_grid_area("📍 Area 2: Rak Nomor 17 - 28 (Kapasitas: 44 Slot/Baris)", 17, 28)
+    border-radius: 4px !important;
