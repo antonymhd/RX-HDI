@@ -257,7 +257,6 @@ def show_rack_detail(k, b, info):
     st.divider()
     
     if info['sku_cnt'] > 0:
-        # Buka Master Produk dan bersihkan namanya untuk pencocokan yang kebal spasi
         try:
             try:
                 df_master = pd.read_csv("Master_Produk.csv", sep=";")
@@ -277,16 +276,15 @@ def show_rack_detail(k, b, info):
             part_num = str(df_prod['Part Number'].iloc[0]).strip().upper() if 'Part Number' in df_prod.columns else ""
             jml_utuh = df_prod[~df_prod['Keterangan'].astype(str).str.contains('Pecahan', case=False, na=False)].shape[0]
             
-            # Ambil angka qty pecahan dari keterangan
             pecahan_rows = df_prod[df_prod['Keterangan'].astype(str).str.contains('Pecahan', case=False, na=False)]
             val_pecahan = 0
             if not pecahan_rows.empty:
+                import re
                 ket_str = str(pecahan_rows['Keterangan'].iloc[0])
                 numbers = re.findall(r'\d+', ket_str)
                 if numbers:
                     val_pecahan = int(numbers[0])
 
-            # Cari data di Master Produk (Pencocokan akurat)
             isi_pallet_pcs = 0
             pcs_per_box = 0
             pcs_per_sak = 0
@@ -302,32 +300,29 @@ def show_rack_detail(k, b, info):
                 pcs_per_sak = pd.to_numeric(m_row.get('Sac / Pallet', 0), errors='coerce')
                 pcs_per_sak = 0 if pd.isna(pcs_per_sak) else pcs_per_sak
 
-            # --- LOGIKA MATEMATIKA TOTAL PCS ---
+            # --- LOGIKA MATEMATIKA TOTAL PCS DENGAN FORMAT BARU ---
             is_box_type = part_num.endswith('D')
             satuan_kecil = "Dus" if is_box_type else "Sak"
             pcs_per_satuan = pcs_per_box if is_box_type else pcs_per_sak
             
             if isi_pallet_pcs > 0:
-                # 1. Hitung total Pcs dari pallet utuh
                 total_pcs_dari_pallet = jml_utuh * isi_pallet_pcs
-                
-                # 2. Hitung total Pcs dari pecahan dus/sak
                 total_pcs_dari_pecahan = val_pecahan * pcs_per_satuan
-                
-                # 3. Total Keseluruhan
                 total_semua_pcs = total_pcs_dari_pallet + total_pcs_dari_pecahan
                 
-                # 4. Susun kalimat laporan
-                teks_rincian = f"{jml_utuh} Pallet ({total_pcs_dari_pallet:,.0f} Pcs)"
+                # Format yang diminta user: "27 Pallet * 43200"
+                teks_rincian = f"{jml_utuh} Pallet * {isi_pallet_pcs:,.0f}"
+                
                 if val_pecahan > 0:
-                    teks_rincian += f" + {val_pecahan} {satuan_kecil} ({total_pcs_dari_pecahan:,.0f} Pcs)"
+                    teks_rincian += f" + {val_pecahan} {satuan_kecil} * {pcs_per_satuan:,.0f}"
+                    
                 teks_rincian += f" = **Total {total_semua_pcs:,.0f} Pcs**"
                 
             else:
                 teks_rincian = f"{jml_utuh} Pallet"
                 if val_pecahan > 0:
                     teks_rincian += f" + {val_pecahan} Pecahan"
-                teks_rincian += " (Data Master Kosong / Tidak Ditemukan)"
+                teks_rincian += " (Data Master Kosong)"
 
             rekap_data.append({
                 'Part Number': part_num,
