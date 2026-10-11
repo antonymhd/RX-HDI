@@ -212,7 +212,7 @@ def process_matrix_data(df, search_term, prod_col):
             if len(sub) > max_slot:
                 sub = sub.head(max_slot)
                 
-            prods = sub[prod_col].dropna().unique() if prod_col in sub.columns else []
+            prods = sub[sub[prod_col].astype(str).str.strip() != ""][prod_col].unique() if prod_col in sub.columns else []
             sku = len(prods)
             filled = sub['Part Number'].apply(lambda x: x != "" and pd.notna(x)).sum() if 'Part Number' in sub.columns else 0
             
