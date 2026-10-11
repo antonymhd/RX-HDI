@@ -287,32 +287,31 @@ def show_rack_detail(k, b, info):
 
             # Ambil data dari Master Produk
             isi_pallet_pcs = 0
-            box_per_pallet = 0
-            sac_per_pallet = 0
+            pcs_per_box = 0
+            pcs_per_sak = 0
             
             if not df_master.empty and part_num in df_master['Part Number'].astype(str).values:
                 m_row = df_master[df_master['Part Number'].astype(str) == part_num].iloc[0]
                 isi_pallet_pcs = pd.to_numeric(m_row.get('Isi 1 Pallet (pcs)', 0), errors='coerce') or 0
-                box_per_pallet = pd.to_numeric(m_row.get('Box / Pallet', 0), errors='coerce') or 0
-                sac_per_pallet = pd.to_numeric(m_row.get('Sac / Pallet', 0), errors='coerce') or 0
+                pcs_per_box = pd.to_numeric(m_row.get('Box / Pallet', 0), errors='coerce') or 0
+                pcs_per_sak = pd.to_numeric(m_row.get('Sac / Pallet', 0), errors='coerce') or 0
 
-            # --- LOGIKA KONVERSI SESUAI ATURAN PART NUMBER ---
-            # Akhiran D = Box, Lainnya (C / dll) = Sak
+            # --- LOGIKA KONVERSI BENAR SESUAI MASTER ---
             is_box_type = part_num.upper().endswith('D')
-            
-            # Hitung total konversi unit kecil (Box / Sak)
             satuan_kecil = "Box" if is_box_type else "Sak"
-            rasio_kecil = box_per_pallet if is_box_type else sac_per_pallet
+            pcs_per_satuan = pcs_per_box if is_box_type else pcs_per_sak
             
-            total_utuh_kecil = jml_utuh * rasio_kecil if rasio_kecil > 0 else 0
-            total_keseluruhan_kecil = total_utuh_kecil + val_pecahan
+            # Hitung jumlah box/sak per pallet (Total Pcs Pallet / Pcs per Box/Sak)
+            satuan_per_pallet = (isi_pallet_pcs / pcs_per_satuan) if (pcs_per_satuan > 0 and isi_pallet_pcs > 0) else 0
             
-            # Susun teks rincian
-            if rasio_kecil > 0:
-                teks_rincian = f"{jml_utuh} Pallet ({total_utuh_kecil:,.0f} {satuan_kecil})"
+            total_utuh_satuan = jml_utuh * satuan_per_pallet
+            total_keseluruhan_satuan = total_utuh_satuan + val_pecahan
+            
+            if satuan_per_pallet > 0:
+                teks_rincian = f"{jml_utuh} Pallet ({total_utuh_satuan:,.0f} {satuan_kecil})"
                 if val_pecahan > 0:
                     teks_rincian += f" + {val_pecahan} {satuan_kecil} (Pecahan)"
-                teks_rincian += f" = **Total {total_keseluruhan_kecil:,.0f} {satuan_kecil}**"
+                teks_rincian += f" = **Total {total_keseluruhan_satuan:,.0f} {satuan_kecil}**"
             else:
                 teks_rincian = f"{jml_utuh} Pallet"
                 if val_pecahan > 0:
