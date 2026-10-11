@@ -3,6 +3,7 @@ import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, firestore
 import time
+import re
 
 # ==========================================================
 # 1. KONFIGURASI WEB & DATABASE
@@ -14,7 +15,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 💡 UBAH NAMA INI MENJADI 'visualisasi_rak' JIKA SUDAH SELESAI UJI COBA
+# 💡 NAMA DATABASE
 NAMA_DATABASE = 'uji_coba_rak'
 
 if not firebase_admin._apps:
@@ -150,7 +151,6 @@ product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 # ==========================================================
 st.sidebar.header("🔍 Pencarian & Filter")
 if product_col in df.columns:
-    # Filter sel kosong
     daftar_barang = sorted(df[df[product_col].astype(str).str.strip() != ""][product_col].dropna().astype(str).unique().tolist())
 else:
     daftar_barang = []
@@ -212,7 +212,6 @@ def process_matrix_data(df, search_term, prod_col):
             if len(sub) > max_slot:
                 sub = sub.head(max_slot)
                 
-            # PERBAIKAN BUG: Hapus sel kosong dan spasi sebelum menghitung jenis SKU
             prods = sub[sub[prod_col].astype(str).str.strip() != ""][prod_col].unique() if prod_col in sub.columns else []
             sku = len(prods)
             filled = sub['Part Number'].apply(lambda x: str(x).strip() != "" and pd.notna(x)).sum() if 'Part Number' in sub.columns else 0
@@ -245,9 +244,9 @@ def process_matrix_data(df, search_term, prod_col):
 matrix_info, total_critical, total_kosong, kolom_list, baris_list, lokasi_kritis, lokasi_kosong = process_matrix_data(df, search_query, product_col)
 
 # ==========================================================
-# 6. MODAL POP-UP (DETAIL PALLET)
+# 6. MODAL POP-UP (DETAIL PALLET & KONVERSI KEMASAN BOX/SAK)
 # ==========================================================
-@st.dialog("📦 Rincian Detail Rak", width="large")
+@st.dialog("📦 Rincian Detail Rak & Konversi Stok", width="large")
 def show_rack_detail(k, b, info):
     st.subheader(f"📍 Lokasi Racking: {k} - Baris {b}")
     c1, c2, c3 = st.columns(3)
@@ -258,26 +257,74 @@ def show_rack_detail(k, b, info):
     st.divider()
     
     if info['sku_cnt'] > 0:
-        st.write("### 📋 Ringkasan Produk & Stok:")
+        # Buka Master Produk
+        try:
+            try:
+                df_master = pd.read_csv("Master_Produk.csv", sep=";")
+            except:
+                df_master = pd.read_csv("Master_Produk.csv", sep=",")
+        except FileNotFoundError:
+            df_master = pd.DataFrame()
+
+        st.write("### 📋 Ringkasan & Konversi Kuantitas:")
         df_terisi = info['df_sub'][info['df_sub'][product_col].astype(str).str.strip() != ""]
         
-        # --- HITUNG STOK UTUH DAN PECAHAN ---
         rekap_data = []
         for prod in df_terisi[product_col].unique():
             df_prod = df_terisi[df_terisi[product_col] == prod]
             
-            # Hitung pallet utuh (yang keterangannya tidak mengandung kata "Pecahan")
+            part_num = str(df_prod['Part Number'].iloc[0]).strip() if 'Part Number' in df_prod.columns else ""
             jml_utuh = df_prod[~df_prod['Keterangan'].astype(str).str.contains('Pecahan', case=False, na=False)].shape[0]
             
-            # Ambil nilai pecahan (jika ada)
-            pecahan_str = df_prod[df_prod['Keterangan'].astype(str).str.contains('Pecahan', case=False, na=False)]['Keterangan'].tolist()
-            catatan_pecahan = " + ".join(pecahan_str) if pecahan_str else "-"
+            # Ambil nilai pecahan dari keterangan
+            pecahan_rows = df_prod[df_prod['Keterangan'].astype(str).str.contains('Pecahan', case=False, na=False)]
+            val_pecahan = 0
+            if not pecahan_rows.empty:
+                ket_str = str(pecahan_rows['Keterangan'].iloc[0])
+                numbers = re.findall(r'\d+', ket_str)
+                if numbers:
+                    val_pecahan = int(numbers[0])
+
+            # Ambil data dari Master Produk
+            isi_pallet_pcs = 0
+            box_per_pallet = 0
+            sac_per_pallet = 0
             
+            if not df_master.empty and part_num in df_master['Part Number'].astype(str).values:
+                m_row = df_master[df_master['Part Number'].astype(str) == part_num].iloc[0]
+                isi_pallet_pcs = pd.to_numeric(m_row.get('Isi 1 Pallet (pcs)', 0), errors='coerce') or 0
+                box_per_pallet = pd.to_numeric(m_row.get('Box / Pallet', 0), errors='coerce') or 0
+                sac_per_pallet = pd.to_numeric(m_row.get('Sac / Pallet', 0), errors='coerce') or 0
+
+            # --- LOGIKA KONVERSI SESUAI ATURAN PART NUMBER ---
+            # Akhiran D = Box, Lainnya (C / dll) = Sak
+            is_box_type = part_num.upper().endswith('D')
+            
+            # Hitung total konversi unit kecil (Box / Sak)
+            satuan_kecil = "Box" if is_box_type else "Sak"
+            rasio_kecil = box_per_pallet if is_box_type else sac_per_pallet
+            
+            total_utuh_kecil = jml_utuh * rasio_kecil if rasio_kecil > 0 else 0
+            total_keseluruhan_kecil = total_utuh_kecil + val_pecahan
+            
+            # Susun teks rincian
+            if rasio_kecil > 0:
+                teks_rincian = f"{jml_utuh} Pallet ({total_utuh_kecil:,.0f} {satuan_kecil})"
+                if val_pecahan > 0:
+                    teks_rincian += f" + {val_pecahan} {satuan_kecil} (Pecahan)"
+                teks_rincian += f" = **Total {total_keseluruhan_kecil:,.0f} {satuan_kecil}**"
+            else:
+                teks_rincian = f"{jml_utuh} Pallet"
+                if val_pecahan > 0:
+                    teks_rincian += f" + {val_pecahan} Pecahan"
+                teks_rincian += " (Data Master Konversi Belum Lengkap)"
+
             rekap_data.append({
+                'Part Number': part_num,
                 'Nama Produk': prod,
-                'Stok Utuh (Pallet)': jml_utuh,
-                'Catatan Pecahan': catatan_pecahan,
-                'Total Slot Fisik': len(df_prod)
+                'Pallet Utuh': jml_utuh,
+                'Pecahan': val_pecahan if val_pecahan > 0 else "-",
+                'Konversi Detail': teks_rincian
             })
             
         st.dataframe(pd.DataFrame(rekap_data), use_container_width=True, hide_index=True)
