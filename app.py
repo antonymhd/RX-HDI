@@ -15,7 +15,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 💡 NAMA DATABASE
 NAMA_DATABASE = 'uji_coba_rak'
 
 if not firebase_admin._apps:
@@ -25,12 +24,22 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 # ==========================================================
-# 2. SIDEBAR: REFRESH & AKSES ADMIN
+# 2. SIDEBAR: REFRESH, AKSES ADMIN, & MODE TAMPILAN
 # ==========================================================
 st.sidebar.header("🔄 Muat Ulang")
 if st.sidebar.button("Refresh Layar Visualisasi", use_container_width=True):
     st.cache_data.clear()
     st.rerun()
+
+st.sidebar.divider()
+
+# --- FITUR BARU: TOGGLE MODE TAMPILAN RAK ---
+st.sidebar.header("👁️ Mode Tampilan Grid")
+mode_tampilan = st.sidebar.radio(
+    "Angka pada kotak rak menunjukkan:",
+    ["Variasi SKU (Jenis Barang)", "Sisa Slot Kosong"]
+)
+st.sidebar.caption("Ubah pilihan ini untuk mengganti angka yang muncul di setiap rak gudang.")
 
 st.sidebar.divider()
 st.sidebar.header("🔐 Akses Khusus Admin")
@@ -162,7 +171,8 @@ search_query = "" if pilihan_pencarian == "-- Tampilkan Semua --" else pilihan_p
 st.sidebar.divider()
 st.sidebar.header("🎨 Indikator Warna")
 st.sidebar.markdown("""
-- 🟢 **Hijau (1–2 SKU):** Aman / Ideal
+*(Warna indikator tetap menunjukkan tingkat keberagaman / variasi SKU)*
+- 🟢 **Hijau (1–2 SKU):** Ideal
 - 🟡 **Kuning (3 SKU):** Warning
 - 🔴 **Merah (≥4 SKU):** Kritis
 - ⚪ **Abu-Abu (0 SKU):** Kosong
@@ -212,7 +222,12 @@ def process_matrix_data(df, search_term, prod_col):
             if len(sub) > max_slot:
                 sub = sub.head(max_slot)
                 
-            prods = sub[sub[prod_col].astype(str).str.strip() != ""][prod_col].unique() if prod_col in sub.columns else []
+            # Menggunakan Part Number sebagai acuan SKU jika ada, jika tidak fallback ke Nama Produk
+            if 'Part Number' in sub.columns:
+                prods = sub[sub['Part Number'].astype(str).str.strip() != ""]['Part Number'].unique()
+            else:
+                prods = sub[sub[prod_col].astype(str).str.strip() != ""][prod_col].unique() if prod_col in sub.columns else []
+                
             sku = len(prods)
             filled = sub['Part Number'].apply(lambda x: str(x).strip() != "" and pd.notna(x)).sum() if 'Part Number' in sub.columns else 0
             
@@ -244,7 +259,7 @@ def process_matrix_data(df, search_term, prod_col):
 matrix_info, total_critical, total_kosong, kolom_list, baris_list, lokasi_kritis, lokasi_kosong = process_matrix_data(df, search_query, product_col)
 
 # ==========================================================
-# 6. MODAL POP-UP (DETAIL PALLET & KONVERSI Pcs)
+# 6. MODAL POP-UP (MENGGUNAKAN PART NUMBER SEBAGAI KUNCI UTAMA)
 # ==========================================================
 @st.dialog("📦 Rincian Detail Rak & Konversi Stok", width="large")
 def show_rack_detail(k, b, info):
@@ -267,13 +282,19 @@ def show_rack_detail(k, b, info):
             df_master = pd.DataFrame()
 
         st.write("### 📋 Ringkasan & Konversi Total Pcs:")
-        df_terisi = info['df_sub'][info['df_sub'][product_col].astype(str).str.strip() != ""]
+        df_terisi = info['df_sub'][info['df_sub']['Part Number'].astype(str).str.strip() != ""]
         
         rekap_data = []
-        for prod in df_terisi[product_col].unique():
-            df_prod = df_terisi[df_terisi[product_col] == prod]
+        # --- PERBAIKAN: Mengelompokkan MURNI berdasarkan Part Number ---
+        for part_num in df_terisi['Part Number'].astype(str).str.strip().unique():
+            if not part_num: continue
             
-            part_num = str(df_prod['Part Number'].iloc[0]).strip().upper() if 'Part Number' in df_prod.columns else ""
+            df_prod = df_terisi[df_terisi['Part Number'].astype(str).str.strip() == part_num]
+            
+            # Ambil nama produk dari baris pertama yang cocok
+            prod_name = df_prod[product_col].iloc[0] if product_col in df_prod.columns else "-"
+            part_num_clean = part_num.upper()
+            
             jml_utuh = df_prod[~df_prod['Keterangan'].astype(str).str.contains('Pecahan', case=False, na=False)].shape[0]
             
             pecahan_rows = df_prod[df_prod['Keterangan'].astype(str).str.contains('Pecahan', case=False, na=False)]
@@ -289,8 +310,8 @@ def show_rack_detail(k, b, info):
             pcs_per_box = 0
             pcs_per_sak = 0
             
-            if not df_master.empty and part_num in df_master['Part Number Clean'].values:
-                m_row = df_master[df_master['Part Number Clean'] == part_num].iloc[0]
+            if not df_master.empty and part_num_clean in df_master['Part Number Clean'].values:
+                m_row = df_master[df_master['Part Number Clean'] == part_num_clean].iloc[0]
                 isi_pallet_pcs = pd.to_numeric(m_row.get('Isi 1 Pallet (pcs)', 0), errors='coerce')
                 isi_pallet_pcs = 0 if pd.isna(isi_pallet_pcs) else isi_pallet_pcs
                 
@@ -300,8 +321,7 @@ def show_rack_detail(k, b, info):
                 pcs_per_sak = pd.to_numeric(m_row.get('Sac / Pallet', 0), errors='coerce')
                 pcs_per_sak = 0 if pd.isna(pcs_per_sak) else pcs_per_sak
 
-            # --- LOGIKA MATEMATIKA TOTAL PCS DENGAN FORMAT BARU ---
-            is_box_type = part_num.endswith('D')
+            is_box_type = part_num_clean.endswith('D')
             satuan_kecil = "Dus" if is_box_type else "Sak"
             pcs_per_satuan = pcs_per_box if is_box_type else pcs_per_sak
             
@@ -310,12 +330,9 @@ def show_rack_detail(k, b, info):
                 total_pcs_dari_pecahan = val_pecahan * pcs_per_satuan
                 total_semua_pcs = total_pcs_dari_pallet + total_pcs_dari_pecahan
                 
-                # Format yang diminta user: "27 Pallet * 43200"
                 teks_rincian = f"{jml_utuh} Pallet * {isi_pallet_pcs:,.0f}"
-                
                 if val_pecahan > 0:
                     teks_rincian += f" + {val_pecahan} {satuan_kecil} * {pcs_per_satuan:,.0f}"
-                    
                 teks_rincian += f" = **Total {total_semua_pcs:,.0f} Pcs**"
                 
             else:
@@ -325,8 +342,8 @@ def show_rack_detail(k, b, info):
                 teks_rincian += " (Data Master Kosong)"
 
             rekap_data.append({
-                'Part Number': part_num,
-                'Nama Produk': prod,
+                'Part Number': part_num_clean,
+                'Nama Produk': prod_name,
                 'Pallet Utuh': jml_utuh,
                 'Pecahan': val_pecahan if val_pecahan > 0 else "-",
                 'Konversi Total Pcs': teks_rincian
@@ -416,7 +433,13 @@ def render_grid_area(title, start_baris, end_baris):
                 if not info['exist']:
                     st.write("") 
                 else:
-                    if st.button(f"{info['sku_cnt']}", key=f"btn_{k}_{b}", use_container_width=True):
+                    # --- MENENTUKAN APA YANG TAMPIL DI TOMBOL BERDASARKAN MODE ---
+                    if mode_tampilan == "Sisa Slot Kosong":
+                        label_tombol = str(info['usable_space'])
+                    else:
+                        label_tombol = str(info['sku_cnt'])
+                        
+                    if st.button(label_tombol, key=f"btn_{k}_{b}", use_container_width=True):
                         show_rack_detail(k, b, info)
                             
     cols_bottom = st.columns([0.6] + [1] * total_kolom, gap="small")
