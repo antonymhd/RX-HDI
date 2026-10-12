@@ -202,26 +202,19 @@ def process_matrix_data(df, search_term, prod_col):
                 
             sub = df[(df['Kolom'] == k) & (float(b) == pd.to_numeric(df['Baris'], errors='coerce'))]
             
-            # --- PERBAIKAN: Deteksi tipe Box/Karton ---
+            # --- DETEKSI KARTON / BOX ---
             is_all_box = False
             if 'Part Number' in sub.columns:
                 part_nums = sub['Part Number'].dropna().astype(str).str.strip().str.upper()
-                part_nums = part_nums[part_nums != ""] # Abaikan data hantu
+                part_nums = part_nums[part_nums != ""]
                 if not part_nums.empty:
                     is_all_box = part_nums.str.endswith(('D', 'G')).all()
             
+            # --- KAPASITAS FISIK MUTLAK (Tanpa Toleransi Pelebaran) ---
             if is_all_box:
                 max_slot = 32 if b <= 16 else 46
             else:
                 max_slot = 31 if b <= 16 else 44
-                
-            # --- PERBAIKAN: Hanya cek data riil (bukan hantu) untuk meregangkan kapasitas rak ---
-            if 'Part Number' in sub.columns:
-                filled_sub = sub[sub['Part Number'].astype(str).str.strip() != ""]
-                if 'Pallet Ke' in filled_sub.columns and not filled_sub.empty:
-                    actual_max = pd.to_numeric(filled_sub['Pallet Ke'], errors='coerce').max()
-                    if pd.notna(actual_max) and actual_max > max_slot:
-                        max_slot = int(actual_max)
                 
             if 'Part Number' in sub.columns:
                 prods = sub[sub['Part Number'].astype(str).str.strip() != ""]['Part Number'].unique()
@@ -229,10 +222,12 @@ def process_matrix_data(df, search_term, prod_col):
                 prods = sub[sub[prod_col].astype(str).str.strip() != ""][prod_col].unique() if prod_col in sub.columns else []
                 
             sku = len(prods)
+            # Menghitung riil jumlah pallet yang ada isinya
             filled = sub['Part Number'].apply(lambda x: str(x).strip() != "" and pd.notna(x)).sum() if 'Part Number' in sub.columns else 0
             
+            # MATEMATIKA SEDERHANA: Sisa = Maksimal Fisik - Terisi
             usable_space = max_slot - filled
-            if usable_space < 0: usable_space = 0
+            if usable_space < 0: usable_space = 0 # Jaga-jaga agar tidak minus jika ada error data lebih dari fisik
             
             is_match = False
             if search_term and prod_col in sub.columns:
