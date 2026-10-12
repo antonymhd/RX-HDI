@@ -254,7 +254,7 @@ def process_matrix_data(df, search_term, prod_col):
 matrix_info, total_critical, total_kosong, kolom_list, baris_list, lokasi_kritis, lokasi_kosong = process_matrix_data(df, search_query, product_col)
 
 # ==========================================================
-# 6. MODAL POP-UP (MENGGUNAKAN PART NUMBER SEBAGAI KUNCI UTAMA)
+# 6. MODAL POP-UP (MENGGUNAKAN PART NUMBER & ECERAN)
 # ==========================================================
 @st.dialog("📦 Rincian Detail Rak & Konversi Stok", width="large")
 def show_rack_detail(k, b, info):
@@ -288,16 +288,25 @@ def show_rack_detail(k, b, info):
             prod_name = df_prod[product_col].iloc[0] if product_col in df_prod.columns else "-"
             part_num_clean = part_num.upper()
             
-            jml_utuh = df_prod[~df_prod['Keterangan'].astype(str).str.contains('Pecahan', case=False, na=False)].shape[0]
+            jml_utuh = df_prod[~df_prod['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)].shape[0]
             
-            pecahan_rows = df_prod[df_prod['Keterangan'].astype(str).str.contains('Pecahan', case=False, na=False)]
+            # --- LOGIKA BACA PECAHAN DUS & ECERAN PCS ---
+            pecahan_rows = df_prod[df_prod['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)]
             val_pecahan = 0
+            val_eceran = 0
             if not pecahan_rows.empty:
                 import re
-                ket_str = str(pecahan_rows['Keterangan'].iloc[0])
-                numbers = re.findall(r'\d+', ket_str)
-                if numbers:
-                    val_pecahan = int(numbers[0])
+                ket_str = str(pecahan_rows['Keterangan'].iloc[0]).lower()
+                
+                match_pec = re.search(r'pecahan:\s*(\d+)', ket_str)
+                if match_pec: val_pecahan = int(match_pec.group(1))
+                else:
+                    # Fallback ke format lama
+                    numbers = re.findall(r'\d+', ket_str)
+                    if numbers and 'pecahan' in ket_str: val_pecahan = int(numbers[0])
+                    
+                match_ec = re.search(r'eceran:\s*(\d+)', ket_str)
+                if match_ec: val_eceran = int(match_ec.group(1))
 
             isi_pallet_pcs = 0
             pcs_per_box = 0
@@ -318,27 +327,34 @@ def show_rack_detail(k, b, info):
             satuan_kecil = "Dus" if is_box_type else "Sak"
             pcs_per_satuan = pcs_per_box if is_box_type else pcs_per_sak
             
+            # --- LOGIKA MATEMATIKA TOTAL PCS + ECERAN ---
             if isi_pallet_pcs > 0:
                 total_pcs_dari_pallet = jml_utuh * isi_pallet_pcs
                 total_pcs_dari_pecahan = val_pecahan * pcs_per_satuan
-                total_semua_pcs = total_pcs_dari_pallet + total_pcs_dari_pecahan
+                total_semua_pcs = total_pcs_dari_pallet + total_pcs_dari_pecahan + val_eceran
                 
                 teks_rincian = f"{jml_utuh} Pallet * {isi_pallet_pcs:,.0f}"
                 if val_pecahan > 0:
                     teks_rincian += f" + {val_pecahan} {satuan_kecil} * {pcs_per_satuan:,.0f}"
+                if val_eceran > 0:
+                    teks_rincian += f" + {val_eceran} Pcs"
                 teks_rincian += f" = **Total {total_semua_pcs:,.0f} Pcs**"
                 
             else:
                 teks_rincian = f"{jml_utuh} Pallet"
-                if val_pecahan > 0:
-                    teks_rincian += f" + {val_pecahan} Pecahan"
+                if val_pecahan > 0: teks_rincian += f" + {val_pecahan} Pecahan"
+                if val_eceran > 0: teks_rincian += f" + {val_eceran} Pcs"
                 teks_rincian += " (Data Master Kosong)"
+
+            teks_pecahan_kolom = []
+            if val_pecahan > 0: teks_pecahan_kolom.append(f"{val_pecahan} {satuan_kecil}")
+            if val_eceran > 0: teks_pecahan_kolom.append(f"{val_eceran} Pcs")
 
             rekap_data.append({
                 'Part Number': part_num_clean,
                 'Nama Produk': prod_name,
                 'Pallet Utuh': jml_utuh,
-                'Pecahan': val_pecahan if val_pecahan > 0 else "-",
+                'Pecahan/Eceran': " | ".join(teks_pecahan_kolom) if teks_pecahan_kolom else "-",
                 'Konversi Total Pcs': teks_rincian
             })
             
@@ -352,7 +368,6 @@ def show_rack_detail(k, b, info):
             st.dataframe(df_tampil, use_container_width=True, hide_index=True)
     else:
         st.success("✅ Baris ini KOSONG. Siap digunakan!")
-
 # ==========================================================
 # 7. METRIK & CSS VISUALISASI GRID
 # ==========================================================
