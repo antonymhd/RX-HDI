@@ -33,7 +33,6 @@ if st.sidebar.button("Refresh Layar Visualisasi", use_container_width=True):
 
 st.sidebar.divider()
 
-# --- FITUR BARU: TOGGLE MODE TAMPILAN RAK ---
 st.sidebar.header("👁️ Mode Tampilan Grid")
 mode_tampilan = st.sidebar.radio(
     "Angka pada kotak rak menunjukkan:",
@@ -203,9 +202,11 @@ def process_matrix_data(df, search_term, prod_col):
                 
             sub = df[(df['Kolom'] == k) & (float(b) == pd.to_numeric(df['Baris'], errors='coerce'))]
             
+            # --- PERBAIKAN: Deteksi tipe Box/Karton ---
             is_all_box = False
             if 'Part Number' in sub.columns:
                 part_nums = sub['Part Number'].dropna().astype(str).str.strip().str.upper()
+                part_nums = part_nums[part_nums != ""] # Abaikan data hantu
                 if not part_nums.empty:
                     is_all_box = part_nums.str.endswith(('D', 'G')).all()
             
@@ -214,15 +215,14 @@ def process_matrix_data(df, search_term, prod_col):
             else:
                 max_slot = 31 if b <= 16 else 44
                 
-            if 'Pallet Ke' in sub.columns and not sub.empty:
-                actual_max = pd.to_numeric(sub['Pallet Ke'], errors='coerce').max()
-                if pd.notna(actual_max) and actual_max > max_slot:
-                    max_slot = int(actual_max)
-                    
-            if len(sub) > max_slot:
-                sub = sub.head(max_slot)
+            # --- PERBAIKAN: Hanya cek data riil (bukan hantu) untuk meregangkan kapasitas rak ---
+            if 'Part Number' in sub.columns:
+                filled_sub = sub[sub['Part Number'].astype(str).str.strip() != ""]
+                if 'Pallet Ke' in filled_sub.columns and not filled_sub.empty:
+                    actual_max = pd.to_numeric(filled_sub['Pallet Ke'], errors='coerce').max()
+                    if pd.notna(actual_max) and actual_max > max_slot:
+                        max_slot = int(actual_max)
                 
-            # Menggunakan Part Number sebagai acuan SKU jika ada, jika tidak fallback ke Nama Produk
             if 'Part Number' in sub.columns:
                 prods = sub[sub['Part Number'].astype(str).str.strip() != ""]['Part Number'].unique()
             else:
@@ -285,13 +285,11 @@ def show_rack_detail(k, b, info):
         df_terisi = info['df_sub'][info['df_sub']['Part Number'].astype(str).str.strip() != ""]
         
         rekap_data = []
-        # --- PERBAIKAN: Mengelompokkan MURNI berdasarkan Part Number ---
         for part_num in df_terisi['Part Number'].astype(str).str.strip().unique():
             if not part_num: continue
             
             df_prod = df_terisi[df_terisi['Part Number'].astype(str).str.strip() == part_num]
             
-            # Ambil nama produk dari baris pertama yang cocok
             prod_name = df_prod[product_col].iloc[0] if product_col in df_prod.columns else "-"
             part_num_clean = part_num.upper()
             
@@ -433,7 +431,6 @@ def render_grid_area(title, start_baris, end_baris):
                 if not info['exist']:
                     st.write("") 
                 else:
-                    # --- MENENTUKAN APA YANG TAMPIL DI TOMBOL BERDASARKAN MODE ---
                     if mode_tampilan == "Sisa Slot Kosong":
                         label_tombol = str(info['usable_space'])
                     else:
@@ -450,8 +447,8 @@ def render_grid_area(title, start_baris, end_baris):
         with cols_bottom[idx + 1]:
             st.markdown(f"<div style='text-align:center; font-weight:900; color:#0ea5e9; font-size:clamp(10px, 1.2vw, 16px); margin-top:5px;'>{b}</div>", unsafe_allow_html=True)
 
-render_grid_area("📍 Area 1: Rak Nomor 1 - 16 (Kapasitas: 31 Slot/Baris)", 1, 16)
+render_grid_area("📍 Area 1: Rak Nomor 1 - 16 (Kapasitas: 31/32 Slot per Baris)", 1, 16)
 st.write("")
 st.divider()
 st.write("")
-render_grid_area("📍 Area 2: Rak Nomor 17 - 28 (Kapasitas: 44 Slot/Baris)", 17, 28)
+render_grid_area("📍 Area 2: Rak Nomor 17 - 28 (Kapasitas: 44/46 Slot per Baris)", 17, 28)
