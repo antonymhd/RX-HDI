@@ -58,8 +58,7 @@ if kunci_input == KUNCI_RAHASIA:
         if st.sidebar.button("🚀 Sinkronisasi ke Firebase", use_container_width=True, type="primary"):
             with st.spinner("Membungkus dan mengirim data dalam hitungan detik..."):
                 try:
-                    try:
-                        df_upload = pd.read_csv(uploaded_file, sep=";")
+                    try: df_upload = pd.read_csv(uploaded_file, sep=";")
                     except Exception:
                         uploaded_file.seek(0)
                         df_upload = pd.read_csv(uploaded_file, sep=",")
@@ -90,6 +89,45 @@ if kunci_input == KUNCI_RAHASIA:
                         st.sidebar.error("Format CSV salah: Tidak ada header 'Kolom'")
                 except Exception as e:
                     st.sidebar.error(f"Gagal mengunggah data: {e}")
+
+    # --- FITUR BARU: TOMBOL SAPU JAGAT ---
+    st.sidebar.divider()
+    st.sidebar.subheader("🛠️ Maintenance Database")
+    st.sidebar.caption("Gunakan jika nomor pallet berantakan atau ada data hantu.")
+    if st.sidebar.button("🧹 Bersihkan Data Anomali (Auto-Fix)", type="secondary", use_container_width=True):
+        with st.spinner("Menyapu data hantu & mengurutkan ulang rak..."):
+            try:
+                docs = db.collection(NAMA_DATABASE).stream()
+                batch = db.batch()
+                for doc in docs:
+                    doc_data = doc.to_dict().get('data', [])
+                    
+                    # 1. Hapus data hantu
+                    cleaned_data = [d for d in doc_data if str(d.get('Part Number', '')).strip() != 'nan' and str(d.get('Part Number', '')).strip() != '']
+                    
+                    # 2. Urutkan ulang per baris
+                    from collections import defaultdict
+                    baris_dict = defaultdict(list)
+                    for d in cleaned_data:
+                        baris_dict[float(d.get('Baris', 0))].append(d)
+                        
+                    final_data = []
+                    for b, items in baris_dict.items():
+                        # Sort by current Pallet Ke to keep order
+                        items_sorted = sorted(items, key=lambda x: pd.to_numeric(x.get('Pallet Ke', 999), errors='coerce'))
+                        for idx, item in enumerate(items_sorted):
+                            item['Pallet Ke'] = float(idx + 1)
+                            item['In'] = 1.0  # Standarisasi nilai In
+                            final_data.append(item)
+                            
+                    batch.set(doc.reference, {'data': final_data})
+                batch.commit()
+                st.sidebar.success("✅ Database berhasil dibersihkan & diurutkan ulang!")
+                st.cache_data.clear()
+                time.sleep(2)
+                st.rerun()
+            except Exception as e:
+                st.sidebar.error(f"Gagal membersihkan data: {e}")
 
     st.sidebar.divider()
     st.sidebar.subheader("⚠️ Zona Bahaya")
@@ -202,7 +240,6 @@ def process_matrix_data(df, search_term, prod_col):
                 
             sub = df[(df['Kolom'] == k) & (float(b) == pd.to_numeric(df['Baris'], errors='coerce'))]
             
-            # --- DETEKSI KARTON / BOX ---
             is_all_box = False
             if 'Part Number' in sub.columns:
                 part_nums = sub['Part Number'].dropna().astype(str).str.strip().str.upper()
@@ -210,7 +247,6 @@ def process_matrix_data(df, search_term, prod_col):
                 if not part_nums.empty:
                     is_all_box = part_nums.str.endswith(('D', 'G')).all()
             
-            # --- KAPASITAS FISIK MUTLAK (Tanpa Toleransi Pelebaran) ---
             if is_all_box:
                 max_slot = 32 if b <= 16 else 46
             else:
@@ -222,12 +258,10 @@ def process_matrix_data(df, search_term, prod_col):
                 prods = sub[sub[prod_col].astype(str).str.strip() != ""][prod_col].unique() if prod_col in sub.columns else []
                 
             sku = len(prods)
-            # Menghitung riil jumlah pallet yang ada isinya
             filled = sub['Part Number'].apply(lambda x: str(x).strip() != "" and pd.notna(x)).sum() if 'Part Number' in sub.columns else 0
             
-            # MATEMATIKA SEDERHANA: Sisa = Maksimal Fisik - Terisi
             usable_space = max_slot - filled
-            if usable_space < 0: usable_space = 0 # Jaga-jaga agar tidak minus jika ada error data lebih dari fisik
+            if usable_space < 0: usable_space = 0 
             
             is_match = False
             if search_term and prod_col in sub.columns:
@@ -290,7 +324,6 @@ def show_rack_detail(k, b, info):
             
             jml_utuh = df_prod[~df_prod['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)].shape[0]
             
-            # --- LOGIKA BACA PECAHAN DUS & ECERAN PCS ---
             pecahan_rows = df_prod[df_prod['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)]
             val_pecahan = 0
             val_eceran = 0
@@ -301,7 +334,6 @@ def show_rack_detail(k, b, info):
                 match_pec = re.search(r'pecahan:\s*(\d+)', ket_str)
                 if match_pec: val_pecahan = int(match_pec.group(1))
                 else:
-                    # Fallback ke format lama
                     numbers = re.findall(r'\d+', ket_str)
                     if numbers and 'pecahan' in ket_str: val_pecahan = int(numbers[0])
                     
@@ -327,7 +359,6 @@ def show_rack_detail(k, b, info):
             satuan_kecil = "Dus" if is_box_type else "Sak"
             pcs_per_satuan = pcs_per_box if is_box_type else pcs_per_sak
             
-            # --- LOGIKA MATEMATIKA TOTAL PCS + ECERAN ---
             if isi_pallet_pcs > 0:
                 total_pcs_dari_pallet = jml_utuh * isi_pallet_pcs
                 total_pcs_dari_pecahan = val_pecahan * pcs_per_satuan
@@ -368,6 +399,7 @@ def show_rack_detail(k, b, info):
             st.dataframe(df_tampil, use_container_width=True, hide_index=True)
     else:
         st.success("✅ Baris ini KOSONG. Siap digunakan!")
+
 # ==========================================================
 # 7. METRIK & CSS VISUALISASI GRID
 # ==========================================================
