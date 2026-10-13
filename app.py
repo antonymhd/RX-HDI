@@ -24,12 +24,11 @@ db = firestore.client()
 # ==========================================================
 # 2. LOAD DATA DENGAN SMART CACHE (Hanya 7 Reads!)
 # ==========================================================
-@st.cache_data(ttl=300) # Kunci data di memori selama 5 menit
+@st.cache_data(ttl=300) 
 def load_data_from_firebase():
     docs = db.collection(NAMA_DATABASE).stream()
     semua_data = []
     
-    # Ambil data dari 7 dokumen borongan (Kolom_A s/d Kolom_G)
     for doc in docs:
         doc_data = doc.to_dict()
         if 'data' in doc_data:
@@ -40,7 +39,6 @@ def load_data_from_firebase():
         
     df = pd.DataFrame(semua_data)
     
-    # Standarisasi
     for c in df.columns:
         if c.strip().lower() in ['palet ke', 'pallet ke']:
             df.rename(columns={c: 'Pallet Ke'}, inplace=True)
@@ -144,7 +142,7 @@ def process_matrix_data(df, search_term, prod_col):
 matrix_info, total_critical, total_kosong, kolom_list, baris_list = process_matrix_data(df, search_query, product_col)
 
 # ==========================================================
-# 6. POP-UP DETAIL RAK (STRICTLY READ-ONLY)
+# 6. POP-UP DETAIL RAK (KONVERSI AKURAT)
 # ==========================================================
 @st.dialog("📦 Rincian Detail Rak", width="large")
 def show_rack_detail(k, b, info):
@@ -177,21 +175,28 @@ def show_rack_detail(k, b, info):
                 valid_names = df_prod[product_col].dropna().values
                 if len(valid_names) > 0: prod_name = str(valid_names[0])
             
-            jml_utuh = df_prod[~df_prod['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)].shape[0]
-            pecahan_rows = df_prod[df_prod['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)]
+            jml_utuh = 0
+            val_pecahan = 0
+            val_eceran = 0
             
-            val_pecahan = val_eceran = 0
-            if not pecahan_rows.empty:
-                ket_str = str(pecahan_rows['Keterangan'].iloc[0]).lower()
-                mp = re.search(r'pecahan:\s*(\d+)', ket_str)
-                if mp: val_pecahan = int(mp.group(1))
-                else:
-                    nums = re.findall(r'\d+', ket_str)
-                    if nums and 'pecahan' in ket_str: val_pecahan = int(nums[0])
+            # AKUMULASI SEMUA SLOT UNTUK PART NUMBER INI
+            for _, row in df_prod.iterrows():
+                ket_str = str(row.get('Keterangan', '')).lower()
+                is_pecahan = 'pecahan' in ket_str or 'eceran' in ket_str
                 
-                me = re.search(r'eceran:\s*(\d+)', ket_str)
-                if me: val_eceran = int(me.group(1))
+                if not is_pecahan:
+                    jml_utuh += 1
+                else:
+                    mp = re.search(r'pecahan:\s*(\d+)', ket_str)
+                    if mp: val_pecahan += int(mp.group(1))
+                    else:
+                        nums = re.findall(r'\d+', ket_str)
+                        if nums and 'pecahan' in ket_str: val_pecahan += int(nums[0])
+                        
+                    me = re.search(r'eceran:\s*(\d+)', ket_str)
+                    if me: val_eceran += int(me.group(1))
 
+            # TARIK REFERENSI MASTER (Isi Pallet & Isi Dus/Sak)
             ip = pb = ps = 0
             pnc = str(part_num).strip().upper() 
             if not df_master.empty and pnc in df_master['Part Number Clean'].values:
@@ -203,6 +208,7 @@ def show_rack_detail(k, b, info):
             sc = "Dus" if pnc.endswith('D') else "Sak"
             pss = pb if pnc.endswith('D') else ps
             
+            # MATEMATIKA TOTAL PCS BERDASARKAN RUMUS
             if ip > 0:
                 tot = (jml_utuh * ip) + (val_pecahan * pss) + val_eceran
                 teks_rincian = f"{jml_utuh} Pallet * {ip:,.0f}"
@@ -250,49 +256,4 @@ div[class^="st-key-btn_"] button:hover { transform: scale(1.15); border: 2px sol
 """
 
 color_map = {
-    'match': {"bg": "#38bdf8", "txt": "#000000", "sel": []},
-    'critical': {"bg": "#ef4444", "txt": "#ffffff", "sel": []},
-    'warning': {"bg": "#fde047", "txt": "#000000", "sel": []},
-    'ideal': {"bg": "#86efac", "txt": "#000000", "sel": []},
-    'empty': {"bg": "#e2e8f0", "txt": "#94a3b8", "sel": []}
-}
-
-for k in kolom_list:
-    for b in baris_list:
-        info = matrix_info.get((k, b))
-        if not info or not info['exist']: continue
-        sku = info['sku_cnt']
-        sel = f".st-key-btn_{k}_{b} button"
-        if info['is_match']: color_map['match']['sel'].append(sel)
-        elif sku >= 4: color_map['critical']['sel'].append(sel)
-        elif sku == 3: color_map['warning']['sel'].append(sel)
-        elif sku in [1, 2]: color_map['ideal']['sel'].append(sel)
-        else: color_map['empty']['sel'].append(sel)
-
-for group in color_map.values():
-    if group['sel']: dynamic_css += f"\n{', '.join(group['sel'])} {{ background-color: {group['bg']} !important; color: {group['txt']} !important; }}"
-st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
-
-def render_grid_area(title, start_baris, end_baris):
-    st.markdown(f"### {title}")
-    
-    header_cols = st.columns([0.6] + [1] * 16, gap="small")
-    with header_cols[0]: 
-        st.empty() 
-    for idx, b in enumerate(list(range(start_baris, end_baris + 1))):
-        with header_cols[idx + 1]:
-            st.markdown(f"<div style='text-align:center; font-weight:900; font-size:14px; color:#94a3b8; margin-bottom:4px;'>{b}</div>", unsafe_allow_html=True)
-    
-    for k in kolom_list:
-        cols = st.columns([0.6] + [1] * 16, gap="small")
-        with cols[0]: st.markdown(f"<div style='font-weight:900;'>{k}</div>", unsafe_allow_html=True)
-        for idx, b in enumerate(list(range(start_baris, end_baris + 1))):
-            info = matrix_info[(k, b)]
-            with cols[idx + 1]:
-                if info['exist']:
-                    lbl = str(info['usable_space']) if mode_tampilan == "Sisa Slot Kosong" else str(info['sku_cnt'])
-                    if st.button(lbl, key=f"btn_{k}_{b}", use_container_width=True): show_rack_detail(k, b, info)
-
-render_grid_area("📍 Area 1 (Rak 1 - 16)", 1, 16)
-st.divider()
-render_grid_area("📍 Area 2 (Rak 17 - 28)", 17, 28)
+    'match': {"bg": "#38bdf
