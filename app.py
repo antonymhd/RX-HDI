@@ -1,283 +1,6128 @@
-import streamlit as st
-import pandas as pd
-import re
-
-st.set_page_config(
-    page_title="Warehouse 2D Racking (OFFLINE)",
-    page_icon="📦",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# ==========================================================
-# SIDEBAR
-# ==========================================================
-st.sidebar.header("🔄 Mode Offline")
-st.sidebar.warning("Aplikasi sedang berjalan tanpa internet ke Firebase untuk melindungi kuota. Menampilkan data backup CSV terbaru.")
-st.sidebar.divider()
-
-st.sidebar.header("👁️ Mode Tampilan Grid")
-mode_tampilan = st.sidebar.radio(
-    "Angka pada kotak rak menunjukkan:",
-    ["Variasi SKU (Jenis Barang)", "Sisa Slot Kosong"]
-)
-
-# TOMBOL CLEAR CACHE MANUAL DI SIDEBAR
-st.sidebar.divider()
-if st.sidebar.button("🧹 Bersihkan Cache (Reset App)", use_container_width=True):
-    st.cache_data.clear()
-    st.success("Cache berhasil dibersihkan! Silakan refresh layar.")
-    st.rerun()
-
-# ==========================================================
-# LOAD DATA DARI CSV LOKAL
-# ==========================================================
-st.title("📦 Visualisasi Grid Gudang (MODE DARURAT)")
-st.caption("Menampilkan data berdasarkan backup CSV terbaru. Inbound/Outbound hari ini harap dicatat manual.")
-
-@st.cache_data
-def load_data_from_csv():
-    try:
-        nama_file_csv = "Audit_Stok_WMS_20261012.csv"
-        
-        # Coba baca dengan pemisah titik koma, jika gagal pakai koma
-        try: 
-            df = pd.read_csv(nama_file_csv, sep=";")
-        except: 
-            df = pd.read_csv(nama_file_csv, sep=",")
-        
-        # Standarisasi nama kolom 'Palet ke' / 'Pallet ke' -> 'Pallet Ke'
-        for c in df.columns:
-            if c.strip().lower() in ['palet ke', 'pallet ke']:
-                df.rename(columns={c: 'Pallet Ke'}, inplace=True)
-        
-        # Pastikan kolom tipe angka
-        for col in ['Baris', 'Pallet Ke']:
-            if col in df.columns: 
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
-        
-        if 'Kolom' not in df.columns: 
-            return pd.DataFrame()
-            
-        return df
-    except Exception as e:
-        st.error(f"🚨 Gagal memuat CSV: {e}. Pastikan file 'Audit_Stok_WMS_20261012.csv' ada di folder GitHub.")
-        return None
-
-df = load_data_from_csv()
-if df is None or df.empty: 
-    st.stop()
-
-product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
-
-# ==========================================================
-# PENCARIAN & FILTER
-# ==========================================================
-st.sidebar.header("🔍 Pencarian & Filter")
-if product_col in df.columns:
-    daftar_barang = sorted(df[df[product_col].astype(str).str.strip() != ""][product_col].dropna().astype(str).unique().tolist())
-else:
-    daftar_barang = []
-pilihan_pencarian = st.sidebar.selectbox("Pilih / Ketik Nama Barang:", options=["-- Tampilkan Semua --"] + daftar_barang)
-search_query = "" if pilihan_pencarian == "-- Tampilkan Semua --" else pilihan_pencarian
-
-# ==========================================================
-# LOGIKA MATRIKS
-# ==========================================================
-def is_rack_exist(kolom, baris):
-    if kolom == 'F' and baris < 5: return False
-    if kolom == 'G' and baris < 17: return False
-    return True
-
-def process_matrix_data(df, search_term, prod_col):
-    kolom_list = ['G', 'F', 'E', 'D', 'C', 'B', 'A']
-    baris_list = list(range(1, 29))
-    matrix_info = {}
-    total_critical = total_kosong = 0
-    
-    for k in kolom_list:
-        for b in baris_list:
-            if not is_rack_exist(k, b):
-                matrix_info[(k, b)] = {'exist': False}
-                continue
-                
-            sub = df[(df['Kolom'] == k) & (float(b) == pd.to_numeric(df['Baris'], errors='coerce'))]
-            
-            is_all_box = False
-            if 'Part Number' in sub.columns:
-                p_nums = sub['Part Number'].dropna().astype(str).str.strip().str.upper()
-                p_nums = p_nums[p_nums != ""]
-                if not p_nums.empty: is_all_box = p_nums.str.endswith(('D', 'G')).all()
-            
-            max_slot = (32 if b <= 16 else 46) if is_all_box else (31 if b <= 16 else 44)
-            prods = sub[sub['Part Number'].astype(str).str.strip() != ""]['Part Number'].unique() if 'Part Number' in sub.columns else []
-            sku = len(prods)
-            filled = sub['Part Number'].apply(lambda x: str(x).strip() != "" and pd.notna(x)).sum() if 'Part Number' in sub.columns else 0
-            usable_space = max(0, max_slot - filled)
-            
-            is_match = False
-            if search_term and prod_col in sub.columns:
-                m_prod = sub[prod_col].astype(str).str.contains(search_term, case=False, na=False, regex=False).any()
-                m_part = sub['Part Number'].astype(str).str.contains(search_term, case=False, na=False, regex=False).any() if 'Part Number' in sub.columns else False
-                is_match = m_prod or m_part
-            
-            if sku >= 4: total_critical += 1
-            elif sku == 0: total_kosong += 1
-                
-            matrix_info[(k, b)] = {'exist': True, 'sku_cnt': sku, 'filled': filled, 'usable_space': usable_space, 'max_slot': max_slot, 'df_sub': sub, 'is_match': is_match}
-            
-    return matrix_info, total_critical, total_kosong, kolom_list, baris_list
-
-matrix_info, total_critical, total_kosong, kolom_list, baris_list = process_matrix_data(df, search_query, product_col)
-
-# ==========================================================
-# MODAL POP-UP (KEBAL ERROR DENGAN REKAP QTY & KONVERSI)
-# ==========================================================
-@st.dialog("📦 Rincian Detail Rak & Konversi Stok", width="large")
-def show_rack_detail(k, b, info):
-    st.subheader(f"📍 Lokasi Racking: {k} - Baris {b}")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Variasi SKU", f"{info['sku_cnt']} Jenis")
-    c2.metric("Slot Fisik Terpakai", f"{info['filled']} / {info['max_slot']}")
-    c3.metric("Space Kosong", f"{info['usable_space']} Slot")
-    
-    st.divider()
-    
-    if info['sku_cnt'] > 0:
-        # 1. BACA MASTER PRODUK UNTUK RUMUS KONVERSI
-        try:
-            df_master = pd.read_csv("Master_Produk.csv", sep=";") if ";" in open("Master_Produk.csv").readline() else pd.read_csv("Master_Produk.csv", sep=",")
-            df_master['Part Number Clean'] = df_master['Part Number'].astype(str).str.strip().str.upper()
-        except: 
-            df_master = pd.DataFrame()
-
-        df_terisi = info['df_sub'][info['df_sub']['Part Number'].astype(str).str.strip() != ""]
-        
-        # 2. BUAT TABEL REKAPITULASI (PALLET UTUH & TOTAL PCS)
-        rekap_data = []
-        for part_num in df_terisi['Part Number'].astype(str).str.strip().unique():
-            df_prod = df_terisi[df_terisi['Part Number'].astype(str).str.strip() == part_num]
-            
-            # Pengaman ekstra dari IndexError
-            prod_name = "-"
-            if product_col in df_prod.columns and not df_prod.empty:
-                valid_names = df_prod[product_col].dropna().values
-                if len(valid_names) > 0:
-                    prod_name = str(valid_names[0])
-            
-            # Hitung Utuh
-            jml_utuh = df_prod[~df_prod['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)].shape[0]
-            
-            # Hitung Pecahan/Eceran
-            pecahan_rows = df_prod[df_prod['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)]
-            val_pecahan = val_eceran = 0
-            if not pecahan_rows.empty:
-                ket_str = str(pecahan_rows['Keterangan'].iloc[0]).lower()
-                mp = re.search(r'pecahan:\s*(\d+)', ket_str)
-                if mp: val_pecahan = int(mp.group(1))
-                me = re.search(r'eceran:\s*(\d+)', ket_str)
-                if me: val_eceran = int(me.group(1))
-
-            # Ambil Rumus dari Master
-            ip = pb = ps = 0
-            
-            # [PERBAIKAN KEBAL ERROR FLOAT/NAN UNTUK UPPER]
-            pnc = str(part_num).strip().upper() 
-            
-            if not df_master.empty and pnc in df_master['Part Number Clean'].values:
-                mr = df_master[df_master['Part Number Clean'] == pnc].iloc[0]
-                ip = float(mr.get('Isi 1 Pallet (pcs)', 0) or 0)
-                pb = float(mr.get('Box / Pallet', 0) or 0)
-                ps = float(mr.get('Sac / Pallet', 0) or 0)
-
-            sc = "Dus" if pnc.endswith('D') else "Sak"
-            pss = pb if pnc.endswith('D') else ps
-            
-            # Buat Teks Konversi
-            if ip > 0:
-                tot = (jml_utuh * ip) + (val_pecahan * pss) + val_eceran
-                teks_rincian = f"{jml_utuh} Pallet * {ip:,.0f}"
-                if val_pecahan > 0: teks_rincian += f" + {val_pecahan} {sc} * {pss:,.0f}"
-                if val_eceran > 0: teks_rincian += f" + {val_eceran} Pcs"
-                teks_rincian += f" = **Total {tot:,.0f} Pcs**"
-            else:
-                teks_rincian = f"{jml_utuh} Pallet"
-
-            rekap_data.append({'Part Number': pnc, 'Nama Produk': prod_name, 'Pallet Utuh': jml_utuh, 'Konversi Total Pcs': teks_rincian})
-        
-        # TAMPILKAN TABEL REKAP
-        st.markdown("#### 📊 Rekapitulasi Stok per Baris Rak")
-        st.dataframe(pd.DataFrame(rekap_data), use_container_width=True, hide_index=True)
-        st.write("") # Spasi
-        
-        # 3. TAMPILKAN TABEL RINCIAN MENTAH
-        st.markdown("#### 📑 Rincian Posisi per Pallet")
-        avail = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', product_col, 'Keterangan', 'Grand Total Pcs'] if c in df_terisi.columns]
-        df_tampil = df_terisi[avail].copy()
-        if 'Pallet Ke' in df_tampil.columns: df_tampil = df_tampil.sort_values(by='Pallet Ke', ascending=True)
-        st.dataframe(df_tampil, use_container_width=True, hide_index=True)
-        
-    else:
-        st.success("✅ Baris ini KOSONG. Siap digunakan!")
-
-# ==========================================================
-# RENDER METRIK & GRID
-# ==========================================================
-col_m1, col_m2, col_m3 = st.columns(3)
-col_m1.metric("Total Baris Aktif", "156 Baris")
-col_m2.metric("Baris Kritis", f"{total_critical} Baris")
-col_m3.metric("Baris Kosong", f"{total_kosong} Baris")
-st.divider()
-
-dynamic_css = """
-.block-container { max-width: 98% !important; padding-top: 3.5rem !important; padding-bottom: 2rem !important; }
-div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
-div[data-testid="stColumn"] { padding-left: 2px !important; padding-right: 2px !important; }
-div[data-testid="stColumn"]:nth-child(1) { display: flex; align-items: center; justify-content: center; }
-div[class^="st-key-btn_"] button {
-    aspect-ratio: 1/1 !important; width: 100% !important; min-width: 22px !important;
-    padding: 0px !important; margin: 0px !important; border: 1px solid #475569 !important;
-    border-radius: 4px !important; display: flex !important; align-items: center !important; font-weight: 900 !important;
-}
-div[class^="st-key-btn_"] button:hover { transform: scale(1.15); border: 2px solid #fff !important; z-index: 10; }
-"""
-
-color_map = {
-    'match': {"bg": "#38bdf8", "txt": "#000000", "sel": []},
-    'critical': {"bg": "#ef4444", "txt": "#ffffff", "sel": []},
-    'warning': {"bg": "#fde047", "txt": "#000000", "sel": []},
-    'ideal': {"bg": "#86efac", "txt": "#000000", "sel": []},
-    'empty': {"bg": "#e2e8f0", "txt": "#94a3b8", "sel": []}
-}
-
-for k in kolom_list:
-    for b in baris_list:
-        info = matrix_info.get((k, b))
-        if not info or not info['exist']: continue
-        sku = info['sku_cnt']
-        sel = f".st-key-btn_{k}_{b} button"
-        if info['is_match']: color_map['match']['sel'].append(sel)
-        elif sku >= 4: color_map['critical']['sel'].append(sel)
-        elif sku == 3: color_map['warning']['sel'].append(sel)
-        elif sku in [1, 2]: color_map['ideal']['sel'].append(sel)
-        else: color_map['empty']['sel'].append(sel)
-
-for group in color_map.values():
-    if group['sel']: dynamic_css += f"\n{', '.join(group['sel'])} {{ background-color: {group['bg']} !important; color: {group['txt']} !important; }}"
-st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
-
-def render_grid_area(title, start_baris, end_baris):
-    st.markdown(f"### {title}")
-    for k in kolom_list:
-        cols = st.columns([0.6] + [1] * 16, gap="small")
-        with cols[0]: st.markdown(f"<div style='font-weight:900;'>{k}</div>", unsafe_allow_html=True)
-        for idx, b in enumerate(list(range(start_baris, end_baris + 1))):
-            info = matrix_info[(k, b)]
-            with cols[idx + 1]:
-                if info['exist']:
-                    lbl = str(info['usable_space']) if mode_tampilan == "Sisa Slot Kosong" else str(info['sku_cnt'])
-                    if st.button(lbl, key=f"btn_{k}_{b}", use_container_width=True): show_rack_detail(k, b, info)
-
-render_grid_area("📍 Area 1 (Rak 1 - 16)", 1, 16)
-st.divider()
-render_grid_area("📍 Area 2 (Rak 17 - 28)", 17, 28)
+Kolom;Baris;Palet ke;Part Number;Lot Number;Nama Produk;Keterangan;Status;Qty Utuh;Qty Dus/Sak;Qty Pcs Eceran;Grand Total Eceran
+A;1;1;MJSPS1309104C;2D3230926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;2;MJSPS1309104C;2D3230926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;3;MJSPS1309104C;2D3230926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;4;MJSPS1309104C;2D3230926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;5;MJSPS1309104C;2D3230926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;6;MJSPS1309104C;2D3230926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;7;MJSPS1309104C;2D3230926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;8;MJSPS1309104C;2D3230926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;9;MJSPS1309104C;2D3230926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;10;MJSPS1309104C;2D3230926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;11;MJSPS1309104C;2D3230926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;12;MJSPS1309104C;2D3230926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;13;MJSPS1309104C;2D3230926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;14;MJSPS1309104C;2C1270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;15;MJSPS1309104C;2C1270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;16;MJSPS1309104C;2C1270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;17;MJSPS1309104C;2C1270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;18;MJSPS1309104C;2C1270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;19;MJSPS1309104C;2C1270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;20;MJSPS1309104C;2C1270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;21;MJSPS1309104C;2C1270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;22;MJSPS1309104C;2C1270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;23;MJSPS1309104C;2C1270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;24;MJSPS1309104C;2C1270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;25;MJSPS1309104C;2C1270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;26;MJSPS1309104C;2B2270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;27;MJSPS1309104C;2B2270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;28;MJSPS1309104C;2B2270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;29;MJSPS1309104C;2B2270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;1;30;MJSPS1309104C;2B2270926; Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna ;;Terisi;1;0;0;20000
+A;2;1;MJSPS1309104C;2D3250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;2;2;MJSPS1309104C;2D3250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;2;3;MJSPS1309104C;2D3250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;2;4;MJSPS1309104C;2D3250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;2;5;MJSPS1309104C;2D3250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;2;6;MJSPS1309104C;2D3250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;2;7;MJSPS1309104C;2D3250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;Pecahan: 2 qty;Terisi;0;2;0;2000
+A;2;8;MJSPS1706507C;4A2310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;2;9;MJSPS1706507C;4A2310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;2;10;MJSPS1706507C;4A2310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;2;11;MJSPS1706507C;4A2310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;2;12;MJSPS1706507C;4A2310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;2;13;MJSPS1706507C;4A2310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;2;14;MJSPS1706507C;4A2310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;Pecahan: 14 qty;Terisi;0;14;0;21000
+A;2;15;MJSCP3204341D;5B3021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;16;MJSCP3204341D;5B3021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;17;MJSCP3204341D;5B3021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;18;MJSCP3204341D;5B3021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;19;MJSCP3204341D;5B3021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;20;MJSCP3204341D;5B3021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;21;MJSCP3204341D;5B3021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;22;MJSCP3204341D;5B3021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;23;MJSCP3204341D;5B3021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;24;MJSCP3204341D;5B3021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;25;MJSCP3204341D;5D1031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;26;MJSCP3204341D;5D1031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;27;MJSCP3204341D;5D1031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;28;MJSCP3204341D;5D1031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;29;MJSCP3204341D;5D1031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;30;MJSCP3204341D;5D1031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;2;31;MJSCP3204341D;5D1031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;3;1;MJSPS1706508C;4B3130926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;3;2;MJSPS1706508C;4B3130926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;3;3;MJSPS1706508C;4B3130926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;3;4;MJSPS1706508C;4B3130926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;3;5;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;3;6;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;3;7;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;3;8;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;3;9;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;3;10;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;3;11;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;3;12;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;3;13;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;3;14;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;15;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;16;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;17;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;18;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;19;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;20;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;21;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;22;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;23;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;24;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;25;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;26;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;27;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;28;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;29;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;3;30;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;4;1;MJSPS2122301C;4C1300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+A;4;2;MJSPS2122301C;4C1300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+A;4;3;MJSPS2122301C;4C1300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+A;4;4;MJSPS2122301C;4C1300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+A;4;5;MJSPS2122301C;4C1300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+A;4;6;MJSPS2122301C;4C1300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+A;4;7;MJSPS2122301C;4C1300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+A;4;8;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;Pecahan: 8 qty;Terisi;0;8;0;8000
+A;4;9;MJSPL0313807C;4C3091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;4;10;MJSPL0313807C;4C3091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;4;11;MJSPL0313807C;4C3091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;4;12;MJSPL0313807C;4C3091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;4;13;MJSPL0313807C;4C3091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;4;14;MJSPL0313807C;4C3091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;4;15;MJSPL0313807C;4C3091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;4;16;MJSPL0313807C;4C3091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;4;17;MJSPL0313807C;4C3091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;4;18;MJSPL0313807C;4C3091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;4;19;MJSPL0313807C;4C3091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;4;20;MJSCP2902933D;5B3160926;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+A;4;21;MJSCP2902933D;5B3160926;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);Pecahan: 5 qty;Terisi;0;5;0;10500
+A;4;22;;;;;;;;;
+A;4;23;;;;;;;;;
+A;4;24;;;;;;;;;
+A;4;25;;;;;;;;;
+A;4;26;;;;;;;;;
+A;5;1;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;5;2;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;5;3;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;5;4;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;5;5;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;5;6;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;5;7;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;5;8;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;5;9;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;5;10;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;5;11;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;5;12;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;13;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;14;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;15;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;16;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;17;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;18;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;19;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;20;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;21;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;22;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;23;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;24;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;25;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;26;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;27;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;28;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;29;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;5;30;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;6;1;MJSPS2122301D;3D1021026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;6;2;MJSPS2122301D;3D1021026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;6;3;MJSPS2122301D;3D1021026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;6;4;MJSPS2122301D;3D1021026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;Pecahan: 6 qty;Terisi;0;6;0;3300
+A;6;5;MJSPS2122301C;3A1270626;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+A;6;6;MJSPS2122301C;3A1270626;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+A;6;7;MJSPS2122301C;3A1270626;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+A;6;8;MJSPS2122301C;3A1270626;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+A;6;9;MJSPS2122301C;3A1270626;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+A;6;10;MJSPS2122301C;3A1270626;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+A;6;11;MJSPS1309104C;2A3280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;6;12;MJSPS1309104C;2A3280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;6;13;MJSPS1309104C;2A3280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;6;14;MJSPS1309104C;2C1290926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;6;15;MJSPS1309104C;2C1290926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;6;16;MJSPS1309104C;2C1290926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;6;17;MJSPS1309104C;2C1290926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;6;18;MJSPS1309104C;2C1290926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;6;19;;;;;;;;;
+A;6;20;;;;;;;;;
+A;6;21;MJSPL0313807C;4C3091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;6;22;MJSPL0313807C;4C3091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;6;23;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;6;24;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;6;25;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;7;1;MJSCP0103517D;1D3040926;Cup Printing 170ml, 3.5gr, Panther Grape ND (BTU);;Terisi;1;0;0;30000
+A;7;2;MJSCP0103517D;1D3040926;Cup Printing 170ml, 3.5gr, Panther Grape ND (BTU);;Terisi;1;0;0;30000
+A;7;3;MJSCP0103517D;1D3040926;Cup Printing 170ml, 3.5gr, Panther Grape ND (BTU);;Terisi;1;0;0;30000
+A;7;4;MJSPS0512502D;1B1190926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;7;5;MJSPS0512502D;1B1190926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;7;6;MJSPS0512502D;1B1190926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;7;7;MJSPS0512502D;1B1190926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;7;8;MJSPS0512502D;1B1190926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;7;9;MJSPS0512502D;1B1190926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;7;10;MJSPS0512502D;1B1190926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;7;11;MJSPS0512502D;1B1190926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;7;12;MJSPS0512502D;1B1190926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;7;13;MJSPS0512502D;1B1190926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;7;14;MJSPS1309103C;2B1010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;7;15;MJSPS1309103C;2B1010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;7;16;MJSPS1309103C;2B1010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;7;17;MJSPS1309103C;2B1010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;7;18;MJSPS1309103C;2B1010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;7;19;MJSPS1309103C;2B1010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;7;20;MJSPS1309103C;2B1010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;7;21;MJSPS1309103C;2B1010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;7;22;MJSPS1309103C;2B1010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;7;23;MJSPS1309103C;2B1010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;7;24;MJSPS1309103C;2A2010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;7;25;MJSPS1309103C;2A2010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;7;26;MJSPS1706507C;4A1150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;7;27;MJSPL0313807C;4A3011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;7;28;MJSPL0313807C;4A3011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;7;29;MJSPL0313807C;4A3011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;8;1;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;8;2;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;8;3;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;8;4;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;8;5;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;8;6;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;8;7;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;8;8;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;8;9;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;8;10;MJSPL0313809C;4B2070726;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+A;8;11;MJSPL0313809C;4B2070726;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+A;8;12;MJSPL0313809C;4B2070726;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+A;8;13;MJSPL0313809C;4B2070726;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+A;8;14;MJSPS1706509C;3A1051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+A;8;15;MJSPS1706509C;3A1051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+A;8;16;MJSPS1706509C;3A1051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+A;8;17;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+A;8;18;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+A;8;19;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+A;8;20;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;8;21;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;8;22;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;8;23;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;8;24;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;8;25;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;8;26;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;8;27;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;8;28;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;8;29;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;8;30;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;9;1;MJSPS1309103C;2B2010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;2;MJSPS1309103C;2B2010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;3;MJSPS1309103C;2B2010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;4;MJSPS1309103C;2B2010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;5;MJSPS1309103C;2B2010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;6;MJSPS1309103C;2B2010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;7;MJSPS1309103C;2B2010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;8;MJSPS1309103C;2B2010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;9;MJSPS1309103C;2B2010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;10;MJSPS1309103C;2B2010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;11;MJSPS1309103C;2C3010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;12;MJSPS1309103C;2C3010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;13;MJSPS1309103C;2C3010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;14;MJSPS1309103C;2C3010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;15;MJSPS1309103C;2C3010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;16;MJSPS1309103C;2C3010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;17;MJSPS1309103C;2C3010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;18;MJSPS1309103C;2C3010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;19;MJSPS1309103C;2C3010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;20;MJSPS1309103C;2C3010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+A;9;21;MJSCP3903140D;1B3060826;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+A;9;22;MJSCP3903140D;1B3060826;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+A;9;23;MJSCP3903140D;1B3060826;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+A;9;24;MJSCP3903140D;1B3060826;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+A;9;25;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;9;26;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;9;27;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;9;28;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;9;29;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;9;30;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;1;MJSCP3902941D;4C2021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+A;10;2;MJSCP3902941D;4C2021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+A;10;3;MJSCP3902941D;4C2021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+A;10;4;MJSCP3902941D;4C2021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+A;10;5;MJSCP3902941D;4C2021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+A;10;6;MJSCP3902941D;4C2021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+A;10;7;MJSCP3902941D;4C2021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+A;10;8;MJSCP0103519D;1C1050926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+A;10;9;MJSCP0103519D;1B2050926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+A;10;10;MJSCP0103519D;1B2050926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+A;10;11;MJSCP0103519D;1D3050926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+A;10;12;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;13;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;14;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;15;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;16;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;17;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;18;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;19;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;20;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;21;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;22;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;23;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;24;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;25;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;26;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;27;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;28;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;29;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;30;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;10;31;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;11;1;MJSCP3902941D;4D130926;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+A;11;2;MJSCP3902941D;4D130926;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+A;11;3;MJSPS1210803D;3B3160726;Preform Short Neck AMDK 1500ml, 10.8gr, Sky Blue;;Terisi;1;0;0;24000
+A;11;4;MJSPS1210803D;3B3160726;Preform Short Neck AMDK 1500ml, 10.8gr, Sky Blue;;Terisi;1;0;0;24000
+A;11;5;MJSPS1210803D;3B3160726;Preform Short Neck AMDK 1500ml, 10.8gr, Sky Blue;;Terisi;1;0;0;24000
+A;11;6;MJSPS1210803D;3B3160726;Preform Short Neck AMDK 1500ml, 10.8gr, Sky Blue;;Terisi;1;0;0;24000
+A;11;7;MJSPS1210803D;3B3160726;Preform Short Neck AMDK 1500ml, 10.8gr, Sky Blue;;Terisi;1;0;0;24000
+A;11;8;MJSPS1210803D;3B3160726;Preform Short Neck AMDK 1500ml, 10.8gr, Sky Blue;;Terisi;1;0;0;24000
+A;11;9;MJSPS1210803D;3B3160726;Preform Short Neck AMDK 1500ml, 10.8gr, Sky Blue;Pecahan: 14 qty;Terisi;0;14;0;0
+A;11;10;MJSCP3204339D;5A2230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;11;11;MJSCP3204339D;5A2230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;11;12;MJSCP3204339D;5A2230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;11;13;MJSCP3204339D;5A2230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;11;14;MJSCP3204339D;5A2230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;11;15;MJSCP3204339D;5A2230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;11;16;MJSCP3204339D;5A2230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;11;17;MJSCP3204339D;5A2230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;11;18;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;11;19;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;11;20;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;11;21;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;11;22;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;11;23;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;11;24;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;11;25;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;11;26;MJSCP3902941D;4C1280926;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+A;11;27;MJSCP3902941D;4C1280926;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+A;11;28;MJSCP3902941D;4C1280926;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);Pecahan: 7 qty;Terisi;0;7;0;14700
+A;12;1;MJSPS1309101C;2B3140926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+A;12;2;MJSPS1309101C;2B3140926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+A;12;3;MJSPS1309101C;2B3140926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+A;12;4;MJSPS1309101C;2B3140926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+A;12;5;MJSPS1309101C;2B3140926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+A;12;6;MJSPS1309101C;2B3140926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+A;12;7;MJSPS1309104C;2C1290926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;12;8;MJSPS1309104C;2C1290926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;12;9;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;10;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;11;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;12;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;13;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;14;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;15;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;16;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;17;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;18;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;19;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;20;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;21;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;22;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;23;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;24;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;25;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;26;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;12;27;;;;;;;;;
+A;12;28;;;;;;;;;
+A;12;29;;;;;;;;;
+A;13;1;MJSPS1706508C;4B1070926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;13;2;MJSPS1706508C;4B1070926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;13;3;MJSPS1706508C;4B1070926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;13;4;;;;;;;;;
+A;13;5;;;;;;;;;
+A;13;6;;;;;;;;;
+A;13;7;;;;;;;;;
+A;13;8;;;;;;;;;
+A;13;9;;;;;;;;;
+A;13;10;;;;;;;;;
+A;13;11;;;;;;;;;
+A;13;12;;;;;;;;;
+A;13;13;;;;;;;;;
+A;13;14;;;;;;;;;
+A;13;15;;;;;;;;;
+A;13;16;;;;;;;;;
+A;13;17;;;;;;;;;
+A;13;18;;;;;;;;;
+A;13;19;;;;;;;;;
+A;13;20;;;;;;;;;
+A;13;21;;;;;;;;;
+A;13;22;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;0;11;0;4950
+A;13;23;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;13;24;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;13;25;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;13;26;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;13;27;MJSPS1309101C;2C1290726;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+A;13;28;MJSPS0512502D;1C3081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;Pecahan: 14 qty;Terisi;0;14;0;15400
+A;14;1;MJSPS1309104C;2B2280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;2;MJSPS1309104C;2B2280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;3;MJSPS1309104C;2B2280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;4;MJSPS1309104C;2B2280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;5;MJSPS1309104C;2B2280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;6;MJSPS1309104C;2B2280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;7;MJSPS1309104C;2A3280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;8;MJSPS1309104C;2A3280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;9;MJSPS1309104C;2A3280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;10;MJSPS1309104C;2A3280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;11;MJSPS1309104C;2A3280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;12;MJSPS1309104C;2A3280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;13;MJSPS1309104C;2A3280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;14;MJSPS1309104C;2A3280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;15;MJSPS1309104C;2A3280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;16;MJSPS1309104C;2A3280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;14;17;MJSCN3902902G;1A3011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;14;18;MJSCN3902902G;1A3011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;14;19;MJSCN3902902G;1A3011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;14;20;MJSCN3902902G;1A3011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;14;21;MJSCN3902902G;1A3011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;14;22;MJSCN3902902G;1A3011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;14;23;MJSCN3902902G;1A3011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;14;24;MJSCN3902902G;1A3011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;14;25;MJSCN3902902G;1A3011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;14;26;MJSCN3902902G;1A3011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;14;27;MJSCN3902902G;1D1021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;14;28;MJSCN3902902G;1D1021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;14;29;MJSCN3902902G;1D1021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;14;30;MJSPS1210802C;4B1230926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+A;15;1;MJSCP0103514D;1B3130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;15;2;MJSCP0103514D;1B3130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;15;3;MJSCP0103514D;1B3130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;15;4;MJSCP0103514D;1B3130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;15;5;MJSCP0103514D;1B3130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;15;6;MJSCP0103514D;1A1140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;15;7;MJSCP0103514D;1A1140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;15;8;MJSCP0103514D;1A1140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;15;9;MJSCP0103514D;1A1140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;15;10;MJSCP0103514D;1A1140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;15;11;MJSCP0103514D;1A1140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;15;12;MJSCP0103514D;1A1140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;15;13;MJSCP0103514D;1C2140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;15;14;MJSPS1309104C;2C1260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;15;MJSPS1309104C;2C1260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;16;MJSPS1309104C;2C1260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;17;MJSPS1309104C;2C1260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;18;MJSPS1309104C;2C1260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;19;MJSPS1309104C;2C1260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;20;MJSPS1309104C;2C1260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;21;MJSPS1309104C;2C1260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;22;MJSPS1309104C;2C1260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;23;MJSPS1309104C;2C1260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;24;MJSPS1309104C;2C1260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;25;MJSPS1309104C;2B2260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;26;MJSPS1309104C;2B2260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;27;MJSPS1309104C;2B2260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;28;MJSPS1309104C;2B2260926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+A;15;29;MJSCP3204341D;5D1031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;15;30;MJSCP3204341D;5D1031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;16;1;MJSCP3204341D;5D2190926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;16;2;MJSCP3204341D;5D2190926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;16;3;MJSCP3204341D;5D2190926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;16;4;MJSCP3204341D;5D2190926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;16;5;MJSCP3204341D;5B3041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;16;6;MJSCP3204341D;5B3041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;16;7;MJSPL0313808C;3C2140926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;16;8;MJSPL0313808C;3C2140926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;16;9;MJSPL0313808C;3C2140926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;16;10;MJSPL0313808C;3C2140926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;16;11;MJSPL0313808C;3C2140926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;16;12;MJSPL0313808C;3C2140926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;16;13;MJSCC0103501D;3C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;16;14;MJSCC0103501D;3C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;16;15;MJSCC0103501D;3C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;16;16;MJSCC0103501D;3C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;16;17;MJSCC0103501D;3C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;16;18;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;16;19;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;16;20;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;16;21;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;16;22;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;16;23;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;16;24;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;16;25;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;16;26;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;16;27;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;16;28;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;16;29;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;16;30;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;16;31;MJSCN0102908D;3D2081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;17;1;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;2;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;3;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;4;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;5;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;6;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;7;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;8;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;9;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;10;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;11;MJSPS1706508C;4A1150926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;12;MJSPS1706508C;4A1150926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;13;MJSPS1706508C;4A1150926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;14;MJSPS1706508C;4A1150926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;15;MJSPS1706508C;4A1150926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;16;MJSPS1706508C;4A1150926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+A;17;17;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;17;18;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;17;19;MJSPS1706507C;4D2160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;17;20;MJSPS1706507C;4D2160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;17;21;MJSCN0102908D;3B1091026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;17;22;MJSCN0102908D;3B1091026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;17;23;MJSCN0102908D;3B1091026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;17;24;MJSCN0102908D;3B1091026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;17;25;MJSCN0102908D;3B1091026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;17;26;MJSCN0102908D;3B1091026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;17;27;MJSCN0102908D;3B1091026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;17;28;MJSCN0302414D;2C3101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;29;MJSCN0302414D;2C3101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;30;MJSCN0302414D;2C3101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;31;MJSCN0302414D;2C3101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;32;MJSCN0302414D;2C3101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;33;MJSCN0302414D;2C3101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;34;MJSCN0302414D;2C3101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;35;MJSCN0302414D;2C3101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;36;MJSCN0302414D;2C3101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;37;MJSCN0302414D;2B1111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;38;MJSCN0302414D;2B1111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;39;MJSCN0302414D;2B1111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;40;MJSCN0302414D;2B1111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;41;MJSCN0302414D;2B1111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;42;MJSCN0302414D;2B1111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;17;43;MJSCN0302414D;2B1111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;18;1;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;2;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;3;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;4;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;5;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;6;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;7;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;8;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;9;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;10;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;11;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;12;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;13;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;14;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;15;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;16;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;17;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;18;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;19;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;20;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;21;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;22;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;23;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;24;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;25;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;26;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;27;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;28;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;29;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;30;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;31;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;32;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;33;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;34;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;35;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;36;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;37;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;38;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;18;39;MJSPS1309102C;2C3200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;18;40;MJSPS1309102C;2C3200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;18;41;MJSPS1309102C;2C3200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;18;42;MJSPS1309102C;2B1210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;18;43;MJSPS1309102C;2B1210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;18;44;MJSPS0512505C;1C3111026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;Pecahan: 7 qty;Terisi;0;7;0;0
+A;19;1;MJSPS1309102C;2A1170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;2;MJSPS1309102C;2A1170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;3;MJSPS1309102C;2A1170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;4;MJSPS1309102C;2A1170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;5;MJSPS1309102C;2A1170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;6;MJSPS1309102C;2A1170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;7;MJSPS1309102C;2A1170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;8;MJSPS1309102C;2A1170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;9;MJSPS1309102C;2A1170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;10;MJSPS1309102C;2A1170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;11;MJSPS1309102C;2D2170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;12;MJSPS1309102C;2D2170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;13;MJSPS1309102C;2D2170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;14;MJSPS1309102C;2D2170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;15;MJSPS1309102C;2D2170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;16;MJSPS1309102C;2D2170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;17;MJSPS1309102C;2D2170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;18;MJSPS1309102C;2D2170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;19;MJSPS1309102C;2D2170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;20;MJSPS1309102C;2D2170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;19;21;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;22;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;23;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;24;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;25;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;26;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;27;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;28;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;29;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;30;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;31;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;32;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;33;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;34;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;35;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;36;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;37;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;38;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;39;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;40;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;41;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;19;42;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;20;1;MJSCN0102908D;3B1091026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;20;2;MJSCN0102908D;3A1061026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;20;3;MJSCN0102908D;3A1061026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;20;4;MJSCN0102908D;3A1061026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+A;20;5;MJSPS0512502C;1B1091026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+A;20;6;MJSCP0103505D;1A2051125;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (KTM);;Terisi;1;0;0;30000
+A;20;7;MJSCP0103505D;1A2051125;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (KTM);;Terisi;1;0;0;30000
+A;20;8;MJSCP0103505D;1A2051125;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (KTM);;Terisi;1;0;0;30000
+A;20;9;MJSCP0103505D;1A2051125;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (KTM);;Terisi;1;0;0;30000
+A;20;10;MJSCP0103505D;1A2051125;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (KTM);;Terisi;1;0;0;30000
+A;20;11;MJSCN4402703D;4B1010926;Cup Natural 220ml, 2.7gr, Thread;;Terisi;1;0;0;38400
+A;20;12;MJSCN4402703D;4B1010926;Cup Natural 220ml, 2.7gr, Thread;;Terisi;1;0;0;38400
+A;20;13;MJSCN4402703D;4B1010926;Cup Natural 220ml, 2.7gr, Thread;;Terisi;1;0;0;38400
+A;20;14;MJSCN4402703D;4B1010926;Cup Natural 220ml, 2.7gr, Thread;;Terisi;1;0;0;38400
+A;20;15;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;20;16;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;20;17;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;20;18;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;20;19;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;20;20;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;20;21;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;20;22;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;20;23;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;20;24;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;20;25;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;20;26;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;20;27;MJSCN5403501D;2D2190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;20;28;MJSCN5403501D;2D2190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;20;29;MJSCN2902105D;4A3290926;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+A;20;30;MJSCN2902105D;4A3290926;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+A;20;31;MJSCN2902105D;4A3290926;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+A;20;32;MJSCN2902105D;4A3290926;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+A;20;33;MJSCN2902105D;4A3290926;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+A;20;34;MJSCN2902105D;4A3290926;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+A;20;35;MJSPL0313807C;4D1011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;20;36;MJSPL0313807C;4D1011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;20;37;MJSPL0313807C;4D1011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;20;38;MJSPL0313807C;4D1011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;20;39;MJSPL0313807C;4D1011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;20;40;MJSPL0313807C;4D1011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;20;41;MJSPL0313807C;4D1011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;20;42;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;20;43;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+A;20;44;MJSCN3802703D;1D1300926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+A;21;1;MJSPS1309102C;2C3210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;2;MJSPS1309102C;2C3210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;3;MJSPS1309102C;2C3210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;4;MJSPS1309102C;2C3210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;5;MJSPS1309102C;2C3210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;6;MJSPS1309102C;2C3210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;7;MJSPS1309102C;2C3210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;8;MJSPS1309102C;2C3210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;9;MJSPS1309102C;2C3210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;10;MJSPS1309102C;2C3210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;11;MJSPS1309102C;2C3210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;12;MJSPS1309102C;2C3210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;13;MJSPS1309102C;2C3210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;14;MJSPS1309102C;2B1220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;15;MJSPS1309102C;2B1220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;16;MJSPS1309102C;2B1220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;17;MJSPS1309102C;2B1220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;18;MJSPS1309102C;2B1220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;19;MJSPS1309102C;2B1220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;20;MJSPS1309102C;2B1220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;21;MJSPS1309102C;2B1220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;21;22;MJSCP0103514D;1A3100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;21;23;MJSCP0103514D;1A3100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;21;24;MJSCP0103514D;1D1110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;21;25;MJSCP0103514D;1D1110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+A;21;26;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;27;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;28;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;29;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;30;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;31;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;32;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;33;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;34;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;35;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;36;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;37;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;38;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;39;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;40;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;41;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;21;42;MJSPS1706507C;4A1160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;22;1;MJSCN0302715D;3B1230926;Cup Natural 220ml, 2.7gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;22;2;MJSCN0302715D;3B1230926;Cup Natural 220ml, 2.7gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+A;22;3;CKSPS2011701C;Bongkaran Cikarang;Preform Short Neck AMDK 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;18000
+A;22;4;CKSPS2011701C;Bongkaran Cikarang;Preform Short Neck AMDK 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;18000
+A;22;5;CKSPS2011701C;Bongkaran Cikarang;Preform Short Neck AMDK 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;18000
+A;22;6;CKSPS2011701C;Bongkaran Cikarang;Preform Short Neck AMDK 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;18000
+A;22;7;CKSPS2011701C;Bongkaran Cikarang;Preform Short Neck AMDK 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;18000
+A;22;8;CKSPS2011701C;Bongkaran Cikarang;Preform Short Neck AMDK 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;18000
+A;22;9;CKSPS2011701C;Bongkaran Cikarang;Preform Short Neck AMDK 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;18000
+A;22;10;CKSPS2011701C;Bongkaran Cikarang;Preform Short Neck AMDK 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;18000
+A;22;11;CKSPS2011701C;Bongkaran Cikarang;Preform Short Neck AMDK 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;18000
+A;22;12;CKSPS2011701C;Bongkaran Cikarang;Preform Short Neck AMDK 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;18000
+A;22;13;CKSPS2011701C;Bongkaran Cikarang;Preform Short Neck AMDK 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;18000
+A;22;14;CKSPS2011701C;Bongkaran Cikarang;Preform Short Neck AMDK 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;18000
+A;22;15;MJSPS0512502D;1B2260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;22;16;MJSPS0512502D;1B2260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;22;17;MJSPS0512502D;1B2260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;22;18;MJSPS0512502D;1B2260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;22;19;MJSPS0512502D;1B2260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;22;20;MJSPS0512502D;1B2260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;22;21;MJSPS0512502D;1B2260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+A;22;22;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;22;23;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;22;24;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;22;25;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;22;26;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;22;27;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;22;28;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;22;29;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;22;30;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;22;31;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;22;32;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;22;33;MJSCP3204339D;5C3101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;22;34;MJSCP3204339D;5C3101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;22;35;MJSCP3204339D;5C3101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;22;36;MJSCP3204339D;5C3101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;22;37;MJSCP3204339D;5C3101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;22;38;MJSCP3204339D;5C3101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;22;39;MJSCP3204339D;5C3101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;22;40;MJSCP3204339D;5C3101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;22;41;MJSCP3204339D;5B1111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;22;42;MJSCP3204339D;5B1111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;23;1;MJSPS1706507C;4A1170926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;23;2;MJSPS1706507C;4A1170926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+A;23;3;MJSCC0103501D;2D2170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;4;MJSCC0103501D;2D2170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;5;MJSCC0103501D;2D2170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;6;MJSCC0103501D;2D2170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;7;MJSCC0103501D;2D2170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;8;MJSCC0103501D;2D2170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;9;MJSCC0103501D;2D2170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;10;MJSCC0103501D;2C3170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;11;MJSCC0103501D;2C3170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;12;MJSCC0103501D;2C3170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;13;MJSCC0103501D;2C3170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;14;MJSCC0103501D;2C3170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;15;MJSCC0103501D;2C3170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;16;MJSCC0103501D;2C3170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;17;MJSCC0103501D;2C3170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;18;MJSCC0103501D;2C3170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;19;MJSCC0103501D;2C3170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;20;MJSCC0103501D;2C3170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;21;MJSCC0103501D;2C3170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;22;MJSCC0103501D;2C3170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;23;MJSCC0103501D;2C3170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;24;MJSCC0103501D;2A1180926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+A;23;25;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;26;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;27;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;28;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;29;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;30;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;31;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;32;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;33;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;34;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;35;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;36;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;37;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;38;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;39;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;40;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;23;41;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+A;24;1;MJSPL0114006C;1C3150625;Preform Long Neck 600ml, 14.00gr, Clear Natural;;Terisi;1;0;0;12800
+A;24;2;MJSPL0114006C;1C3150625;Preform Long Neck 600ml, 14.00gr, Clear Natural;;Terisi;1;0;0;12800
+A;24;3;MJSPL0114006C;1C3150625;Preform Long Neck 600ml, 14.00gr, Clear Natural;;Terisi;1;0;0;12800
+A;24;4;MJSPL0114006C;1C3150625;Preform Long Neck 600ml, 14.00gr, Clear Natural;;Terisi;1;0;0;12800
+A;24;5;MJSPL0114006C;1C3150625;Preform Long Neck 600ml, 14.00gr, Clear Natural;;Terisi;1;0;0;12800
+A;24;6;MJSCP3204339D;5A2220926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+A;24;7;MJSPS1309102C;2A2230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;24;8;MJSPS1309102C;2A2230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+A;24;9;MJSCN3902902G;1B3051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;10;MJSCN3902902G;1B3051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;11;MJSCN3902902G;1B3051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;12;MJSCN3902902G;1B3051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;13;MJSCN3902902G;1B3051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;14;MJSCN3902902G;1B3051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;15;MJSCN3902902G;1B3051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;16;MJSCN3902902G;1B3051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;17;MJSCN3902902G;1B3051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;18;MJSCN3902902G;1B3051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;19;MJSCN3902902G;1B3051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;20;MJSCN3902902G;1B3051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;21;MJSCN3902902G;1B3051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;22;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;23;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;24;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;25;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;26;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;27;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;28;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;29;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;30;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;31;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;32;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;33;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;34;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;35;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;36;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;37;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;38;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;24;39;MJSCN3902902G;1A1061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;25;1;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;2;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;3;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;4;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;5;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;6;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;7;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;8;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;9;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;10;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;11;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;12;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;13;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;14;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;15;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;16;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;17;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;18;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;19;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;20;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;21;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;22;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;23;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;24;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;25;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;26;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;27;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;25;28;MJSCP3903132D;4B3260826;Cup Printing 155ml, 3.1gr, MTR4/MFTAH8 04 APEL MERAH (D : 73.5);;Terisi;1;0;0;25200
+A;25;29;MJSCP3903132D;4B3260826;Cup Printing 155ml, 3.1gr, MTR4/MFTAH8 04 APEL MERAH (D : 73.5);;Terisi;1;0;0;25200
+A;25;30;MJSCP3903132D;4A1260826;Cup Printing 155ml, 3.1gr, MTR4/MFTAH8 04 APEL MERAH (D : 73.5);;Terisi;1;0;0;25200
+A;25;31;MJSCP3903132D;4A1260826;Cup Printing 155ml, 3.1gr, MTR4/MFTAH8 04 APEL MERAH (D : 73.5);;Terisi;1;0;0;25200
+A;25;32;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;25;33;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;25;34;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;25;35;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;25;36;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;25;37;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;25;38;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;25;39;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;25;40;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;25;41;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;25;42;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;25;43;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;25;44;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;26;1;MJSCN0302703D;4B1230926;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+A;26;2;MJSCN0302703D;4A2230926;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+A;26;3;MJSCN0302703D;4A2230926;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+A;26;4;MJSCN0302703D;4A2230926;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+A;26;5;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;6;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;7;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;8;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;9;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;10;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;11;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;12;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;13;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;14;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;15;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;16;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;17;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;18;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;19;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;20;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;21;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;22;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;23;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;24;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;25;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;26;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;27;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;28;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;29;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;30;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;31;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;32;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;33;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;26;34;MJSCP3204341D;5D1021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;26;35;MJSCP3204341D;5D1021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;26;36;MJSCP3204341D;5D1021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;26;37;MJSCP3204341D;5C2021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;26;38;MJSCP3204341D;5C2021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;26;39;MJSCP3204341D;5C2021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;26;40;MJSCP3204341D;5C2021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+A;26;41;MJSPS1309101C;2B1121026;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+A;26;42;;;;;;;;;
+A;26;43;;;;;;;;;
+A;26;44;;;;;;;;;
+A;27;1;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;2;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;3;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;4;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;5;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;6;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;7;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;8;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;9;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;10;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;11;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;12;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;13;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;14;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;15;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;16;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;17;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;18;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;19;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;20;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;21;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;22;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;23;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;24;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;25;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;26;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;27;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;28;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;29;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;30;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;31;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;32;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;33;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;34;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;35;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+A;27;36;MJSCN3902902G;1A1041026;Cup Natural 160ml, 2.9gr, Mountea;2P;Terisi;1;0;0;25200
+A;27;37;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;27;38;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;27;39;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;27;40;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;27;41;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+A;27;42;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;2P;Terisi;1;0;0;24000
+A;27;43;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;27;44;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+A;28;1;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;2;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;3;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;4;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;5;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;6;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;7;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;8;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;9;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;10;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;11;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;12;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;13;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;14;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;15;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;16;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;17;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;18;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;19;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+A;28;20;;;;;;;;;
+A;28;21;MJSCP0103501D;1B1111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+A;28;22;MJSCP0103501D;1B1111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+A;28;23;MJSCP0103501D;1B1111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+A;28;24;MJSCP0103501D;1B1111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+A;28;25;MJSCP0103501D;1B1111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+A;28;26;MJSCP0103501D;1B1111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+A;28;27;MJSCP0103501D;1B1111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);Pecahan: 2 qty;Terisi;0;2;0;6000
+A;28;28;MJSCP0103517D;1C1050926;Cup Printing 170ml, 3.5gr, Panther Grape ND (BTU);Pecahan: 7 qty;Terisi;0;7;0;21000
+A;28;29;;;;;;;;;
+A;28;30;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+A;28;31;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+A;28;32;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+A;28;33;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+A;28;34;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+A;28;35;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+A;28;36;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+A;28;37;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+A;28;38;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+A;28;39;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+A;28;40;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+A;28;41;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+A;28;42;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+A;28;43;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+A;28;44;MJSCJ0802501D;4D2081026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);Pecahan: 4 qty;Terisi;0;4;0;12800
+B;1;1;MJSCP3204348D;5D2071026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+B;1;2;MJSCP3204348D;5D2071026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+B;1;3;MJSCP3204348D;5D2071026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+B;1;4;MJSCP3204348D;5C3071026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+B;1;5;MJSCP3204348D;5C3071026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+B;1;6;MJSCP3204348D;5C3071026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+B;1;7;MJSCP3204348D;5C3071026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+B;1;8;MJSCP3204348D;5C3071026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+B;1;9;MJSCP3204348D;5C3071026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+B;1;10;MJSCP3204348D;5C3071026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+B;1;11;MJSCP3204348D;5C3071026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+B;1;12;MJSCP3204348D;5A1081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;0;9;0;18900
+B;1;13;MJSPS0512502D;1D1300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;14;MJSPS0512502D;1D1300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;15;MJSPS0512502D;1D1300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;16;MJSPS0512502D;1D1300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;17;MJSPS0512502D;1C2300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;18;MJSPS0512502D;1C2300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;19;MJSPS0512502D;1C2300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;20;MJSPS0512502D;1C2300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;21;MJSPS0512502D;1C2300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;22;MJSPS0512502D;1C2300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;23;MJSPS0512502D;1C2300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;24;MJSPS0512502D;1C2300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;25;MJSPS0512502D;1C2300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;26;MJSPS0512502D;1C2300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;27;MJSPS0512502D;1C2300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;28;MJSPS0512502D;1C2300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;1;29;MJSPS0512502D;1A3300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;2;1;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;2;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;3;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;4;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;5;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;6;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;7;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;8;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;9;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;10;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;11;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;12;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;13;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;14;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;15;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;16;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;17;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;18;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;19;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;20;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;21;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;22;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;23;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;24;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;25;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;26;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;27;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;28;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;29;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;2;30;MJSPS2011701C;3C1207025;Preform Short Neck 600ml, 11.70gr, Clear Natural;;Terisi;0;4;564;4164
+B;3;1;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;3;2;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;3;3;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;3;4;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;3;5;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;3;6;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;7;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;8;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;9;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;10;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;11;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;12;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;13;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;14;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;15;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;16;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;17;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;18;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;19;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;20;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;21;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;22;MJSCN2902303D;4A1051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;23;MJSCN2902303D;4D2051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;24;CKSPS0822209C;Bongkaran Cikarang;Preform Short Neck AMDK 1500ml, 22.20gr, New Blue Club;;Terisi;0;9;450;4770
+B;3;25;MJSCN2902303D;4D2051026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+B;3;26;MJSCP3902941D;4A2101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;3;27;MJSCP3902941D;4A2101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;3;28;MJSCP3902941D;4A2101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;3;29;MJSCP3902941D;4A2101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;3;30;MJSCP3902941D;4A2101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;3;31;MJSCP3902941D;4A2101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;4;1;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;4;2;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;4;3;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;4;4;MJSPS1706508C;4A1140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;4;5;MJSCP0103501D;1B1111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;6;MJSCP0103501D;1A2111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;7;MJSCP0103501D;1A2111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;8;MJSCP0103501D;1A2111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;9;MJSCP0103501D;1A2111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;10;MJSCP0103501D;1A2111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;11;MJSCP0103501D;1A2111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;12;MJSCP0103501D;1A2111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;13;MJSCP0103501D;1A2111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;14;MJSPS0512505C;1A2111026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;4;15;MJSPS0512505C;1A2111026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;4;16;MJSPS0512505C;1A2111026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;4;17;MJSPS0512505C;1A2111026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;4;18;MJSPS0512505C;1A2111026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;4;19;MJSPS0512505C;1A2111026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;4;20;MJSPS0512505C;1A2111026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;4;21;MJSCP0103501D;1C3111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;22;MJSCP0103501D;1C3111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;23;MJSCP0103501D;1C3111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;24;MJSCP0103501D;1C3111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;25;MJSCP0103501D;1C3111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;26;MJSCP0103501D;1C3111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;27;MJSCP0103501D;1C3111026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;28;MJSCP0103501D;1B1121026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;29;MJSCP0103501D;1B1121026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;30;MJSCP0103501D;1B1121026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+B;4;31;;;;;;;;;
+B;5;1;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;2;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;3;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;4;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;5;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;6;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;7;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;8;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;9;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;10;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;11;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;12;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;13;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;14;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;15;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;16;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;17;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;18;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;19;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;20;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;21;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;22;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;23;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;24;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;25;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;26;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;27;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;28;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;29;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;5;30;MJSPL0313807D;4C1090726;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;0;9;0;9000
+B;6;1;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;2;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;3;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;4;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;5;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;6;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;7;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;8;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;9;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;10;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;11;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;12;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;13;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;14;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;15;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;16;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;6;17;MJSPS2122301C;4A3300526;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;0;11;0;4950
+B;6;18;MJSCP3902941D;1A1051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;6;19;MJSCP3902941D;1A1051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;6;20;MJSCP3902941D;1A1051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;6;21;MJSCP3902941D;1A1051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;6;22;MJSCP3902941D;1A1051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;6;23;MJSCP3902941D;1A1051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;7;1;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;2;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;3;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;4;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;5;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;6;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;7;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;8;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;9;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;10;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;11;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;12;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;13;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;14;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;15;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;16;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;7;17;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;7;18;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;7;19;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;7;20;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;7;21;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;7;22;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;7;23;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;7;24;MJSPL0313807C;4B1101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;7;25;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;7;26;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;7;27;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;7;28;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;7;29;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;7;30;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;8;1;;;;;;;;;
+B;8;2;;;;;;;;;
+B;8;3;;;;;;;;;
+B;8;4;;;;;;;;;
+B;8;5;;;;;;;;;
+B;8;6;;;;;;;;;
+B;8;7;;;;;;;;;
+B;8;8;;;;;;;;;
+B;8;9;;;;;;;;;
+B;8;10;;;;;;;;;
+B;8;11;;;;;;;;;
+B;8;12;MJSCN1702402D;2B3030826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;8;13;MJSCN1702402D;2B3030826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;8;14;MJSCN1702402D;2B3030826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;8;15;MJSCN1702402D;2B3030826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;8;16;MJSCN1702402D;2B3030826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;8;17;MJSPS1210803C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+B;8;18;MJSPS1210803C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+B;8;19;MJSPS1210803C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+B;8;20;MJSPS1210803C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+B;8;21;MJSPS1210803C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+B;8;22;MJSPS1210803C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+B;8;23;MJSPS1210803C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+B;8;24;MJSPS1210803C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+B;8;25;MJSPS1210803C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+B;8;26;MJSPS1210803C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+B;8;27;MJSPL0313808C;3B1260926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;8;28;MJSPL0313808C;3B1260926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;8;29;MJSPL0313808C;3B1260926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;9;1;MJSPS1706509C;3A1051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+B;9;2;MJSPS1706509C;3A1051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+B;9;3;MJSPS1706509C;3A1051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+B;9;4;MJSPS1706509C;3A1051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+B;9;5;MJSPS1706509C;3A1051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+B;9;6;MJSPS1706509C;3A1051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+B;9;7;MJSPS1706509C;3A1051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+B;9;8;MJSPS1706509C;3A1051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+B;9;9;MJSPS1706509C;3A1051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+B;9;10;MJSPS0512502D;1C2011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;11;MJSPS0512502D;1C2011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;12;MJSPS0512502D;1C2011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;13;MJSPS0512502D;1C2011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;14;MJSPS0512502D;1C2011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;15;MJSPS0512502D;1C2011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;16;MJSPS0512502D;1C2011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;17;MJSPS0512502D;1C2011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;18;MJSPS0512502D;1C2011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;19;MJSPS0512502D;1C2011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;20;MJSPS0512502D;1A3011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;21;MJSPS0512502D;1A3011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;22;MJSPS0512502D;1A3011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;23;MJSPS0512502D;1A3011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;24;MJSPS0512502D;1A3011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;25;MJSPS0512502D;1A3011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;26;MJSPS0512502D;1A3011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;27;MJSPS0512502D;1A3011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;28;MJSPS0512502D;1A3011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;29;MJSPS0512502D;1A3011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;9;30;MJSPS0512502D;1A3011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;10;1;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;10;2;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;10;3;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;10;4;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;10;5;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;10;6;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;10;7;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;10;8;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;10;9;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;10;10;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;10;11;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;10;12;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+B;10;13;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;14;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;15;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;16;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;17;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;18;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;19;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;20;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;21;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;22;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;23;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;24;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;25;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;26;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;27;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;10;28;MJSPL0313807C;4B3021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;11;1;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;11;2;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;11;3;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;11;4;MJSPL0313808C;4D2071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;11;5;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;11;6;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;11;7;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;11;8;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;11;9;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;11;10;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;11;11;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;11;12;MJSPL0313808C;4A1081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;12;1;MJSCP3902931D;4D3150826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+B;12;2;MJSCP3902931D;4D3150826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+B;12;3;MJSCP3902931D;4D3150826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+B;12;4;MJSCP3902931D;4D3150826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+B;12;5;MJSCP3902931D;4D3150826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+B;12;6;MJSPJ0610801D;3A3030626;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+B;12;7;MJSPJ0610801D;3A3030626;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+B;12;8;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;9;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;10;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;11;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;12;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;13;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;14;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;15;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;16;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;17;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;18;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;19;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;20;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;21;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;22;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;12;23;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;Pecahan: 14 qty;Terisi;0;14;0;11200
+B;14;1;MJSPS0512502C;1D2061026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+B;14;2;MJSPS0512502C;1D2061026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+B;14;3;MJSPS0512502C;1D2061026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+B;14;4;MJSPS0512502C;1D2061026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+B;14;5;MJSPS0512502C;1D2061026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+B;14;6;MJSPS0512502C;1D2061026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+B;14;7;MJSCP3204339D;5A5290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;14;8;MJSCP3204339D;5A5290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;14;9;MJSCP3204339D;5A5290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;14;10;MJSCP3204339D;5D1300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;14;11;MJSCP3204339D;5D1300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;14;12;MJSCP3204339D;5D1300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;14;13;MJSCP3204339D;5D1300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;14;14;MJSCP3204339D;5D1300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;14;15;MJSCP3204339D;5D1300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;14;16;MJSCP3903130D;4A3290926;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+B;14;17;MJSCP3903130D;4A3290926;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+B;14;18;MJSCP3903130D;4A3290926;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+B;14;19;MJSCP0103507D;4B1091026;Cup Printing 170ml, 3.5gr, Panther Grape (TBT);;Terisi;1;0;0;30000
+B;14;20;MJSCP0103507D;4B1091026;Cup Printing 170ml, 3.5gr, Panther Grape (TBT);Pecahan: 6 qty;Terisi;0;6;0;18000
+B;14;21;MJSPS1210801C;3A2101026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+B;14;22;MJSPS1210801C;3A2101026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+B;14;23;MJSPS1210801C;3A2101026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+B;14;24;MJSCP3902941D;4C3111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;15;1;MJSPS1309102C;2D2180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;15;2;MJSPS1309102C;2D2180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;15;3;MJSPS1309102C;2D2180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;15;4;MJSPS1309102C;2D2180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;15;5;MJSPS1309102C;2D2180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;15;6;MJSPS1309102C;2D2180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;15;7;MJSPS0512502D;1A3300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;8;MJSPS0512502D;1A3300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;9;MJSPS0512502D;1A3300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;10;MJSPS0512502D;1A3300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;11;MJSPS0512502D;1A3300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;12;MJSPS0512502D;1A3300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;13;MJSPS0512502D;1A3300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;14;MJSPS0512502D;1A3300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;15;MJSPS0512502D;1A3300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;16;MJSPS0512502D;1A3300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;17;MJSPS0512502D;1A3300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;18;MJSPS0512502D;1D1011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;19;MJSPS0512502D;1D1011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;20;MJSPS0512502D;1D1011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;21;MJSPS0512502D;1D1011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;22;MJSPS0512502D;1D1011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;23;MJSPS0512502D;1D1011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;24;MJSPS0512502D;1D1011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;25;MJSPS0512502D;1D1011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;26;MJSPS0512502D;1D1011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;27;MJSPS0512502D;1D1011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;28;MJSPS0512502D;1D1011026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;15;29;MJSPS1309101C;2A1160926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+B;15;30;MJSPS1309101C;2A1160926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+B;15;31;MJSPS1309101C;2A1160926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+B;16;1;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;16;2;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;16;3;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;16;4;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;16;5;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;16;6;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;16;7;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;16;8;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;16;9;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;16;10;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;16;11;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;16;12;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;16;13;MJSPS1309102C;2A1180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;14;MJSPS1309102C;2A1180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;15;MJSPS1309102C;2A1180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;16;MJSPS1309102C;2A1180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;17;MJSPS1309102C;2A1180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;18;MJSPS1309102C;2A1180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;19;MJSPS1309102C;2A1180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;20;MJSPS1309102C;2A1180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;21;MJSPS1309102C;2A1180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;22;MJSPS1309102C;2A1180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;23;MJSPS1309102C;2A1180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;24;MJSPS1309102C;2D2180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;25;MJSPS1309102C;2D2180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;26;MJSPS1309102C;2D2180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;27;MJSPS1309102C;2D2180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+B;16;28;MJSCP3902941D;1D2061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;16;29;MJSCP3902941D;1D2061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;16;30;MJSCP3902941D;1D2061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+B;17;1;MJSPS1706507C;4D2160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;2;MJSPS1706507C;4D2160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;3;MJSPS1706507C;4D2160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;4;MJSPS1706507C;4D2160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;5;MJSPS1706507C;4D2160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;6;MJSPS1706507C;4D2160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;7;MJSPS1706507C;4D2160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;8;MJSPS1706507C;4D2160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;9;MJSPS1706507C;4D2160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;10;MJSPS1706507C;4B3160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;11;MJSPS1706507C;4B3160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;12;MJSPS1706507C;4B3160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;13;MJSPS1706507C;4B3160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;14;MJSPS1706507C;4B3160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;15;MJSPS1706507C;4B3160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;16;MJSPS1706507C;4B3160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;17;MJSPS1706507C;4B3160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;17;18;MJSCP0103519D;1B2060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+B;17;19;MJSCP0103519D;1B2060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+B;17;20;MJSCP0103519D;1B2060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+B;17;21;MJSCP0103519D;1B2060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+B;17;22;MJSCP0103519D;1B2060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+B;17;23;MJSCP0103519D;1B2060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+B;17;24;MJSCP0103519D;1B2060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+B;17;25;MJSCP0103519D;1B2060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+B;17;26;MJSCP0103519D;1D3060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+B;17;27;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;28;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;29;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;30;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;31;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;32;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;33;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;34;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;35;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;36;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;37;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;38;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;39;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;40;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;41;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;42;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;17;43;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+B;18;1;MJSCN1702402D;2B3030826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;18;2;MJSCN1702402D;2B3030826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;18;3;MJSCN1702402D;2B3030826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;18;4;MJSCN1702402D;2B3030826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;18;5;MJSCN1702402D;2B3030826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;18;6;MJSCN1702402D;2B3030826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;18;7;MJSCN1702402D;2D1040826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;18;8;MJSCN1702402D;2D1040826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;18;9;MJSCN1702402D;2D1040826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;18;10;MJSCN1702402D;2D1040826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;18;11;MJSCN1702402D;2D1040826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;18;12;MJSCN1702402D;2D1040826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;18;13;MJSCN1702402D;2D1040826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+B;18;14;MJSCP3204339D;5D3230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;18;15;MJSCP3204339D;5D3230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;18;16;MJSCP3204339D;5D3230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;18;17;MJSCP3204339D;5D3230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;18;18;MJSCP3204339D;5D3230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;18;19;MJSCP3204339D;5D3230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;18;20;MJSCP3204339D;5D3230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;18;21;MJSCP3204339D;5D3230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;18;22;MJSCP3204339D;5D3230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+B;18;23;MJSPS1309103C;2B1230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;24;MJSPS1309103C;2B1230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;25;MJSPS1309103C;2B1230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;26;MJSPS1309103C;2B1230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;27;MJSPS1309103C;2B1230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;28;MJSPS1309103C;2B1230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;29;MJSPS1309103C;2B1230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;30;MJSPS1309103C;2B1230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;31;MJSPS1309103C;2B1230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;32;MJSPS1309103C;2B1230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;33;MJSPS1309103C;2A2230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;34;MJSPS1309103C;2A2230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;35;MJSPS1309103C;2A2230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;36;MJSPS1309103C;2A2230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;37;MJSPS1309103C;2A2230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;38;MJSPS1309103C;2A2230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;39;MJSPS1309103C;2A2230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;40;MJSPS1309103C;2A2230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;41;MJSPS1309103C;2A2230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;18;42;MJSPS1309103C;2A2230926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+B;19;1;MJSPS0512502D;1A2240926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;19;2;MJSPS0512502D;1A2240926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;19;3;MJSPS0512502D;1A2240926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;19;4;MJSPS0512502D;1A2240926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+B;19;5;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;6;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;7;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;8;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;9;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;10;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;11;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;12;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;13;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;14;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;15;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;16;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;17;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;18;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;19;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;20;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;21;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;22;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;23;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;24;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;25;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;26;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;27;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;28;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;29;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;30;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;31;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+B;19;32;MJSPS2122302C;3D3240926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;19;33;MJSPS2122302C;3D3240926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;19;34;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;35;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;36;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;37;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;38;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;39;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;40;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;41;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;19;42;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;20;1;MJSCN0302804D;4B3160926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+B;20;2;MJSCP3902941D;4C3210926;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);3P2B;Terisi;1;0;0;25200
+B;20;3;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;20;4;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;20;5;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;20;6;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;20;7;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;20;8;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;20;9;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;20;10;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;20;11;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;20;12;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;20;13;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;20;14;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;20;15;MJSPS0512505C;1A2101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;20;16;MJSPS0512505C;1A2101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;20;17;MJSPS0512505C;1A2101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;20;18;MJSPS0512505C;1A2101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;20;19;MJSPS0512505C;1A2101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;20;20;MJSPS0512505C;1A2101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;20;21;MJSPS0512505C;1A2101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;20;22;MJSPS0512505C;1A2101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;20;23;MJSPS0512505C;1A2101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+B;20;24;MJSPS0512505C;1A2101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;Pecahan: 5 qty;Terisi;0;5;0;0
+B;20;25;MJSCJ0203504D;1C3111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;20;26;MJSCJ0203504D;1C3111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;20;27;MJSCJ0203504D;1C3111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;20;28;MJSCJ0203504D;1C3111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;20;29;MJSCJ0203504D;1C3111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;20;30;MJSCJ0203504D;1C3111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;20;31;MJSCJ0203504D;1C3111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;20;32;MJSCJ0203504D;1C3111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;20;33;MJSCJ0203504D;1C3111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;21;1;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;2;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;3;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;4;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;5;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;6;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;7;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;8;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;9;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;10;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;11;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;12;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;13;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;14;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;15;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;16;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;17;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;18;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;19;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;20;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;21;21;CKSPS0824810C;Bongkaran Cikarang;Preform Short Neck AMDK 1500ml, 24.80gr, Blue Arjuna;;Terisi;1;0;0;9000
+B;21;22;CKSPS0824810C;Bongkaran Cikarang;Preform Short Neck AMDK 1500ml, 24.80gr, Blue Arjuna;;Terisi;1;0;0;9000
+B;21;23;CKSPS0824810C;Bongkaran Cikarang;Preform Short Neck AMDK 1500ml, 24.80gr, Blue Arjuna;;Terisi;1;0;0;9000
+B;21;24;CKSPS0824810C;Bongkaran Cikarang;Preform Short Neck AMDK 1500ml, 24.80gr, Blue Arjuna;;Terisi;1;0;0;9000
+B;21;25;CKSPS0824810C;Bongkaran Cikarang;Preform Short Neck AMDK 1500ml, 24.80gr, Blue Arjuna;Pecahan: 10 qty;Terisi;0;10;0;4500
+B;21;26;MJSPS2122301C;3B3260626;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;21;27;MJSPS2122301C;3B3260626;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;21;28;MJSPS2122301C;3B3260626;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;21;29;MJSPS2122301C;3B3260626;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;21;30;MJSPS2122301C;3B3260626;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;21;31;MJSPS2122301C;3B3260626;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;21;32;MJSPS2122301C;3B3260626;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;21;33;MJSPS2122301C;3B3260626;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+B;21;34;MJSCP3902931D;4C1160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+B;21;35;MJSCP3902931D;4C1160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+B;21;36;MJSCP3902931D;4C1160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+B;21;37;MJSCP3902931D;4C1160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+B;21;38;MJSCP3902931D;4C1160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+B;21;39;MJSCP3902931D;4C1160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+B;21;40;MJSCP3902931D;4C1160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+B;21;41;MJSCP3902931D;4C1160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+B;22;1;MJSCN0302804D;4D3230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+B;22;2;MJSCN0302804D;4D3230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+B;22;3;MJSCN0302804D;4D3230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+B;22;4;MJSCN0302804D;4D3230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+B;22;5;MJSCN0302804D;4D3230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+B;22;6;MJSCN0302804D;4D3230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+B;22;7;MJSCN0302804D;4D3230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+B;22;8;MJSCN0302804D;4D3230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+B;22;9;MJSCN0302804D;4D3230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+B;22;10;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;11;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;12;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;13;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;14;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;15;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;16;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;17;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;18;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;19;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;20;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;21;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;22;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;23;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;24;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;25;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;26;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;27;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;28;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;29;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;30;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;31;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;32;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;33;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;34;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;35;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;36;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;37;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;38;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;39;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;40;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;41;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;42;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;43;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;22;44;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;2P;Terisi;1;0;0;8250
+B;23;1;MJSCN5403501D;2A2210926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;23;2;MJSCN5403501D;2A2210926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;23;3;MJSCN5403501D;2A2210926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;23;4;MJSCN5403501D;2A2210926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;23;5;MJSCN5403501D;2A2210926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;23;6;MJSCN5403501D;2A2210926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;23;7;MJSCN5403501D;2A2210926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;23;8;MJSCN5403501D;2A2210926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;23;9;MJSCN5403501D;2A2210926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;23;10;MJSCN5403501D;2A2210926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;23;11;MJSCN5403501D;2A2210926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;23;12;MJSCN5403501D;2A2210926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;23;13;MJSCN0302412D;3B1100826;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+B;23;14;MJSCN0302412D;3B1100826;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+B;23;15;MJSCN0302412D;3B1100826;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+B;23;16;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;17;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;18;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;19;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;20;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;21;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;22;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;23;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;24;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;25;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;26;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;27;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;28;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;29;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;30;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;23;31;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;23;32;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;23;33;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;23;34;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;23;35;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;23;36;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;23;37;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;23;38;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;23;39;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;23;40;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;23;41;MJSCP3204341D;5C2021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+B;23;42;MJSCP3204341D;5C2021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+B;23;43;MJSCP3204341D;5C2021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+B;23;44;MJSCP3204341D;5C2021026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+B;24;1;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;2;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;3;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;4;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;5;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;6;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;7;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;8;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;9;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;10;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;11;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;12;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;13;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;14;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;15;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;16;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;17;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;18;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;19;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;20;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;21;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;22;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;23;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;24;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;25;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;26;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;27;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;28;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;29;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;30;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;31;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;32;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;33;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;34;MJSCN3902902G;1C2041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;35;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;36;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;37;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;38;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;39;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;40;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;41;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;42;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;43;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+B;24;44;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;3P;Terisi;1;0;0;25200
+B;25;1;MJSCP3204340D;5B2250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+B;25;2;MJSCP3204340D;5B2250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+B;25;3;MJSCP3204340D;5B2250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+B;25;4;MJSCP3204340D;5B2250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+B;25;5;MJSCP3204340D;5B2250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+B;25;6;MJSCP3204340D;5D3250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+B;25;7;MJSCP3204340D;5D3250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+B;25;8;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;25;9;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;25;10;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;25;11;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;25;12;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;25;13;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;25;14;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;25;15;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;25;16;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;25;17;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;25;18;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+B;25;19;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;20;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;21;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;22;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;23;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;24;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;25;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;26;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;27;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;28;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;29;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;30;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;31;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;32;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;33;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;34;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;35;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;36;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;37;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;38;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;39;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;40;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;41;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;42;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;25;43;MJSPS2122301D;3C2300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;26;1;MJSCP0103514D;1C2130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+B;26;2;MJSCP0103514D;1C2130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+B;26;3;MJSCP0103514D;1C2130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+B;26;4;MJSPS1706507C;4B3160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;26;5;MJSPS1706507C;4B3160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;26;6;MJSPS1706507C;4B3160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;26;7;MJSPS1706507C;4B3160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;26;8;MJSPS1706507C;4B3160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;26;9;MJSPS1706507C;4B3160926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;26;10;MJSPS1706507C;4A1170926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;26;11;MJSPS1706507C;4A1170926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;26;12;MJSPS1706507C;4A1170926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;26;13;MJSPS1706507C;4A1170926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+B;26;14;MJSCN5403501D;2C1250926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;26;15;MJSCN5403501D;2C1250926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;26;16;MJSCN5403501D;2C1250926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;26;17;MJSCN5403501D;2C1250926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+B;26;18;MJSCN5403501D;2C1250926;Cup Natural 240ml, 3.50gr, Emboos Santri;Pecahan: 3 qty;Terisi;0;3;0;0
+B;26;19;;;;;;;;;
+B;26;20;;;;;;;;;
+B;26;21;MJSCN0302414D;2C3091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+B;26;22;MJSCN0302414D;2C3091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+B;26;23;MJSCN0302414D;2C3091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+B;26;24;MJSCN0302414D;2C3091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+B;26;25;MJSCN0302414D;2C3091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+B;26;26;MJSCN0302414D;2B1101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+B;26;27;MJSCN0302414D;2B1101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+B;26;28;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;29;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;30;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;31;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;32;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;33;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;34;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;35;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;36;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;37;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;38;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;39;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;40;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;41;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;42;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;43;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;26;44;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+B;27;1;MJSPS2011701C;3C2010826;Preform Short Neck 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;14400
+B;27;2;MJSPS2011701C;3C2010826;Preform Short Neck 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;14400
+B;27;3;MJSPS2011701C;3C2010826;Preform Short Neck 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;14400
+B;27;4;MJSPS2011701C;3C2010826;Preform Short Neck 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;14400
+B;27;5;MJSPS2011701C;3C2010826;Preform Short Neck 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;14400
+B;27;6;MJSPS2011701C;3C2010826;Preform Short Neck 600ml, 11.70gr, Clear Natural;;Terisi;1;0;0;14400
+B;27;7;MJSCP3903140D;4D3250926;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73,5);;Terisi;1;0;0;25200
+B;27;8;MJSCP3903140D;4D3250926;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73,5);;Terisi;1;0;0;25200
+B;27;9;MJSCP3903140D;4C1260926;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73,5);;Terisi;1;0;0;25200
+B;27;10;MJSCP3903140D;4C1260926;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73,5);;Terisi;1;0;0;25200
+B;27;11;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;12;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;13;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;14;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;15;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;16;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;17;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;18;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;19;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;20;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;21;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;22;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;23;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;24;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;25;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;26;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;27;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;28;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;29;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;30;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;31;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;32;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;33;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;34;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;35;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;36;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;37;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;38;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;39;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;40;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;41;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;27;42;MJSPL0313808C;4D2061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+B;28;1;MJSCP0103514D;1D1110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+B;28;2;MJSCP0103514D;1D1110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+B;28;3;MJSCP0103514D;1D1110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+B;28;4;MJSCP0103514D;1D1110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+B;28;5;MJSCP0103514D;1D1110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+B;28;6;MJSCP0103514D;1D1110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+B;28;7;MJSCP0103514D;1C2110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+B;28;8;MJSCP0103514D;1C2110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+B;28;9;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;10;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;11;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;12;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;13;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;14;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;15;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;16;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;17;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;18;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;19;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;20;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;21;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;22;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;23;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;24;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;25;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;26;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;27;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;28;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;29;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+B;28;30;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;28;31;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;28;32;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;28;33;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;28;34;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;28;35;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;28;36;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;28;37;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;28;38;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;28;39;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;28;40;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;28;41;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;28;42;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;28;43;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+B;13;1;;;;;;;;;
+B;13;2;;;;;;;;;
+B;13;3;;;;;;;;;
+B;13;4;;;;;;;;;
+B;13;5;;;;;;;;;
+B;13;6;;;;;;;;;
+B;13;7;;;;;;;;;
+B;13;8;;;;;;;;;
+B;13;9;;;;;;;;;
+B;13;10;;;;;;;;;
+B;13;11;;;;;;;;;
+B;13;12;;;;;;;;;
+B;13;13;;;;;;;;;
+B;13;14;;;;;;;;;
+B;13;15;;;;;;;;;
+B;13;16;;;;;;;;;
+B;13;17;;;;;;;;;
+B;13;18;;;;;;;;;
+B;13;19;;;;;;;;;
+B;13;20;;;;;;;;;
+B;13;21;;;;;;;;;
+B;13;22;;;;;;;;;
+B;13;23;;;;;;;;;
+B;13;24;;;;;;;;;
+B;13;25;;;;;;;;;
+B;13;26;;;;;;;;;
+B;13;27;;;;;;;;;
+B;13;28;;;;;;;;;
+B;13;29;;;;;;;;;
+B;13;30;;;;;;;;;
+B;13;31;;;;;;;;;
+C;1;1;MJSPS1309102C;2C3190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;2;MJSPS1309102C;2C3190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;3;MJSPS1309102C;2C3190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;4;MJSPS1309102C;2C3190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;5;MJSPS1309102C;2C3190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;6;MJSPS1309102C;2C3190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;7;MJSPS1309102C;2C3190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;8;MJSPS1309102C;2C3190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;9;MJSPS1309102C;2C3190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;10;MJSPS1309102C;2C3190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;11;MJSPS1309102C;2C3190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;12;MJSPS1309102C;2C3190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;13;MJSPS1309102C;2C3190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;14;MJSPS1309102C;2B1200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;15;MJSPS1309102C;2B1200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;16;MJSPS1309102C;2B1200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;17;MJSPS1309102C;2B1200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;18;MJSPS1309102C;2B1200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;19;MJSPS1309102C;2B1200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;20;MJSPS1309102C;2A2210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;1;21;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;1;22;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;1;23;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;1;24;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;1;25;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;1;26;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;1;27;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;1;28;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;1;29;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;2;1;MJSPS1210802C;4B1230926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;2;2;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;3;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;4;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;5;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;6;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;7;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;8;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;9;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;10;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;11;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;12;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;13;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;14;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;15;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;16;MJSPL0313808C;4B1121026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;2;17;;;;;;;;;
+C;2;18;;;;;;;;;
+C;2;19;;;;;;;;;
+C;2;20;;;;;;;;;
+C;2;21;;;;;;;;;
+C;2;22;;;;;;;;;
+C;2;23;;;;;;;;;
+C;3;1;MJSPS1309102C;2B1200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;3;2;MJSPS1309102C;2B1200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;3;3;MJSPS1309102C;2B1200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;3;4;MJSPS1309102C;2A2200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;3;5;MJSPS1309102C;2A2200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;3;6;MJSPS1309102C;2A2200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;3;7;MJSPS1309102C;2A2200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;3;8;MJSPS1309102C;2A2200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;3;9;MJSPS1309102C;2D3220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;3;10;MJSPS1309102C;2D3220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;3;11;MJSPS1309101C;2D1310726;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;3;12;MJSPS1309101C;2D1310726;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;3;13;MJSPS1309101C;2D1310726;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;3;14;MJSPS1309101C;2D1310726;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;3;15;MJSPS1309101C;2D1310726;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;3;16;MJSPS1309101C;2D1310726;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;3;17;MJSPS1309101C;2D1310726;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;3;18;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;3;19;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;3;20;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;3;21;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;3;22;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;3;23;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;3;24;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;3;25;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;3;26;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;3;27;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;3;28;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;3;29;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;3;30;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;3;31;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;4;1;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;2;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;3;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;4;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;5;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;6;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;7;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;8;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;9;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;10;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;11;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;12;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;13;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;14;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;15;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;16;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;17;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;18;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;19;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;20;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;21;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;22;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;23;MJSPS2122302C;3C1260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;24;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;25;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;26;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;27;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;28;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;4;29;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;5;1;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+C;5;2;MJSPS1706508C;4C2140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+C;5;3;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+C;5;4;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+C;5;5;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+C;5;6;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+C;5;7;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+C;5;8;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+C;5;9;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+C;5;10;MJSPS1706508C;4B3140926;Preform Short Neck AMDK 220ml, 6.50gr, Blue;;Terisi;1;0;0;24000
+C;5;11;MJSCN0302414D;3B3140926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;5;12;MJSCN0302414D;3B3140926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;5;13;MJSCN0302414D;3B3140926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;5;14;MJSCN0302414D;3B3140926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;5;15;MJSCN0302414D;3B3140926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;5;16;MJSCN0302414D;3B3140926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;5;17;MJSCN0302414D;3B3140926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;5;18;MJSCN0302414D;3B3140926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;5;19;MJSCN0302414D;3B3140926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;5;20;MJSCN0302414D;3B3140926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;5;21;MJSCN0302414D;3B3140926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;5;22;MJSCN0302414D;3A1150926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;5;23;MJSCN0302414D;3A1150926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;Pecahan: 8 qty;Terisi;0;8;0;0
+C;5;24;MJSCJ0203504D;1A1071026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;5;25;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;5;26;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;6;1;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+C;6;2;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+C;6;3;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+C;6;4;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+C;6;5;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+C;6;6;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;Pecahan: 12 qty;Terisi;0;12;0;18000
+C;6;7;MJSCP3903132D;4A1270826;Cup Printing 155ml, 3.1gr, MTR4/MFTAH8 04 APEL MERAH (D : 73.5);;Terisi;1;0;0;25200
+C;6;8;MJSCP3903132D;4A1270826;Cup Printing 155ml, 3.1gr, MTR4/MFTAH8 04 APEL MERAH (D : 73.5);;Terisi;1;0;0;25200
+C;6;9;MJSCP3903132D;4A1270826;Cup Printing 155ml, 3.1gr, MTR4/MFTAH8 04 APEL MERAH (D : 73.5);;Terisi;1;0;0;25200
+C;6;10;MJSCP3903132D;4A1270826;Cup Printing 155ml, 3.1gr, MTR4/MFTAH8 04 APEL MERAH (D : 73.5);Pecahan: 6 qty;Terisi;0;6;0;12600
+C;6;11;MJSPL0313808C;4B3051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;6;12;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;6;13;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;6;14;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;6;15;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;6;16;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;6;17;MJSPL0313808C;4A1061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;6;18;MJSPS1309102C;2D3220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;6;19;MJSPS1309102C;2D3220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;6;20;MJSPS1309102C;2D3220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;6;21;MJSCP3204339D;5C3111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;6;22;MJSCP3204339D;5C3111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;6;23;MJSCP3204339D;5C3111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;6;24;MJSCP3204339D;5C3111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;6;25;MJSCP3204339D;5C3111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;6;26;MJSCP3204339D;5C3111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;6;27;MJSCP3204339D;5C3111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;6;28;MJSCP3204339D;5C3111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;6;29;MJSCP3204339D;5B1121026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;6;30;;;;;;;;;
+C;6;31;;;;;;;;;
+C;7;1;MJSCP3902931D;4B2160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+C;7;2;MJSCP3902931D;4B2160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+C;7;3;MJSCP3902931D;4B2160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+C;7;4;MJSCP3902931D;4B2160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+C;7;5;MJSCP3902931D;4B2160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+C;7;6;MJSCP3902931D;4B2160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+C;7;7;MJSCP3902931D;4B2160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+C;7;8;MJSCP3902931D;4D3160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+C;7;9;MJSCP3902931D;4D3160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+C;7;10;MJSCP3902931D;4D3160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+C;7;11;MJSCP3902931D;4D3160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+C;7;12;MJSCP3902931D;4D3160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+C;7;13;MJSCP3902931D;4D3160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+C;7;14;MJSCP3902931D;4D3160826;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+C;7;15;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;16;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;17;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;18;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;19;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;20;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;21;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;22;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;23;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;24;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;25;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;26;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;27;MJSPS1706509C;3D2051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;28;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;29;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;7;30;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+C;8;1;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;2;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;3;MJSPS1210802C;4D3250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;4;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;5;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;6;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;7;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;8;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;9;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;10;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;11;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;12;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;13;MJSPS1210802C;4C1260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;14;MJSPS1210802C;4D3240926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;15;MJSPS1210802C;4D3240926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;16;MJSPS1210802C;4D3240926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;17;MJSPS1210802C;4D3240926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;18;MJSPS1210802C;4D3240926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;19;MJSPS1210802C;4D3240926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;20;MJSPS1210802C;4D3240926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;21;MJSPS1210802C;4D3240926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;22;MJSPS1210802C;4D3240926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+C;8;23;MJSPS1210802C;4D3240926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;Pecahan: 10 qty;Terisi;0;10;0;10000
+C;9;1;MJSCC0103501D;2D2150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;9;2;MJSCC0103501D;2D2150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;9;3;MJSCC0103501D;2D2150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;9;4;MJSCC0103501D;2D2150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;9;5;MJSPS0512502D;1B2290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;6;MJSPS0512502D;1B2290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;7;MJSPS0512502D;1A3290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;8;MJSPS0512502D;1A3290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;9;MJSPS0512502D;1A3290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;10;MJSPS0512502D;1A3290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;11;MJSPS0512502D;1A3290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;12;MJSPS0512502D;1A3290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;13;MJSPS0512502D;1A3290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;14;MJSPS0512502D;1A3290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;15;MJSPS0512502D;1A3290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;16;MJSPS0512502D;1A3290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;17;MJSPS0512502D;1A3290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;18;MJSPS0512502D;1A3290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;19;MJSPS0512502D;1D1300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;20;MJSPS0512502D;1D1300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;21;MJSPS0512502D;1D1300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;22;MJSPS0512502D;1D1300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;23;MJSPS0512502D;1D1300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;24;MJSPS0512502D;1D1300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;25;MJSPS0512502D;1D1300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;9;26;MJSPS0512502D;1D1300926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;10;1;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;2;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;3;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;4;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;5;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;6;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;7;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;8;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;9;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;10;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;11;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;12;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;13;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;14;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;15;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;16;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;17;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;18;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;19;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;20;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;10;21;MJSPS2122302C;3C1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;11;1;MJSPS1309103C;2A2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+C;11;2;MJSPS1309103C;2A2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+C;11;3;MJSPS1309103C;2A2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+C;11;4;MJSPS1309103C;2A2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+C;11;5;MJSPS1309103C;2A2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+C;11;6;MJSPS1309103C;2A2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+C;11;7;MJSPS1309103C;2A2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+C;11;8;MJSPS1309103C;2A2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+C;11;9;MJSPS1309103C;2A2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+C;11;10;MJSPS1309101C;2C2120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;11;11;MJSPS1309101C;2C2120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;11;12;MJSPS1309101C;2C2120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;11;13;MJSPS1309101C;2C2120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;11;14;MJSPS1309101C;2C2120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;11;15;MJSPS1309101C;2C2120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;11;16;MJSPS1309101C;2C2120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;11;17;MJSPS1309101C;2C2120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;11;18;MJSPS1309101C;2C2120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+C;11;19;MJSCP3204339D;5B1111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;11;20;MJSCP3204339D;5B1111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;11;21;MJSCP3204339D;5B1111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;11;22;MJSCP3204339D;5B1111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;11;23;MJSCP3204339D;5B1111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;11;24;MJSCP3204339D;5B1111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;11;25;MJSCP3204339D;5B1111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;11;26;MJSCP3204339D;5A2111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;11;27;MJSCP3204339D;5A2111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;11;28;MJSCP3204339D;5A2111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;11;29;MJSCP3204339D;5A2111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;11;30;MJSCP3204339D;5A2111026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;12;1;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;12;2;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;12;3;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;12;4;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;12;5;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;12;6;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;12;7;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;12;8;MJSPL0313808C;3D3220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+C;12;9;MJSCP3902941D;1A1051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;12;10;MJSCP3902941D;1A1051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;12;11;MJSCP3902941D;1A1051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;12;12;MJSCP0103501D;1C3091026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+C;12;13;MJSCP0103501D;1C3091026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+C;12;14;MJSCP0103501D;1C3091026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+C;12;15;MJSCP0103501D;1C3091026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+C;12;16;MJSCP0103501D;1C3091026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+C;12;17;MJSCP0103501D;1C3091026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+C;12;18;MJSCP0103501D;1C3091026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+C;12;19;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;12;20;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;12;21;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;12;22;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;12;23;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;12;24;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;12;25;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;12;26;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;12;27;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;12;28;MJSPL0313807C;4A2101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+C;13;1;MJSCN0302414D;2A3290926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;Pecahan: 1 qty;Terisi;0;1;0;0
+C;13;2;MJSCN0302414D;2D1300926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;13;3;MJSCN0302414D;2D1300926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;13;4;MJSCN0302414D;2D1300926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;13;5;MJSCN0302414D;2D1300926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;13;6;MJSCN0302414D;2D1300926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;13;7;MJSCN0302414D;2D1300926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;13;8;MJSCN0302414D;2D1300926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;13;9;MJSCN0302414D;2D1300926;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;13;10;MJSPS0512502C;1B1111026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+C;13;11;MJSPS0512502C;1B1111026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+C;13;12;MJSPS0512502C;1B1111026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+C;13;13;MJSPS0512502C;1B1111026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+C;13;14;MJSPS0512502C;1B1111026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+C;13;15;MJSPS0512502C;1B1111026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+C;13;16;MJSPS0512502C;1B1111026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+C;13;17;MJSPS0512502C;1B1111026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+C;13;18;MJSPS0512502C;1B1111026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+C;13;19;MJSPS0512502C;1B1111026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+C;13;20;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+C;13;21;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+C;13;22;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+C;13;23;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+C;13;24;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+C;13;25;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+C;13;26;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+C;13;27;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+C;13;29;;;;;;;;;
+C;13;30;;;;;;;;;
+C;13;31;;;;;;;;;
+C;14;1;MJSCP0103519D;1C1060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+C;14;2;MJSCP0103519D;1C1060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+C;14;3;MJSCP0103519D;1B2060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+C;14;4;MJSCP0103519D;1B2060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+C;14;5;MJSCP0103519D;1B2060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+C;14;6;MJSCP0103519D;1B2060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+C;14;7;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+C;14;8;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+C;14;9;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+C;14;10;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+C;14;11;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+C;14;12;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+C;14;13;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+C;14;14;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+C;14;15;MJSPS1309104C;2B2270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;16;MJSPS1309104C;2B2270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;17;MJSPS1309104C;2B2270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;18;MJSPS1309104C;2B2270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;19;MJSPS1309104C;2B2270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;20;MJSPS1309104C;2B2270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;21;MJSPS1309104C;2B2270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;22;MJSPS1309104C;2B2270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;23;MJSPS1309104C;2A3270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;24;MJSPS1309104C;2A3270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;25;MJSPS1309104C;2A3270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;26;MJSPS1309104C;2A3270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;27;MJSPS1309104C;2A3270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;28;MJSPS1309104C;2A3270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;29;MJSPS1309104C;2A3270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;14;30;MJSPS1309104C;2A3270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;1;MJSPS2122302C;3D3230926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;15;2;MJSPS1309104C;2A3270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;3;MJSPS1309104C;2A3270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;4;MJSPS1309104C;2A3270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;5;MJSPS1309104C;2A3270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;6;MJSPS1309104C;2A3270926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;7;MJSPS1309104C;2C1280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;8;MJSPS1309104C;2C1280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;9;MJSPS1309104C;2C1280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;10;MJSPS1309104C;2C1280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;11;MJSPS1309104C;2C1280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;12;MJSPS1309104C;2C1280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;13;MJSPS1309104C;2C1280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;14;MJSPS1309104C;2C1280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;15;MJSPS1309104C;2C1280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;16;MJSPS1309104C;2C1280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+C;15;17;MJSPS0512502D;1C1240926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;15;18;MJSPS0512502D;1C1240926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;15;19;MJSPS0512502D;1C1240926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;15;20;MJSCN0302412D;2C3071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+C;15;21;MJSCN0302412D;2C3071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+C;15;22;MJSCN0302412D;2C3071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+C;15;23;MJSCN0302412D;2C3071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+C;15;24;MJSCN0302412D;2C3071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+C;15;25;MJSCN0302412D;2C3071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+C;15;26;MJSCN0302412D;2C3071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+C;15;27;MJSCN0302412D;2C3071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+C;15;28;MJSCN0302412D;2C3071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+C;15;29;MJSCN0302412D;2C3071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+C;15;30;MJSCN0302412D;2A1081026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+C;16;1;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;2;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;3;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;4;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;5;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;6;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;7;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;8;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;9;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;10;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;11;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;12;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;13;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;14;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;15;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;16;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;17;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;18;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;19;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;20;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;21;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;22;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;23;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;24;MJSPS2122301D;3A3290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;16;25;MJSCP3204341D;5B3041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+C;16;26;MJSCP3204341D;5B3041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+C;16;27;MJSCP3204341D;5B3041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+C;16;28;MJSCP3204341D;5B3041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+C;16;29;MJSCP3204341D;5B3041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+C;16;30;MJSCP3204341D;5B3041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+C;17;1;MJSPS1210803C;3C1190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;2;MJSPS1210803C;3C1190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;3;MJSPS1210803C;3C1190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;4;MJSPS1210803C;3C1190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;5;MJSPS1210803C;3C1190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;6;MJSPS1210803C;3C1190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;7;MJSPS1210803C;3C1190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;8;MJSPS1210803C;3C1190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;9;MJSPS1210803C;3B2190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;10;MJSPS1210803C;3B2190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;11;MJSPS1210803C;3B2190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;12;MJSPS1210803C;3B2190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;13;MJSPS1210803C;3B2190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;14;MJSPS1210803C;3B2190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;15;MJSPS1210803C;3B2190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;16;MJSPS1210803C;3B2190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;17;MJSPS1210803C;3B2190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;18;MJSPS1210803C;3B2190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;19;MJSPS1210803C;3B2190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;20;MJSPS1210803C;3B2190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;21;MJSPS1210803C;3B2190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;22;MJSPS1210803C;3B2190426;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+C;17;23;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;17;24;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;17;25;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;17;26;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;17;27;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;17;28;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;17;29;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;17;30;MJSCN5403501D;2A2230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;17;31;MJSCP0103501D;1A2121026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+C;17;32;MJSCP0103501D;1A2121026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+C;17;33;MJSCP0103501D;1A2121026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+C;17;34;MJSCP0103501D;1A2121026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+C;17;35;MJSCP0103501D;1A2121026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+C;17;36;MJSCP0103501D;1A2121026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+C;17;37;;;;;;;;;
+C;17;38;;;;;;;;;
+C;17;39;;;;;;;;;
+C;17;40;;;;;;;;;
+C;17;41;;;;;;;;;
+C;17;42;;;;;;;;;
+C;17;43;;;;;;;;;
+C;18;1;MJSCN0102908D;3B3051026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;2;MJSCN0102908D;3B3051026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;3;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;4;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;5;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;6;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;7;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;8;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;9;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;10;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;11;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;12;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;13;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;14;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;15;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;16;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;17;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;18;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;19;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;20;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;21;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;22;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;23;MJSCN0102908D;3D2071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;24;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;25;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;26;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;27;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;28;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;29;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;30;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;31;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;32;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;33;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;34;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;35;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;36;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;37;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;38;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;39;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;40;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;41;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;42;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;43;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;18;44;MJSCN0102908D;3C3071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;19;1;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;2;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;3;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;4;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;5;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;6;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;7;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;8;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;9;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;10;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;11;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;12;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;13;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;14;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;15;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;16;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;17;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;18;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;19;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;20;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;21;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;22;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;23;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;24;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;25;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;26;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;27;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;19;28;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;29;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;30;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;31;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;32;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;33;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;34;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;35;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;36;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;37;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;38;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;39;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;40;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;41;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;42;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;43;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;19;44;MJSCN0302804D;4A2230926;Cup Natural 220ml, 2.80gr, Combinasi;;Terisi;1;0;0;32000
+C;20;1;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;20;2;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;20;3;MJSPS2122301D;3D1220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;20;4;MJSPS2122301D;3C2320826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;20;5;MJSPS2122301D;3C2320826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;20;6;MJSPS2122301D;3C2320826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;20;7;MJSPS2122301D;3C2320826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+C;20;8;MJSCN0102908D;3B3051026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;20;9;MJSCN0102908D;3B3051026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;20;10;MJSCN0102908D;3B3051026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;20;11;MJSCN0102908D;3B3051026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+C;20;12;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;13;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;14;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;15;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;16;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;17;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;18;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;19;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;20;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;21;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;22;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;23;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;24;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;25;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;26;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;27;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;20;28;MJSCN0302414D;2C3081026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;29;MJSCN0302414D;2C3081026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;30;MJSCN0302414D;2C3081026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;31;MJSCN0302414D;2C3081026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;32;MJSCN0302414D;2C3081026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;33;MJSCN0302414D;2C3081026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;34;MJSCN0302414D;2C3081026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;35;MJSCN0302414D;2C3081026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;36;MJSCN0302414D;2C3081026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;37;MJSCN0302414D;2C3081026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;38;MJSCN0302414D;2C3081026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;39;MJSCN0302414D;2B1091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;40;MJSCN0302414D;2B1091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;41;MJSCN0302414D;2B1091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;42;MJSCN0302414D;2B1091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;43;MJSCN0302414D;2B1091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;20;44;MJSCN0302414D;2B1091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;3P;Terisi;1;0;0;36000
+C;21;1;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;2;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;3;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;4;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;5;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;6;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;7;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;8;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;9;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;10;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;11;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;12;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;13;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;14;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;15;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;16;MJSCN5403501D;2C3200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+C;21;17;MJSCP0103514D;1A3110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;21;18;MJSCP0103514D;1A3110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;21;19;MJSCP0103514D;1A3110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;21;20;MJSCP0103514D;1A3110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;21;21;MJSCP0103514D;1A3110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;21;22;MJSCP0103514D;1D1120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;21;23;MJSCP0103514D;1D1120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;21;24;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;21;25;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;21;26;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;21;27;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;21;28;MJSPS2122302C;3C1270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;21;29;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;21;30;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;21;31;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;21;32;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;21;33;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+C;21;34;MJSCP3902941D;1D2051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;21;35;MJSCP3902941D;1D2051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;21;36;MJSCP3902941D;1D2051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;21;37;MJSCP3902941D;1D2051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;21;38;MJSCP3902941D;1D2051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;21;39;MJSCP3902941D;1D2051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;21;40;MJSCP3902941D;1D2051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;21;41;MJSCP3902941D;1D2051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;21;42;MJSCP3902941D;1D2051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;21;43;MJSCP3902941D;1D2051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;22;1;MJSCP3204341D;5C3200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+C;22;2;MJSCP3204341D;5C3200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+C;22;3;MJSCP3204341D;5C3200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+C;22;4;MJSCP3204341D;5C3200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+C;22;5;MJSCP3204341D;5C3200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+C;22;6;MJSCP3204341D;5C3200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+C;22;7;MJSCP3204341D;5C3200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+C;22;8;MJSCP3204341D;5C3200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+C;22;9;MJSCP0103514D;1B3140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;10;MJSCP0103514D;1B3140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;11;MJSCP0103514D;1B3140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;12;MJSCP0103514D;1B3140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;13;MJSCP0103514D;1B3140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;14;MJSCP0103514D;1B3140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;15;MJSCP0103514D;1B3140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;16;MJSCP0103514D;1A1150926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;17;MJSCP0103514D;1A1150926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;18;MJSCP0103514D;1A1150926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;19;MJSCP0103514D;1A1150926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;20;MJSCP0103514D;1A1150926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;21;MJSCP0103514D;1A1150926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;22;MJSCP0103514D;1A1150926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;23;MJSCP0103514D;1A1150926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;22;24;MJSCN3902902G;1D1300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;25;MJSCN3902902G;1D1300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;26;MJSCN3902902G;1D1300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;27;MJSCN3902902G;1D1300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;28;MJSCN3902902G;1D1300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;29;MJSCN3902902G;1D1300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;30;MJSCN3902902G;1D1300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;31;MJSCN3902902G;1D1300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;32;MJSCN3902902G;1C3300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;33;MJSCN3902902G;1C3300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;34;MJSCN3902902G;1C3300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;35;MJSCN3902902G;1C3300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;36;MJSCN3902902G;1C3300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;37;MJSCN3902902G;1C3300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;38;MJSCN3902902G;1C3300926;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;22;39;;;;;;;;;
+C;22;40;;;;;;;;;
+C;22;41;;;;;;;;;
+C;22;42;;;;;;;;;
+C;22;43;;;;;;;;;
+C;22;44;;;;;;;;;
+C;23;1;MJSPS2122301C;3D1240826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+C;23;2;MJSPS2122301C;3D1240826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+C;23;3;MJSPS2122301C;3D1240826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+C;23;4;MJSPS2122301C;3D1240826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+C;23;5;MJSPS2122301C;3D1240826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;7200
+C;23;6;MJSCP3204339D;5D1300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;23;7;MJSCP3204339D;5D1300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;23;8;MJSCP3204339D;5D1300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;23;9;MJSCN0302414D;2B1111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;10;MJSCN0302414D;2B1111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;11;MJSCN0302414D;2B1111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;12;MJSCN0302414D;2B1111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;13;MJSCN0302414D;2B1111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;14;MJSCN0302414D;2B1111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;15;MJSCN0302414D;2A2111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;16;MJSCN0302414D;2A2111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;17;MJSCN0302414D;2A2111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;18;MJSCN0302414D;2A2111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;19;MJSCN0302414D;2A2111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;20;MJSCN0302414D;2A2111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;21;MJSCN0302414D;2A2111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;22;MJSCN0302414D;2A2111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;23;MJSCN0302414D;2A2111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;24;MJSCN0302414D;2A2111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;25;MJSCN0302414D;2A2111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;26;MJSCN0302414D;2A2111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;27;MJSCN0302414D;2A2111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;28;MJSCN0302414D;2C3111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;29;MJSCN0302414D;2C3111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;30;MJSCN0302414D;2C3111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;31;MJSCN0302414D;2C3111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;32;MJSCN0302414D;2C3111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;33;MJSCN0302414D;2C3111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;34;MJSCN0302414D;2C3111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;35;MJSCN0302414D;2C3111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;36;MJSCN0302414D;2C3111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;37;MJSCN0302414D;2C3111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;38;MJSCN0302414D;2C3111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;39;MJSCN0302414D;2C3111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;23;40;MJSCN0302414D;2C3111026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+C;24;1;MJSCP3204340D;5B2260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;2;MJSCP3204340D;5B2260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;3;MJSCP3204340D;5B2260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;4;MJSCP3204340D;5B2260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;5;MJSCP3204340D;5B2260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;6;MJSCP3204340D;5B2260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;7;MJSCP3204340D;5B2260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;8;MJSCP3204340D;5B2260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;9;MJSCP3204340D;5B2260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;10;MJSCP3204340D;5D3260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;11;MJSCP3204340D;5D3260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;12;MJSCP3204340D;5D3260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;13;MJSCP3204340D;5D3260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;14;MJSCP3204340D;5D3260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;15;MJSCP3204340D;5D3260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;16;MJSCP3204340D;5D3260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;17;MJSCP3204340D;5D3260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;18;MJSCP3204340D;5D3260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;19;MJSCP3204340D;5C1270926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;20;MJSCP3204340D;5C1270926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;21;MJSCP3204340D;5C1270926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;22;MJSCP3204340D;5C1270926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;23;MJSCP3204340D;5C1270926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;24;MJSCP3204340D;5C1270926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;24;25;MJSPS0512502D;1C2031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;24;26;MJSPS0512502D;1C2031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;24;27;MJSPS0512502D;1C2031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;24;28;MJSPS0512502D;1C2031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;24;29;MJSPS0512502D;1C2031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;24;30;MJSPS0512502D;1C2031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;24;31;MJSPS0512502D;1C2031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;24;32;MJSPS0512502D;1C2031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;24;33;MJSPS0512502D;1C2031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;24;34;MJSPS0512502D;1C2031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+C;24;35;MJSPS0512502D;1C2031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;2P;Terisi;1;0;0;16500
+C;24;36;MJSCP3204339D;5D1011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;24;37;MJSCP3204339D;5D1011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;24;38;MJSCP3204339D;5D1011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;24;39;MJSCP3204339D;5D1011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;24;40;MJSCP3204339D;5D1011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;24;41;MJSCP3204339D;5D1011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;24;42;MJSCP3204339D;5C2011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;24;43;MJSCP3204339D;5C2011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;24;44;MJSCP3204339D;5C2011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+C;26;1;MJSPS1309102C;2B1190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;2;MJSPS1309102C;2B1190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;3;MJSPS1309102C;2B1190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;4;MJSPS1309102C;2B1190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;5;MJSPS1309102C;2B1190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;6;MJSPS1309102C;2B1190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;7;MJSPS1309102C;2D2190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;8;MJSPS1309102C;2D2190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;9;MJSPS1309102C;2D2190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;10;MJSPS1309102C;2D2190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;11;MJSPS1309102C;2D2190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;12;MJSPS1309102C;2D2190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;13;MJSPS1309102C;2D2190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;14;MJSPS1309102C;2D2190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;15;MJSPS1309102C;2D2190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+C;26;16;MJSCP0103514D;1C2140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;26;17;MJSCP0103514D;1C2140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;26;18;MJSCP0103514D;1C2140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+C;26;19;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;20;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;21;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;22;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;23;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;24;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;25;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;26;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;27;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;28;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;29;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;30;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;31;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;32;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;33;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;34;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;35;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;36;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;37;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;38;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;39;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;40;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;41;MJSCN3902902G;1A3011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;42;MJSCN3902902G;1A3011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;43;MJSCN3902902G;1A3011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;26;44;MJSCN3902902G;1A3011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;27;1;MJSCP3204340D;5B2270926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;27;2;MJSCP3204340D;5B2270926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;27;3;MJSCP3204340D;5B2270926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;27;4;MJSCP3204340D;5B2270926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;27;5;MJSCP3204340D;5B2270926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;27;6;MJSCP3204340D;5B2270926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;27;7;MJSCP3204340D;5B2270926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;27;8;MJSCP3204340D;5B2270926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+C;27;9;MJSCN2902105D;4B3061026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+C;27;10;MJSCN2902105D;4B3061026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+C;27;11;MJSCN2902105D;4B3061026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+C;27;12;MJSCN2902105D;4B3061026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+C;27;13;MJSCN2902105D;4B3061026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+C;27;14;MJSCN2902105D;4B3061026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+C;27;15;MJSCN2902105D;4B3061026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+C;27;16;MJSCN2902105D;4B3061026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+C;27;17;MJSCC0103501D;2B3140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;18;MJSCC0103501D;2B3140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;19;MJSCC0103501D;2B3140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;20;MJSCC0103501D;2B3140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;21;MJSCC0103501D;2B3140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;22;MJSCC0103501D;2B3140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;23;MJSCC0103501D;2B3140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;24;MJSCC0103501D;2B3140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;25;MJSCC0103501D;2B3140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;26;MJSCC0103501D;2A1150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;27;MJSCC0103501D;2A1150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;28;MJSCC0103501D;2A1150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;29;MJSCC0103501D;2A1150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;30;MJSCC0103501D;2A1150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;31;MJSCC0103501D;2A1150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;32;MJSCC0103501D;2A1150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;33;MJSCC0103501D;2D2150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;34;MJSCC0103501D;2D2150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;35;MJSCC0103501D;2D2150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;36;MJSCC0103501D;2D2150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;37;MJSCC0103501D;2D2150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;38;MJSCC0103501D;2D2150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;39;MJSCC0103501D;2D2150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;27;40;MJSCC0103501D;2D2150926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;28;1;MJSCC0103501D;2A1180926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;28;2;MJSCC0103501D;2A1180926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;28;3;MJSCC0103501D;2A1180926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;28;4;MJSCC0103501D;2A1180926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+C;28;5;MJSCC0103501D;2A1180926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;0;4;0;12000
+C;28;6;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;7;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;8;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;9;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;10;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;11;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;12;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;13;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;14;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;15;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;16;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;17;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;18;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;19;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;20;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;21;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;22;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;23;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;24;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;25;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;26;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;27;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;28;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;29;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;30;MJSCN3902902G;1D1011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;31;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;32;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;33;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;34;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;35;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;36;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;37;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;38;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;39;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;40;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;41;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;28;42;MJSCN3902902G;1C2011026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+C;25;1;MJSCP3902941D;4C3101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;25;2;MJSCP3902941D;4C3101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;25;3;MJSCP3902941D;4C3101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;25;4;MJSCP3902941D;4C3101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;25;5;MJSCP3902941D;4C3101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;25;6;MJSCP3902941D;4C3101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;25;7;MJSCP3902941D;4C3101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;25;8;MJSCP3902941D;4C3101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;25;9;MJSCP3902941D;4C3101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+C;25;10;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;11;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;12;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;13;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;14;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;15;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;16;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;17;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;18;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;19;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;20;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;21;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;22;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;23;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;24;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;25;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;26;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;27;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;28;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;29;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;30;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;31;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;32;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;33;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;34;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;35;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;36;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;37;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;38;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;39;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;40;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;41;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;42;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+C;25;43;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+D;1;1;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;2;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;3;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;4;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;5;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;6;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;7;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;8;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;9;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;10;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;11;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;12;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;13;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;14;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;15;MJSPS2122301D;3D1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;16;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;1;17;MJSPS2122301D;3B2290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;0;13;0;7150
+D;1;18;;;;;;;;;
+D;1;19;;;;;;;;;
+D;1;20;;;;;;;;;
+D;1;21;;;;;;;;;
+D;1;22;;;;;;;;;
+D;1;23;;;;;;;;;
+D;1;24;;;;;;;;;
+D;1;25;;;;;;;;;
+D;1;26;;;;;;;;;
+D;1;27;;;;;;;;;
+D;1;28;;;;;;;;;
+D;1;29;;;;;;;;;
+D;1;30;;;;;;;;;
+D;1;31;;;;;;;;;
+D;2;17;MJSCP3204339D;5D2091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;2;18;MJSCP3204339D;5D2091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;2;19;MJSCP3204339D;5D2091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;2;20;MJSCP3204339D;5D2091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;2;21;MJSCP3204339D;5D2091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;2;22;MJSCP3204339D;5D2091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;2;23;MJSCP3204339D;5C3091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;2;24;MJSCP3204339D;5C3091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;2;25;MJSCP3204339D;5C3091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;2;26;MJSCP3204339D;5C3091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;2;27;MJSCP3204339D;5C3091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;2;28;MJSCP3204339D;5C3091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;2;29;MJSCP3204339D;5C3091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;2;30;MJSCP3204339D;5C3091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;2;31;MJSCP3204339D;5C3091026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;3;1;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;2;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;3;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;4;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;5;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;6;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;7;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;8;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;9;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;10;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;11;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;12;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;13;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;14;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;15;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;16;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;17;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;18;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;19;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;20;MJSPS1210802C;4C1050926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;3;21;MJSPS1309104C;2C1280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+D;3;22;MJSPS1309104C;2C1280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+D;3;23;MJSPS1309104C;2B2280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+D;3;24;MJSPS1309104C;2B2280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+D;3;25;MJSPS1309104C;2B2280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+D;3;26;MJSPS1309104C;2B2280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+D;3;27;MJSPS1309104C;2B2280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+D;3;28;MJSPS1309104C;2B2280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+D;3;29;MJSPS1309104C;2B2280926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+D;4;1;MJSCP3902941D;4C2011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;2;MJSCP3902941D;4A3011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;3;MJSCP3902941D;4A3011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;4;MJSCP3902941D;4A3011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;5;MJSCP3902941D;4A3011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;6;MJSCP3902941D;4A3011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;7;MJSCP3902941D;4A3011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;8;MJSCP3902941D;4A3011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;9;MJSCP3902941D;4A3011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;10;MJSCP3902941D;4A3011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;11;MJSCP3902941D;4D1021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;12;MJSCP3902941D;4D1021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;13;MJSCP3902941D;4D1021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;14;MJSCP3902941D;4D1021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;15;MJSCP3902941D;4D1021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;16;MJSCP3902941D;4D1021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;17;MJSCP3902941D;4D1021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;18;MJSCP3902941D;4D1021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;19;MJSCP3902941D;4D1021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;4;20;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;4;21;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;4;22;MJSPS0512502D;1D1031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;4;23;MJSPS0512502D;1D1031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;4;24;MJSPS0512502D;1D1031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;4;25;MJSPS0512502D;1D1031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;4;26;MJSPS0512502D;1D1031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;4;27;MJSPS0512502D;1D1031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;4;28;MJSPS0512502D;1D1031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;4;29;MJSPS0512502D;1D1031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;5;1;MJSPS1309102C;2D2170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;2;MJSPS1309102C;2D2170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;3;MJSPS1309102C;2D2170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;4;MJSPS1309102C;2C3170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;5;MJSPS1309102C;2C3170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;6;MJSPS1309102C;2C3170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;7;MJSPS1309102C;2C3170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;8;MJSPS1309102C;2C3170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;9;MJSPS1309102C;2C3170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;10;MJSPS1309102C;2C3170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;11;MJSPS1309102C;2C3170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;12;MJSPS1309102C;2C3170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;13;MJSPS1309102C;2C3170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;14;MJSPS1309102C;2C3170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;15;MJSPS1309102C;2C3170926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;16;MJSPS1309102C;2A1180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;17;MJSPS1309102C;2A1180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;5;18;MJSPL0313808C;4A1041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;0;8;0;6400
+D;5;19;;;;;;;;;
+D;5;20;;;;;;;;;
+D;5;21;;;;;;;;;
+D;5;22;;;;;;;;;
+D;5;23;;;;;;;;;
+D;5;24;;;;;;;;;
+D;5;25;;;;;;;;;
+D;5;26;;;;;;;;;
+D;5;27;;;;;;;;;
+D;5;28;;;;;;;;;
+D;5;29;;;;;;;;;
+D;6;1;MJSPJ0610801D;3A2250126;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;24000
+D;6;2;MJSPJ0610801D;3A2250126;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;24000
+D;6;3;MJSPJ0610801D;3A2250126;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;24000
+D;6;4;MJSPJ0610801D;3D3250126;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;24000
+D;6;5;MJSPJ0610801D;3D3250126;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;24000
+D;6;6;MJSPJ0610801D;3D3250126;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;24000
+D;6;7;MJSPJ0610801D;3D3250126;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;24000
+D;6;8;MJSPJ0610801D;3D3250126;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;24000
+D;6;9;MJSPJ0610801D;3D3250126;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;24000
+D;6;10;MJSPJ0610801D;3D3250126;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;24000
+D;6;11;MJSPJ0610801D;3D3250126;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;0;20;0;24000
+D;6;12;;;;;;;;;
+D;6;13;MJSCP3902941D;4A3300926;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;14;MJSCP3902941D;4A3300926;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;15;MJSCP3902941D;4A3300926;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;16;MJSCP3902941D;4A3300926;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;17;MJSCP3902941D;4D1011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;18;MJSCP3902941D;4D1011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;19;MJSCP3902941D;4D1011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;20;MJSCP3902941D;4D1011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;21;MJSCP3902941D;4D1011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;22;MJSCP3902941D;4D1011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;23;MJSCP3902941D;4D1011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;24;MJSCP3902941D;4D1011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;25;MJSCP3902941D;4D1011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;26;MJSCP3902941D;4C2011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;27;MJSCP3902941D;4C2011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;28;MJSCP3902941D;4C2011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;29;MJSCP3902941D;4C2011026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;6;30;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;6;31;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;1;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;2;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;3;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;4;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;5;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;6;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;7;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;8;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;9;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;10;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;11;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;12;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;13;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;14;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;15;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;16;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;17;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;18;MJSPJ0610801D;3C2160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;19;MJSPJ0610801D;3B3160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;20;MJSPJ0610801D;3B3160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;21;MJSPJ0610801D;3B3160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;22;MJSPJ0610801D;3B3160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;23;MJSPJ0610801D;3B3160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;24;MJSPJ0610801D;3B3160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;25;MJSPJ0610801D;3B3160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;26;MJSPJ0610801D;3B3160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;27;MJSPJ0610801D;3B3160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;28;MJSPJ0610801D;3B3160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;29;MJSPJ0610801D;3B3160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;30;MJSPJ0610801D;3B3160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);;Terisi;1;0;0;18000
+D;7;31;MJSPJ0610801D;3B3160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue (Jasa);2P;Terisi;1;0;0;18000
+D;8;1;MJSCP3204341D;5A2200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;8;2;MJSCP3204341D;5A2200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;8;3;MJSCP3204341D;5A2200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;8;4;MJSCP3204341D;5A2200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;8;5;MJSCP3204341D;5A2200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;8;6;MJSCP3204341D;5A2200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;8;7;MJSCP3204341D;5A2200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;8;8;MJSCP3204341D;5A2200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;8;9;MJSPS1309102C;2B1220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;10;MJSPS1309102C;2B1220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;11;MJSPS1309102C;2B1220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;12;MJSPS1309102C;2B1220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;13;MJSPS1309102C;2A2220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;14;MJSPS1309102C;2A2220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;15;MJSPS1309102C;2A2220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;16;MJSPS1309102C;2A2220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;17;MJSPS1309102C;2A2220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;18;MJSPS1309102C;2A2220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;19;MJSPS1309102C;2A2220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;20;MJSPS1309102C;2A2220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;21;MJSPS1309102C;2A2220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;22;MJSPS1309102C;2A2220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;23;MJSPS1309102C;2A2220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;8;24;MJSPS1309102C;2A2220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+D;9;1;;;;;;;;;
+D;9;2;;;;;;;;;
+D;9;3;;;;;;;;;
+D;9;4;;;;;;;;;
+D;9;5;;;;;;;;;
+D;9;6;;;;;;;;;
+D;9;7;;;;;;;;;
+D;9;8;;;;;;;;;
+D;9;9;;;;;;;;;
+D;9;10;;;;;;;;;
+D;9;11;;;;;;;;;
+D;9;12;;;;;;;;;
+D;9;13;;;;;;;;;
+D;9;14;;;;;;;;;
+D;9;15;;;;;;;;;
+D;9;16;;;;;;;;;
+D;9;17;;;;;;;;;
+D;9;18;;;;;;;;;
+D;9;19;;;;;;;;;
+D;9;20;;;;;;;;;
+D;9;21;;;;;;;;;
+D;9;22;MJSCP3204339D;5A2101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;9;23;MJSCP3204339D;5A2101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;9;24;MJSCP3204339D;5A2101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;9;25;MJSCP3204339D;5A2101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;9;26;MJSCP3204339D;5A2101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;9;27;MJSCP3204339D;5A2101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;9;28;MJSCP3204339D;5A2101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;9;29;MJSCP3204339D;5A2101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;9;30;MJSCP3204339D;5C3101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;10;1;MJSPL0313809C;4B2070726;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+D;10;2;MJSPL0313808C;3A2220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;10;3;MJSPL0313808C;3A2220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;10;4;MJSPL0313808C;3A2220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;10;5;MJSPL0313808C;3A2220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;10;6;MJSPL0313808C;3A2220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;10;7;MJSPL0313808C;3A2220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;10;8;MJSPL0313808C;3A2220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;10;9;MJSPL0313808C;3A2220926;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;Pecahan: 3 qty;Terisi;0;3;0;2400
+D;10;10;MJSCP0103514D;1D1090926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;10;11;MJSCP0103514D;1D1090926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;10;12;MJSCP0103514D;1D1090926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;10;13;MJSCP0103514D;1D1090926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;10;14;MJSCP0103514D;1D1090926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;10;15;MJSCP0103514D;1D1090926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;10;16;MJSCP0103514D;1D1090926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;10;17;MJSCP0103514D;1D1090926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;10;18;MJSCP0103514D;1B2090926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;10;19;MJSCP0103514D;1B2090926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;10;20;MJSCP0103514D;1B2090926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;10;21;MJSCP0103514D;1B2090926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;10;22;MJSCP0103514D;1B2090926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;10;23;MJSCP0103514D;1B2090926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;10;24;MJSPL0313809C;4B2070726;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+D;10;25;MJSPL0313809C;4B2070726;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;Pecahan: 10 qty;Terisi;0;10;0;8000
+D;10;26;MJSCP0103519D;5A2111026;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+D;10;27;MJSCP0103519D;5A2111026;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+D;10;28;MJSCP0103519D;5A2111026;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+D;10;29;MJSCP0103519D;5A2111026;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+D;10;30;MJSCP0103519D;5A2111026;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+D;11;1;;;;;;;;;
+D;11;2;;;;;;;;;
+D;11;3;;;;;;;;;
+D;11;4;;;;;;;;;
+D;11;5;;;;;;;;;
+D;11;6;;;;;;;;;
+D;11;7;;;;;;;;;
+D;11;8;;;;;;;;;
+D;11;9;;;;;;;;;
+D;11;10;;;;;;;;;
+D;11;11;;;;;;;;;
+D;11;12;;;;;;;;;
+D;11;13;;;;;;;;;
+D;11;14;;;;;;;;;
+D;11;15;;;;;;;;;
+D;11;16;;;;;;;;;
+D;11;17;;;;;;;;;
+D;11;18;;;;;;;;;
+D;11;19;;;;;;;;;
+D;11;20;;;;;;;;;
+D;11;21;;;;;;;;;
+D;11;22;;;;;;;;;
+D;11;23;;;;;;;;;
+D;11;24;;;;;;;;;
+D;11;25;;;;;;;;;
+D;11;26;;;;;;;;;
+D;11;27;;;;;;;;;
+D;11;28;;;;;;;;;
+D;11;29;;;;;;;;;
+D;12;1;MJSPS0512502C;1A1261026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;12;2;MJSPS0512502C;1A1261026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;12;3;MJSPS0512502C;1A1261026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;12;4;MJSPS0512502C;1A1261026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;12;5;MJSPS0512502C;1A1261026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;12;6;MJSPS0512502C;1A1261026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;12;7;MJSPS0512502C;1A1261026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;12;8;MJSPS0512502C;1A1261026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;12;9;MJSPS0512502C;1A1261026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;12;10;MJSPS0512502C;1A1261026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;12;11;MJSPS0512502C;1A1261026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;12;12;MJSCP3902941D;4B3021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;12;13;MJSCP3902941D;4B3021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;12;14;MJSCP3902941D;4B3021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;12;15;MJSCP3902941D;4B3021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;12;16;MJSCP3902941D;4B3021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;12;17;MJSCP3902941D;4B3021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;12;18;MJSCP3902941D;4B3021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;12;19;MJSCP3902941D;4B3021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;12;20;MJSCP3902941D;4B3021026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;12;21;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;12;22;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;12;23;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;12;24;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;12;25;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;12;26;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;12;27;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;12;28;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;12;29;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;12;30;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;13;1;MJSPS0512502D;1C1270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;2;MJSPS0512502D;1C1270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;3;MJSPS0512502D;1C1270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;4;MJSPS0512502D;1B2270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;5;MJSPS0512502D;1B2270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;6;MJSPS0512502D;1B2270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;7;MJSPS0512502D;1B2270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;8;MJSPS0512502D;1B2270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;9;MJSPS0512502D;1B2270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;10;MJSPS0512502D;1B2270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;11;MJSPS0512502D;1B2270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;12;MJSPS0512502D;1B2270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;13;MJSPS0512502D;1B2270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;14;MJSPS0512502D;1B2270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;15;MJSPS0512502D;1B2270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;16;MJSPS0512502D;1A3270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;17;MJSPS0512502D;1A3270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;18;MJSPS0512502D;1A3270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;19;MJSPS0512502D;1A3270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;13;20;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;13;21;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;13;22;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;13;23;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;13;24;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;13;25;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;13;26;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;13;27;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;13;28;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;13;29;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;13;30;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;13;31;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;14;1;MJSCN3902902G;1B3021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;2;MJSCN3902902G;1B3021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;3;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;4;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;5;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;6;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;7;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;8;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;9;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;10;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;11;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;12;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;13;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;14;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;15;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;16;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;17;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;18;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;19;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;20;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;21;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;22;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;23;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;24;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;25;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;26;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;14;27;MJSPS1210801C;3A2111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+D;14;28;MJSPS1210801C;3A2111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+D;14;29;MJSPS1210801C;3A2111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+D;14;30;;;;;;;;;
+D;14;31;;;;;;;;;
+D;15;1;MJSCN0302325D;3A3100926;Cup Natural 220ml, 2.3gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+D;15;2;MJSCN0302325D;3A3100926;Cup Natural 220ml, 2.3gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+D;15;3;MJSCN0302325D;3A3100926;Cup Natural 220ml, 2.3gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+D;15;4;MJSCN0302325D;3A3100926;Cup Natural 220ml, 2.3gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+D;15;5;MJSCN0302325D;3A3100926;Cup Natural 220ml, 2.3gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+D;15;6;MJSCN0302325D;3A3100926;Cup Natural 220ml, 2.3gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+D;15;7;MJSCN0302325D;3A3100926;Cup Natural 220ml, 2.3gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+D;15;8;MJSCN0302325D;3A3100926;Cup Natural 220ml, 2.3gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+D;15;9;MJSCN0302325D;3A3100926;Cup Natural 220ml, 2.3gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+D;15;10;MJSCN0302325D;3A3100926;Cup Natural 220ml, 2.3gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+D;15;11;MJSCN0302325D;3A3100926;Cup Natural 220ml, 2.3gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+D;15;12;MJSCN0302325D;3A3100926;Cup Natural 220ml, 2.3gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+D;15;13;MJSCN0302325D;3A3100926;Cup Natural 220ml, 2.3gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+D;15;14;MJSCP0103514D;1C2110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;15;15;MJSCP0103514D;1C2110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;15;16;MJSCP0103514D;1C2110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;15;17;MJSCP0103514D;1C2110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;15;18;MJSCP0103514D;1A3110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;15;19;MJSCP0103514D;1A3110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;15;20;MJSCP0103514D;1A3110926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+D;15;21;MJSPS0512502C;1A1061026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;15;22;MJSPS0512502C;1A1061026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;15;23;MJSPS0512502C;1A1061026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;15;24;MJSPS0512502C;1D2061026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;15;25;MJSPS0512502C;1D2061026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;15;26;MJSPS0512502C;1D2061026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+D;16;1;MJSPS1309103C;2C3010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;2;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;3;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;4;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;5;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;6;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;7;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;8;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;9;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;10;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;11;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;12;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;13;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;14;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;15;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;16;MJSPS1309103C;2B1020926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+D;16;17;MJSPS0512502D;1B2280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;2P;Terisi;1;0;0;16500
+D;16;18;MJSPS0512502D;1B2280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;16;19;MJSPS0512502D;1B2280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;16;20;MJSPS0512502D;1B2280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;16;21;MJSPS0512502D;1B2280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;16;22;MJSPS0512502D;1B2280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;16;23;MJSPS0512502D;1B2280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;16;24;MJSPS0512502D;1B2290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;16;25;MJSPS0512502D;1B2290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;16;26;MJSPS0512502D;1B2290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;16;27;MJSPS0512502D;1B2290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;16;28;MJSPS0512502D;1B2290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;16;29;MJSPS0512502D;1B2290926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+D;16;30;MJSCC0103501D;2C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;16;31;MJSCC0103501D;2C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;1;MJSCC0103501D;2C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;2;MJSCC0103501D;2C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;3;MJSCC0103501D;2C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;4;MJSCC0103501D;2C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;5;MJSCC0103501D;2C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;6;MJSCC0103501D;2C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;7;MJSCC0103501D;2C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;8;MJSCC0103501D;2C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;9;MJSCC0103501D;2C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;10;MJSCC0103501D;2C2140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;11;MJSCC0103501D;2B3140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;12;MJSCC0103501D;2B3140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;13;MJSCC0103501D;2B3140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;14;MJSCC0103501D;2B3140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;15;MJSCC0103501D;2B3140926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+D;17;16;MJSCP3204339D;5D3220926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;17;17;MJSCP3204339D;5D3220926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;17;18;MJSCP3204339D;5D3220926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;17;19;MJSCP3204339D;5D3220926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;17;20;MJSCP3204339D;5D3220926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;17;21;MJSCP3204339D;5D3220926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;17;22;MJSCP3204339D;5D3220926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;17;23;MJSCP3204339D;5D3220926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;17;24;MJSCP3204339D;5D3220926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;17;25;MJSCP3204339D;5D3220926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;17;26;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;17;27;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;17;28;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;17;29;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;17;30;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;17;31;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;17;32;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;17;33;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;17;34;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;17;35;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;17;36;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;17;37;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;17;38;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;17;39;MJSPS1210802C;4B2250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;17;40;;;;;;;;;
+D;17;41;;;;;;;;;
+D;17;42;;;;;;;;;
+D;17;43;;;;;;;;;
+D;18;1;MJSPS1210802C;4A2220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;2;MJSPS1210802C;4A2220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;3;MJSPS1210802C;4A2220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;4;MJSPS1210802C;4A2220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;5;MJSPS1210802C;4A2220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;6;MJSPS1210802C;4A2220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;7;MJSPS1210802C;4A2220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;8;MJSPS1210802C;4A2220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;9;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;10;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;11;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;12;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;13;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;14;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;15;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;16;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;18;17;MJSCN2902105D;4D2051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;18;MJSCN2902105D;4D2051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;19;MJSCN2902105D;4D2051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;20;MJSCN2902105D;4D2051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;21;MJSCN2902105D;4D2051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;22;MJSCN2902105D;4D2051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;23;MJSCN2902105D;4D2051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;24;MJSCN2902105D;4D2051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;25;MJSCN2902105D;4D2051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;26;MJSCN2902105D;4D2051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;27;MJSCN2902105D;4D2051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;28;MJSCN2902105D;4B3051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;29;MJSCN2902105D;4B3051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;30;MJSCN2902105D;4B3051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;31;MJSCN2902105D;4B3051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;32;MJSCN2902105D;4B3051026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+D;18;33;MJSCP3204341D;5D2190926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;18;34;MJSCP3902941D;1C2041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;18;35;MJSCP3902941D;1C2041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;18;36;MJSCP3902941D;1C2041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;18;37;MJSCP3902941D;1C2041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;18;38;MJSCP3902941D;1C2041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;18;39;MJSCP3902941D;1C2041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;19;1;MJSCN1202501D;2A1292826;Cup Natural 150ml, 2.5gr, KIPAS;;Terisi;1;0;0;30000
+D;19;2;MJSCN1202501D;2A1292826;Cup Natural 150ml, 2.5gr, KIPAS;;Terisi;1;0;0;30000
+D;19;3;MJSCN1202501D;2A1292826;Cup Natural 150ml, 2.5gr, KIPAS;;Terisi;1;0;0;30000
+D;19;4;MJSCN1202501D;2A1292826;Cup Natural 150ml, 2.5gr, KIPAS;;Terisi;1;0;0;30000
+D;19;5;MJSPS1210802C;4C1250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;19;6;MJSPS1210802C;4C1250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;19;7;MJSPS1210802C;4C1250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;19;8;MJSPS1210802C;4C1250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;19;9;MJSPS1210802C;4C1250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;19;10;MJSPS1210802C;4C1250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;19;11;MJSPS1210802C;4C1250926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;19;12;MJSPS1210802C;4B2260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;19;13;MJSPS1210802C;4B2260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;19;14;MJSPS1210802C;4B2260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;19;15;MJSPS1210802C;4B2260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;19;16;MJSCN2902303D;4B3021026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;19;17;MJSCN2902303D;4B3021026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;19;18;MJSCN2902303D;4B3021026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;19;19;MJSCN2902303D;4B3021026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;19;20;MJSCN2902303D;4B3021026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;19;21;MJSCN2902303D;4B3021026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;19;22;MJSCN2902303D;4B3021026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;19;23;MJSCN2902303D;4B3021026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;19;24;MJSCN2902303D;4B3021026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;19;25;MJSCN2902303D;4D1031026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;19;26;MJSCN2902303D;4D1031026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+D;19;27;MJSCN0302412D;2D2071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;28;MJSCN0302412D;2D2071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;29;MJSCN0302412D;2D2071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;30;MJSCN0302412D;2D2071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;31;MJSCN0302412D;2D2071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;32;MJSCN0302412D;2D2071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;33;MJSCN0302412D;2D2071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;34;MJSCN0302412D;2D2071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;35;MJSCN0302412D;2D2071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;36;MJSCN0302412D;2D2071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;37;MJSCN0302412D;2D2071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;38;MJSCN0302412D;2D2071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;39;MJSCN0302412D;2C3071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;40;MJSCN0302412D;2C3071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;41;MJSCN0302412D;2C3071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;19;42;MJSCN0302412D;2C3071026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;20;1;MJSCP3204339D;5C2011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;2;MJSCP3204339D;5C2011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;3;MJSCP3204339D;5C2011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;4;MJSCP3204339D;5C2011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;5;MJSCP3204339D;5C2011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;6;MJSCP3204339D;5C2011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;7;MJSCP3204339D;5C2011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;8;MJSCP3204339D;5A3011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;9;MJSCP3204339D;5A3011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;10;MJSCP3204339D;5A3011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;11;MJSCP3204339D;5A3011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;12;MJSCP3204339D;5A3011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;13;MJSCP3204339D;5A3011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;14;MJSCP3204339D;5A3011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;15;MJSCP3204339D;5A3011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;16;MJSCP3204339D;5A3011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;20;17;MJSPS2122301D;3A3011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;20;18;MJSPS2122301D;3D1021026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;20;19;MJSPS2122301D;3D1021026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;20;20;MJSPS2122301D;3D1021026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;20;21;MJSPS2122301D;3D1021026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;20;22;MJSPS2122301D;3D1021026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;20;23;MJSPS2122301D;3D1021026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;20;24;MJSPS2122301D;3D1021026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;20;25;MJSPS2122301D;3D1021026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+D;20;26;MJSCP3902941D;4B2290926;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;20;27;MJSCP3902941D;4B2290926;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;20;28;MJSCP3902941D;4A3290926;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;20;29;MJSCP3902941D;4A3290926;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+D;20;30;MJSCP3204348D;5A1081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+D;20;31;MJSCP3204348D;5A1081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+D;20;32;MJSCP3204348D;5A1081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+D;20;33;MJSCP3204348D;5A1081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+D;20;34;MJSCP3204348D;5A1081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+D;20;35;MJSCP3204348D;5A1081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+D;20;36;MJSCP3204348D;5A1081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+D;20;37;MJSCP3204348D;5A1081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+D;20;38;MJSCP3204348D;5D2081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+D;20;39;MJSCP3204348D;5D2081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+D;20;40;MJSCP3204348D;5D2081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+D;20;41;MJSCP3204348D;5D2081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+D;20;42;MJSCP3204348D;5D2081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+D;20;43;MJSCP3204348D;5D2081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+D;21;1;MJSPS1706507C;4A1150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+D;21;2;MJSPS1706507C;4A1150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+D;21;3;MJSPS1706507C;4A1150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+D;21;4;MJSPS1706507C;4A1150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+D;21;5;MJSPS1706507C;4A1150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+D;21;6;MJSPS1210803C;3A1160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+D;21;7;MJSPS1210803C;3A1160726;Preform Short Neck AMDK 600ml, 10.8gr, Sky Blue;;Terisi;1;0;0;16000
+D;21;8;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;9;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;10;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;11;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;12;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;13;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;14;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;15;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;16;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;17;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;18;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;19;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;20;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;21;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;22;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;23;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;24;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;25;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;26;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;27;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;28;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;29;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;30;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;31;MJSPL0313808C;4D2051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+D;21;32;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;21;33;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;22;1;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;22;2;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;22;3;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;22;4;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;22;5;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;22;6;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;22;7;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;22;8;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;22;9;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;22;10;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;22;11;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;22;12;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;22;13;MJSPS1210802C;4D3220926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+D;22;14;MJSCP3204340D;5B3270826;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+D;22;15;MJSCP3204340D;5B3270826;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+D;22;16;MJSCP3204340D;5B3270826;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+D;22;17;;;;;;;;;
+D;22;18;;;;;;;;;
+D;22;19;;;;;;;;;
+D;22;20;;;;;;;;;
+D;22;21;;;;;;;;;
+D;22;22;;;;;;;;;
+D;22;23;;;;;;;;;
+D;22;24;;;;;;;;;
+D;22;25;;;;;;;;;
+D;22;26;;;;;;;;;
+D;22;27;;;;;;;;;
+D;22;28;;;;;;;;;
+D;22;29;;;;;;;;;
+D;22;30;;;;;;;;;
+D;22;31;;;;;;;;;
+D;22;32;;;;;;;;;
+D;22;33;;;;;;;;;
+D;22;34;;;;;;;;;
+D;22;35;;;;;;;;;
+D;22;36;;;;;;;;;
+D;22;37;;;;;;;;;
+D;22;38;;;;;;;;;
+D;22;39;;;;;;;;;
+D;22;40;;;;;;;;;
+D;23;1;MJSCN0302412D;2A1081026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;23;2;MJSCN0302412D;2A1081026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;23;3;MJSCN0302412D;2A1081026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;23;4;MJSCN0302412D;2A1081026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;23;5;MJSCN0302412D;2A1081026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+D;23;6;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;7;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;8;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;9;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;10;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;11;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;12;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;13;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;14;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;15;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;16;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;17;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;18;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;19;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;20;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;21;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;22;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;23;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;24;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;25;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;26;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;27;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;28;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;29;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;30;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;31;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;32;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;33;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;34;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;35;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;36;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;37;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;38;MJSPS2122302C;3B2270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;39;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;23;40;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+D;24;1;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;2;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;3;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;4;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;5;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;6;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;7;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;8;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;9;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;10;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;11;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;12;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;13;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;14;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;15;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;16;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;17;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;18;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;19;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;20;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;21;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;22;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;23;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;24;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;25;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;26;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;27;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;28;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;29;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;30;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;31;MJSPL0313807C;4C2011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;32;MJSPL0313807C;4A3011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;33;MJSPL0313807C;4A3011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;34;MJSPL0313807C;4A3011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;35;MJSPL0313807C;4A3011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;36;MJSPL0313807C;4A3011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+D;24;37;;;;;;;;;
+D;24;38;;;;;;;;;
+D;24;39;;;;;;;;;
+D;24;40;;;;;;;;;
+D;24;41;;;;;;;;;
+D;26;1;;;;;;;;;
+D;26;2;;;;;;;;;
+D;26;3;;;;;;;;;
+D;26;4;;;;;;;;;
+D;26;5;;;;;;;;;
+D;26;6;;;;;;;;;
+D;26;7;;;;;;;;;
+D;26;8;;;;;;;;;
+D;26;9;;;;;;;;;
+D;26;10;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;11;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;12;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;13;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;14;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;15;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;16;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;17;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;18;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;19;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;20;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;21;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;22;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;23;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;24;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;25;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;26;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;27;MJSCN5403501D;2C1240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;28;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;29;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+D;26;30;MJSCP3204341D;5B3031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;26;31;MJSCP3204341D;5B3031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;26;32;MJSCP3204341D;5B3031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;26;33;MJSCP3204341D;5B3031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;26;34;MJSCP3204341D;5B3031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;26;35;MJSCP3204341D;5B3031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;26;36;MJSCP3204341D;5A1041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;26;37;MJSCP3204341D;5A1041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;26;38;MJSCP3204341D;5A1041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;26;39;MJSCP3204341D;5A1041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;26;40;MJSCP3204341D;5A1041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;26;41;MJSCP3204341D;5A1041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+D;27;1;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;2;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;3;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;4;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;5;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;6;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;7;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;8;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;9;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;10;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;11;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;12;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;13;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;14;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;15;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;16;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;17;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;18;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;19;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;20;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;21;MJSCN3902902G;1D2051026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;27;22;;;;;;;;;
+D;27;23;;;;;;;;;
+D;27;24;;;;;;;;;
+D;27;25;;;;;;;;;
+D;27;26;;;;;;;;;
+D;27;27;;;;;;;;;
+D;27;28;;;;;;;;;
+D;27;29;;;;;;;;;
+D;27;30;;;;;;;;;
+D;27;31;;;;;;;;;
+D;27;32;;;;;;;;;
+D;27;33;;;;;;;;;
+D;27;34;;;;;;;;;
+D;27;35;;;;;;;;;
+D;27;36;;;;;;;;;
+D;27;37;;;;;;;;;
+D;27;38;;;;;;;;;
+D;28;1;MJSCN1702402D;2D11100826;Cup Natural 120ml, 2.4gr, General;;Terisi;0;2;0;6000
+D;28;2;MJSCP3204339D;5B1250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;28;3;MJSCP3204339D;5B1250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;28;4;MJSCP3204339D;5B1250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;28;5;MJSCP3204339D;5B1250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;28;6;MJSCP3204339D;5B1250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;28;7;MJSCP3204339D;5B1250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;28;8;MJSCP3204339D;5B1250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;28;9;MJSCP3204339D;5B1250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;28;10;MJSCP3204339D;5A2230926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+D;28;11;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;12;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;13;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;14;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;15;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;16;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;17;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;18;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;19;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;20;MJSCN3902902G;1D1031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;21;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;22;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;23;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;24;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;25;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;26;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;27;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;28;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;29;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;30;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;31;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;32;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;33;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;34;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;35;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;36;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;37;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;38;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;39;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;40;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;41;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;42;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;43;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;28;44;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+D;25;1;;;;;;;;;
+D;25;2;;;;;;;;;
+D;25;3;;;;;;;;;
+D;25;4;;;;;;;;;
+D;25;5;;;;;;;;;
+D;25;6;;;;;;;;;
+D;25;7;;;;;;;;;
+D;25;8;;;;;;;;;
+D;25;9;;;;;;;;;
+D;25;10;;;;;;;;;
+D;25;11;;;;;;;;;
+D;25;12;;;;;;;;;
+D;25;13;;;;;;;;;
+D;25;14;;;;;;;;;
+D;25;15;;;;;;;;;
+D;25;16;;;;;;;;;
+D;25;17;;;;;;;;;
+D;25;18;;;;;;;;;
+D;25;19;;;;;;;;;
+D;25;20;;;;;;;;;
+D;25;21;;;;;;;;;
+D;25;22;;;;;;;;;
+D;25;23;;;;;;;;;
+D;25;24;;;;;;;;;
+D;25;25;;;;;;;;;
+D;25;26;;;;;;;;;
+D;25;27;;;;;;;;;
+D;25;28;;;;;;;;;
+D;25;29;;;;;;;;;
+D;25;30;;;;;;;;;
+D;25;31;;;;;;;;;
+D;25;32;;;;;;;;;
+D;25;33;;;;;;;;;
+D;25;34;;;;;;;;;
+D;25;35;;;;;;;;;
+D;25;36;;;;;;;;;
+D;25;37;;;;;;;;;
+D;25;38;;;;;;;;;
+D;25;39;;;;;;;;;
+D;25;40;;;;;;;;;
+D;25;41;;;;;;;;;
+D;25;42;;;;;;;;;
+D;25;43;;;;;;;;;
+D;25;44;;;;;;;;;
+E;1;1;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;1;2;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;1;3;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;1;4;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;1;5;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;1;6;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;1;7;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;1;8;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;1;9;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;1;10;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;1;11;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;1;12;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;1;13;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;1;14;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;1;15;MJSPS1706507C;4C3310826;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;Pecahan: 13 qty;Terisi;0;13;0;19500
+E;1;16;MJSCN3802703D;1D3250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;1;17;MJSCN3802703D;1D3250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;1;18;MJSCN3802703D;1D3250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;1;19;MJSCN3802703D;1D3250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;1;20;MJSCN3802703D;1D3250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;1;21;MJSCN3802703D;1D3250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;1;22;MJSCN3802703D;1D3250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;1;23;MJSCN3802703D;1D3250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;1;24;MJSCN3802703D;1D3250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;1;25;MJSCN3802703D;1D3260926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;1;26;MJSCN3802703D;1D3260926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;1;27;MJSCN3802703D;1D3260926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;1;28;MJSCN3802703D;1D3260926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;1;29;MJSCN3802703D;1D3260926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;1;30;MJSCN3802703D;1D3260926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+E;2;1;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;2;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;3;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;4;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;5;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;6;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;7;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;8;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;9;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;10;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;11;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;12;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;13;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;14;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;15;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;16;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;17;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;18;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;19;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;20;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;21;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;22;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;23;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;24;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;25;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;26;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;27;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;28;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;29;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;30;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;2;31;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;+ 14 Box;Terisi;1;0;0;8250
+E;2;32;MJSPS2122301D;3A3220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;Pecahan: 14 qty;Terisi;0;14;0;7700
+E;4;1;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;4;2;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;4;3;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;4;4;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;5;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;6;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;7;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;8;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;9;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;10;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;11;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;12;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;13;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;14;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;15;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;16;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;17;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;18;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;19;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;20;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;21;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;22;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;23;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;24;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;25;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;26;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;27;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;1;0;0;12800
+E;4;28;MJSPL0313809C;4C3081026;Preform Long Neck AMDK 600ml, 13.80gr, Dark Blue;;Terisi;0;4;0;3200
+E;5;1;MJSPS0512502D;1D1021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;2;MJSPS0512502D;1D1021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;3;MJSPS0512502D;1D1021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;4;MJSPS0512502D;1D1021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;5;MJSPS0512502D;1D1021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;6;MJSPS0512502D;1D1021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;7;MJSPS0512502D;1D1021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;8;MJSPS0512502D;1D1021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;9;MJSPS0512502D;1D1021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;10;MJSPS0512502D;1D1021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;11;MJSPS0512502D;1D1021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;12;MJSPS0512502D;1C2021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;13;MJSPS0512502D;1C2021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;14;MJSPS0512502D;1C2021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;15;MJSPS0512502D;1C2021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;16;MJSPS0512502D;1C2021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;17;MJSPS0512502D;1C2021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;18;MJSPS0512502D;1C2021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;19;MJSPS0512502D;1C2021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;20;MJSPS0512502D;1C2021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;21;MJSPS0512502D;1C2021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;22;MJSPS0512502D;1C2021026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;23;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;24;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;25;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;26;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;27;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;28;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;29;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;30;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;31;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;5;32;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;6;1;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+E;6;2;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+E;6;3;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+E;6;4;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+E;6;5;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+E;6;6;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+E;6;7;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+E;6;8;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+E;6;9;MJSPS1706406C;3A2250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+E;6;10;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+E;6;11;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;Pecahan: 11 qty;Terisi;0;11;0;16500
+E;6;12;MJSPS1309101C;2D1120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+E;6;13;MJSPS1309101C;2D1120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+E;6;14;MJSPS1309101C;2D1120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+E;6;15;MJSPS1309101C;2D1120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+E;6;16;MJSPS1309101C;2D1120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+E;6;17;MJSPS1309101C;2C2120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+E;6;18;MJSPS1309101C;2C2120926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+E;6;19;MJSPS1309101C;2A1160926;Preform Short Neck AMDK 330ml, 9.1gr, Clear Natural;;Terisi;1;0;0;20000
+E;6;20;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;6;21;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;6;22;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;6;23;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;6;24;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;6;25;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;6;26;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;6;27;MJSCJ0203504D;1A1071026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;6;28;MJSCJ0203504D;1A1071026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;6;29;MJSCJ0203504D;1A1071026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;6;30;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;3P;Terisi;1;0;0;12800
+E;6;31;MJSPL0313807C;4B1091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;1;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;7;2;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;7;3;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;7;4;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;7;5;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;7;6;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;7;7;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;7;8;MJSCN0302412D;2B3061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;7;9;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;10;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;11;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;12;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;13;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;14;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;15;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;16;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;17;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;18;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;19;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;20;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;21;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;22;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;23;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;24;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;25;MJSPL0313807C;4C3101026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;26;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;27;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;28;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;29;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;7;30;MJSPL0313807C;4B1111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;8;1;MJSCN0102908D;3B3061026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;8;2;MJSCN0102908D;3B3061026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;8;3;MJSCN0102908D;3B3061026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;8;4;MJSCN0102908D;3A1071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;8;5;MJSCN0102908D;3A1071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;8;6;MJSCN0102908D;3A1071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;8;7;MJSCN0102908D;3A1071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;8;8;MJSCN0102908D;3A1071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;8;9;MJSCN0102908D;3A1071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;8;10;MJSCN0102908D;3A1071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;8;11;MJSCN0102908D;3A1071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;8;12;MJSCN0102908D;3A1071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;8;13;MJSCN0102908D;3A1071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;8;14;MJSCN0102908D;3A1071026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;8;15;MJSPS1309103C;2C3310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;16;MJSPS1309103C;2C3310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;17;MJSPS1309103C;2C3310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;18;MJSPS1309103C;2C3310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;19;MJSPS1309103C;2C3310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;20;MJSPS1309103C;2C3310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;21;MJSPS1309103C;2C3310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;22;MJSPS1309103C;2C3310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;23;MJSPS1309103C;2C3310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;24;MJSPS1309103C;2C3310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;25;MJSPS1309103C;2C3310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;26;MJSPS1309103C;2C3310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;27;MJSPS1309103C;2C3310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;28;MJSPS1309103C;2B1010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;29;MJSPS1309103C;2B1010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;8;30;MJSPS1309103C;2B1010926;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+E;10;1;;;;;;;;;
+E;10;2;;;;;;;;;
+E;10;3;;;;;;;;;
+E;10;4;;;;;;;;;
+E;10;5;;;;;;;;;
+E;10;6;;;;;;;;;
+E;10;7;;;;;;;;;
+E;10;8;;;;;;;;;
+E;10;9;;;;;;;;;
+E;10;10;;;;;;;;;
+E;10;11;;;;;;;;;
+E;10;12;;;;;;;;;
+E;10;13;;;;;;;;;
+E;10;14;;;;;;;;;
+E;10;15;;;;;;;;;
+E;10;16;;;;;;;;;
+E;10;17;;;;;;;;;
+E;10;18;;;;;;;;;
+E;10;19;MJSPS1309102C;2D3150926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;10;20;MJSPS1309102C;2D3150926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;10;21;MJSPS1309102C;2A2200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;10;22;MJSPS1309102C;2A2200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;10;23;MJSPS1309102C;2A2200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;10;24;MJSPS1309102C;2A2200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;10;25;MJSPS1309102C;2A2200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;10;26;MJSPS1309102C;2A2200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;10;27;MJSPS1309102C;2A2200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;10;28;MJSPS1309102C;2A2200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;10;29;MJSPS1309102C;2C3200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;10;30;MJSPS1309102C;2C3200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;11;1;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;2;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;3;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;4;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;5;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;6;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;7;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;8;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;9;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;10;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;11;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;12;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;13;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;14;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;15;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;16;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;17;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;18;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;19;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;20;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;21;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;22;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;11;23;MJSPS2122302C;3B2250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;12;1;MJSPS1210801C;3D2091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;12;2;MJSPS1210801C;3D2091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;12;3;MJSPS1210801C;3D2091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;12;4;MJSCN2902303D;4B3031026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;12;5;MJSCN2902303D;4B3031026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;12;6;MJSCN2902303D;4B3031026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;12;7;MJSCN2902303D;4B3031026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;12;8;MJSCN2902303D;4B3031026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;12;9;MJSCN2902303D;4B3031026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;12;10;MJSCN2902303D;4B3031026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;12;11;MJSCN2902303D;4B3031026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;12;12;MJSCN2902303D;4B3031026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;12;13;MJSCN2902303D;4B3031026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;12;14;MJSCN2902303D;4B3031026;Cup Natural 200ml, 2.3gr, Full Ring;Pecahan: 3 qty;Terisi;0;3;0;9600
+E;12;15;MJSCP3204339D;5B1121026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;12;16;MJSCP3204339D;5B1121026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;12;17;MJSCP3204339D;5B1121026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;12;18;;;;;;;;;
+E;12;19;;;;;;;;;
+E;12;20;;;;;;;;;
+E;12;21;;;;;;;;;
+E;12;22;;;;;;;;;
+E;12;23;;;;;;;;;
+E;13;1;MJSPS0512502D;1A3270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;2;MJSPS0512502D;1A3270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;3;MJSPS0512502D;1A3270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;4;MJSPS0512502D;1A3270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;5;MJSPS0512502D;1A3270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;6;MJSPS0512502D;1A3270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;7;MJSPS0512502D;1A3270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;8;MJSPS0512502D;1A3270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;9;MJSPS0512502D;1A3270926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;10;MJSPS0512502D;1C1280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;11;MJSPS0512502D;1C1280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;12;MJSPS0512502D;1C1280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;13;MJSPS0512502D;1C1280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;14;MJSPS0512502D;1C1280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;15;MJSPS0512502D;1C1280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;16;MJSPS0512502D;1C1280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;17;MJSPS0512502D;1C1280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;18;MJSPS0512502D;1C1280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;19;MJSPS0512502D;1C1280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;20;MJSPS0512502D;1C1280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;21;MJSPS0512502D;1C1280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;22;MJSPS0512502D;1B3280926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;13;23;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;13;24;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;13;25;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;13;26;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;13;27;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;13;28;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;13;29;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;13;30;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;13;31;MJSCN0102908D;3A1081026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;14;1;MJSCP0103501D;1B1121026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+E;14;2;MJSCP0103501D;1B1121026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+E;14;3;MJSCP0103501D;1B1121026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+E;14;4;MJSCP0103501D;1B1121026;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (TMI);;Terisi;1;0;0;30000
+E;14;5;;;;;;;;;
+E;14;6;;;;;;;;;
+E;14;7;;;;;;;;;
+E;14;8;;;;;;;;;
+E;14;9;;;;;;;;;
+E;14;10;;;;;;;;;
+E;14;11;;;;;;;;;
+E;14;12;;;;;;;;;
+E;14;13;;;;;;;;;
+E;14;14;;;;;;;;;
+E;14;15;;;;;;;;;
+E;14;16;;;;;;;;;
+E;14;17;;;;;;;;;
+E;14;18;;;;;;;;;
+E;14;19;;;;;;;;;
+E;14;20;;;;;;;;;
+E;14;21;;;;;;;;;
+E;14;22;;;;;;;;;
+E;14;23;;;;;;;;;
+E;14;24;;;;;;;;;
+E;14;25;;;;;;;;;
+E;14;26;;;;;;;;;
+E;14;27;;;;;;;;;
+E;14;28;;;;;;;;;
+E;14;29;;;;;;;;;
+E;14;30;;;;;;;;;
+E;14;31;;;;;;;;;
+E;15;1;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;15;2;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;15;3;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;15;4;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;15;5;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;15;6;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;15;7;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;15;8;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;15;9;MJSPS2122302C;3D3250926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+E;15;10;MJSCP3204341D;5C2031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+E;15;11;MJSCP3204341D;5C2031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+E;15;12;MJSCP3204341D;5C2031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+E;15;13;MJSCP3204341D;5C2031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+E;15;14;MJSCP3204341D;5C2031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+E;15;15;MJSCP3204341D;5C2031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+E;15;16;MJSCP3204341D;5C2031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+E;15;17;MJSCP3204341D;5C2031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+E;15;18;MJSCP3204341D;5C2031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+E;15;19;MJSCP3204341D;5B3031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+E;15;20;MJSCP3204341D;5B3031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+E;15;21;MJSCP3204341D;5B3031026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+E;16;1;MJSCN0302412D;2B3051026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;2;MJSCN0302412D;2B3051026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;3;MJSCN0302412D;2B3051026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;4;MJSCN0302412D;2B3051026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;5;MJSCN0302412D;2B3051026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;6;MJSCN0302412D;2B3051026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;7;MJSCN0302412D;2B3051026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;8;MJSCN0302412D;2B3051026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;9;MJSCN0302412D;2B3051026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;10;MJSCN0302412D;2B3051026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;11;MJSCN0302412D;2A1061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;12;MJSCN0302412D;2A1061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;13;MJSCN0302412D;2A1061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;14;MJSCN0302412D;2A1061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;15;MJSCN0302412D;2A1061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;16;MJSCN0302412D;2A1061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;17;MJSCN0302412D;2A1061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;18;MJSCN0302412D;2A1061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;19;MJSCN0302412D;2A1061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;20;MJSCN0302412D;2A1061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;21;MJSCN0302412D;2A1061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;22;MJSCN0302412D;2A1061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;23;MJSCN0302412D;2A1061026;Cup Natural 220ml, 2.4gr, Combinasi;;Terisi;1;0;0;32000
+E;16;24;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;16;25;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;16;26;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;16;27;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;16;28;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;16;29;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;16;30;MJSPL0313807C;4D2091026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;17;1;MJSCN5403501D;2C3190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;17;2;MJSCN5403501D;2C3190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;17;3;MJSCN5403501D;2C3190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;17;4;MJSCN5403501D;2C3190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;17;5;MJSCN5403501D;2C3190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;17;6;MJSCN5403501D;2C3190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;17;7;MJSCN5403501D;2C3190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;17;8;MJSCN5403501D;2C3190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;17;9;MJSCN5403501D;2C3190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;17;10;MJSCN5403501D;2C3190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;17;11;MJSCN5403501D;2C3190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;17;12;MJSCN5403501D;2C3190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;17;13;MJSCN5403501D;2C3190926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;17;14;MJSCN5403501D;2B1200926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;17;15;MJSPS1309104C;2B2250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+E;17;16;MJSPS1309104C;2B2250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+E;17;17;MJSPS1309104C;2B2250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+E;17;18;MJSPS1309104C;2B2250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+E;17;19;MJSPS1309104C;2B2250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+E;17;20;MJSPS1309104C;2B2250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+E;17;21;MJSPS1309104C;2B2250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+E;17;22;MJSPS1309104C;2B2250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+E;17;23;MJSPS1309104C;2B2250926;Preform Short Neck AMDK 330ml, 9.1gr, Blue Arjuna;;Terisi;1;0;0;20000
+E;17;24;MJSPS0512505C;1A2101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;25;MJSPS0512505C;1C3101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;26;MJSPS0512505C;1C3101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;27;MJSPS0512505C;1C3101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;28;MJSPS0512505C;1C3101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;29;MJSPS0512505C;1C3101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;30;MJSPS0512505C;1C3101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;31;MJSPS0512505C;1C3101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;32;MJSPS0512505C;1C3101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;33;MJSPS0512505C;1C3101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;34;MJSPS0512505C;1C3101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;35;MJSPS0512505C;1C3101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;36;MJSPS0512505C;1C3101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;37;MJSPS0512505C;1C3101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;38;MJSPS0512505C;1C3101026;Preform Short Neck AMDK 600ml, 12.50gr, Blue;;Terisi;1;0;0;14400
+E;17;39;MJSPS0512502C;1B1111016;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+E;17;40;MJSPS0512502C;1B1111016;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+E;18;1;MJSPS1706201C;Bongkaran Cikarang;Preform Short Neck AMDK 220ml, 6.20gr, Clear Natural;;Terisi;1;0;0;24000
+E;18;2;MJSPS1706201C;Bongkaran Cikarang;Preform Short Neck AMDK 220ml, 6.20gr, Clear Natural;;Terisi;1;0;0;24000
+E;18;3;MJSPS1706201C;Bongkaran Cikarang;Preform Short Neck AMDK 220ml, 6.20gr, Clear Natural;;Terisi;1;0;0;24000
+E;18;4;MJSPS1706201C;Bongkaran Cikarang;Preform Short Neck AMDK 220ml, 6.20gr, Clear Natural;;Terisi;1;0;0;24000
+E;18;5;MJSCP3204339D;5C1240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;18;6;MJSCP3204339D;532240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;18;7;MJSCP3204339D;532240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;18;8;MJSCP3204339D;532240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;18;9;MJSCP3204339D;532240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;18;10;MJSCP3204339D;532240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;18;11;MJSCP3204339D;532240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;18;12;MJSCP3204339D;532240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;18;13;MJSCP3204339D;532240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;18;14;MJSCN0102908D;3B3051026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;18;15;MJSCN0102908D;3B3051026;Cup Natural 240ml, 2.9gr, Combinasi;;Terisi;1;0;0;36000
+E;18;16;MJSCN0302414D;2B1091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;18;17;MJSCN0302414D;2B1091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;18;18;MJSCN0302414D;2B1091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;18;19;MJSCN0302414D;2B1091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;18;20;MJSCN0302414D;2D2091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;18;21;MJSPS1210801C;3B1091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;18;22;MJSPS1210801C;3B1091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;18;23;MJSPS1210801C;3B1091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;18;24;MJSPS1210801C;3B1091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;18;25;MJSPS1210801C;3B1091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;19;1;MJSPS1309102C;2D2180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;2;MJSPS1309102C;2D2180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;3;MJSPS1309102C;2D2180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;4;MJSPS1309102C;2C3180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;5;MJSPS1309102C;2C3180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;6;MJSPS1309102C;2C3180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;7;MJSPS1309102C;2C3180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;8;MJSPS1309102C;2C3180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;9;MJSPS1309102C;2C3180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;10;MJSPS1309102C;2C3180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;11;MJSPS1309102C;2C3180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;12;MJSPS1309102C;2C3180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;13;MJSPS1309102C;2C3180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;14;MJSPS1309102C;2C3180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;15;MJSPS1309102C;2C3180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;16;MJSPS1309102C;2C3180926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;17;MJSPS1309102C;2B1190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;18;MJSPS1309102C;2B1190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;19;MJSPS1309102C;2B1190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;20;MJSPS1309102C;2B1190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;21;MJSPS1309102C;2B1190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;22;MJSPS1309102C;2B1190926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;19;23;MJSCN3902902G;1A01061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;19;24;MJSCN3902902G;1A01061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;19;25;MJSCN3902902G;1A01061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;19;26;MJSCN3902902G;1A01061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;19;27;MJSCN3902902G;1A01061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;19;28;MJSCN3902902G;1A01061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;19;29;MJSCN3902902G;1A01061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;19;30;MJSCN3902902G;1A01061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;19;31;MJSCN3902902G;1A01061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;19;32;MJSCN3902902G;1A01061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;19;33;MJSCN3902902G;1A01061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;19;34;MJSCN3902902G;1A01061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;19;35;MJSCN3902902G;1A01061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;19;36;MJSCN3902902G;1A01061026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;19;37;MJSCP3204348D;5D2081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+E;19;38;MJSCP3204348D;5D2081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+E;19;39;MJSCP3204348D;5C3081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+E;19;40;MJSCP3204348D;5C3081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+E;19;41;MJSCP3204348D;5C3081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+E;19;42;MJSCP3204348D;5C3081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+E;21;1;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;2;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;3;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;4;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;5;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;6;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;7;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;8;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;9;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;10;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;11;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;12;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;13;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;14;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;15;MJSCC0103501D;2A1170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;16;MJSCC0103501D;2D2170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;17;MJSCC0103501D;2D2170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;18;MJSCC0103501D;2D2170926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;21;19;MJSPS0512502D;1B2260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;20;MJSPS0512502D;1B2260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;21;MJSPS0512502D;1B2260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;22;MJSPS0512502D;1B2260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;23;MJSPS0512502D;1D3260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;24;MJSPS0512502D;1D3260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;25;MJSPS0512502D;1D3260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;26;MJSPS0512502D;1D3260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;27;MJSPS0512502D;1D3260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;28;MJSPS0512502D;1D3260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;29;MJSPS0512502D;1D3260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;30;MJSPS0512502D;1D3260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;31;MJSPS0512502D;1D3260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;32;MJSPS0512502D;1D3260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;33;MJSPS0512502D;1D3260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;34;MJSPS0512502D;1D3260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;35;MJSPS0512502D;1D3260926;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;36;MJSPS0512502D;1C1071026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;37;MJSPS0512502D;1C1071026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;38;MJSPS0512502D;1C1071026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;39;MJSPS0512502D;1C1071026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;40;MJSPS0512502D;1C1071026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;41;MJSPS0512502D;1C1071026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;42;MJSPS0512502D;1C1071026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;43;MJSPS0512502D;1C1071026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;21;44;MJSPS0512502D;1C1071026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+E;22;1;MJSPS2122301D;3C3180826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;2;MJSPS2122301D;3C3180826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;3;MJSPS2122301D;3C3180826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;4;MJSPS2122301D;3C3180826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;5;MJSPS2122301D;3C3180826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;6;MJSPS2122301D;3A1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;7;MJSPS2122301D;3A1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;8;MJSPS2122301D;3A1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;9;MJSPS2122301D;3A1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;10;MJSPS2122301D;3A1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;11;MJSPS2122301D;3A1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;12;MJSPS2122301D;3A1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;13;MJSPS2122301D;3A1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;14;MJSPS2122301D;3A1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;15;MJSPS2122301D;3A1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;16;MJSPS2122301D;3A1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;17;MJSPS2122301D;3A1290926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+E;22;18;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;19;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;20;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;21;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;22;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;23;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;24;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;25;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;26;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;27;MJSCN3902902G;1C2031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;28;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;29;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;30;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;31;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;32;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;33;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;34;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;35;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;36;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;37;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;38;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;39;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;40;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;41;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;42;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;43;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+E;22;44;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;2P;Terisi;1;0;0;25200
+E;23;1;MJSCN1702402D;2D1010826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+E;23;2;MJSCN1702402D;2D1010826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+E;23;3;MJSCN1702402D;2D1010826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+E;23;4;MJSCN1702402D;2D1010826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+E;23;5;MJSCN1702402D;2D1010826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+E;23;6;MJSCN1702402D;2D1010826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+E;23;7;MJSCN1702402D;2D1010826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+E;23;8;MJSCN1702402D;2D1010826;Cup Natural 120ml, 2.4gr, General;;Terisi;1;0;0;30000
+E;23;9;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;23;10;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;23;11;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;23;12;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;23;13;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;23;14;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;23;15;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;23;16;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;23;17;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;23;18;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;23;19;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;23;20;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+E;23;21;MJSPL0313808C;4D2081026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;Pecahan: 6 qty;Terisi;0;6;0;4800
+E;23;22;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;23;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;24;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;25;MJSCJ0802501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;26;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;27;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;28;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;29;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;30;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;31;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;32;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;33;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;34;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;35;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;36;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;37;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;38;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;39;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;40;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;41;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;23;42;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+E;24;1;MJSCC0103501D;2C2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;2;MJSCC0103501D;2C2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;3;MJSCC0103501D;2B2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;4;MJSCC0103501D;2B2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;5;MJSCC0103501D;2B2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;6;MJSCC0103501D;2B2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;7;MJSCC0103501D;2B2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;8;MJSCC0103501D;2B2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;9;MJSCC0103501D;2B2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;10;MJSCC0103501D;2B2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;11;MJSCC0103501D;2B2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;12;MJSCC0103501D;2B2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;13;MJSCC0103501D;2B2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;14;MJSCC0103501D;2B2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;15;MJSCC0103501D;2B2120926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;16;MJSCC0103501D;2D1130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;17;MJSCC0103501D;2D1130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;18;MJSCC0103501D;2D1130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;19;MJSCC0103501D;2D1130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;20;MJSCC0103501D;2D1130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;21;MJSCC0103501D;2D1130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;22;MJSCC0103501D;2D1130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;23;MJSCC0103501D;2D1130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;24;MJSCC0103501D;2D1130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;25;MJSCC0103501D;2D1130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;26;MJSCC0103501D;2D1130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;27;MJSCC0103501D;2D1130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;28;MJSCC0103501D;2D1130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;29;MJSCC0103501D;2D1130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;30;MJSCC0103501D;2C2130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;31;MJSCC0103501D;2C2130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;32;MJSCC0103501D;2C2130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;33;MJSCC0103501D;2C2130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;34;MJSCC0103501D;2C2130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;35;MJSCC0103501D;2C2130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;36;MJSCC0103501D;2C2130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;37;MJSCC0103501D;2C2130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;24;38;MJSCC0103501D;2C2130926;Cup Color White 170ml, 3.5gr, Panther;;Terisi;1;0;0;30000
+E;25;1;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;2;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;3;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;4;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;5;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;6;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;7;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;8;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;9;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;10;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;11;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;12;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;13;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;14;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;15;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;16;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;17;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;18;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;19;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;20;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;21;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;22;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;23;MJSPS1210802C;4D3260926;Preform Short Neck AMDK 600ml, 10.8gr, Blue;;Terisi;1;0;0;16000
+E;25;24;MJSCP0103514D;1C2100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+E;25;25;MJSCP0103514D;1C2100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+E;25;26;MJSCP0103514D;1C2100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+E;25;27;MJSCP0103514D;1A3100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+E;25;28;MJSCP0103514D;1A3100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+E;25;29;MJSCP0103514D;1A3100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+E;25;30;MJSCP0103514D;1A3100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+E;25;31;MJSCP0103514D;1A3100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+E;25;32;MJSPS0512502C;1B1091026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+E;25;33;MJSPS0512502C;1B1091026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+E;25;34;MJSPS0512502C;1B1091026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+E;25;35;MJSPS0512502C;1B1091026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+E;25;36;MJSPS0512502C;1B1091026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+E;25;37;MJSPS0512502C;1B1091026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+E;25;38;MJSPS0512502C;1B1091026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+E;25;39;MJSPS0512502C;1B1091026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+E;25;40;MJSPS0512502C;1B1091026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+E;25;41;MJSPS0512502C;1B1091026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+E;25;42;MJSPS0512502C;1B1091026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+E;25;43;MJSPS0512502C;1B1091026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+E;26;1;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;2;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;3;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;4;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;5;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;6;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;7;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;8;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;9;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;10;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;11;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;12;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;13;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;14;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;15;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;16;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;17;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;18;MJSPS1706507C;4D2150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;19;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;20;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;21;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;22;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;23;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;24;MJSPS1706507C;4B3150926;Preform Short Neck AMDK 220ml, 6.50gr, Clear Natural;;Terisi;1;0;0;24000
+E;26;25;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;26;26;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;26;27;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;26;28;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;26;29;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;26;30;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;26;31;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;26;32;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;26;33;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;26;34;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;26;35;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;26;36;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;26;37;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;26;38;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;26;39;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;Pecahan: 6 qty;Terisi;0;6;0;19200
+E;26;40;MJSCJ0203504D;1C3111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;26;41;MJSCJ0203504D;1C3111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;26;42;MJSCJ0203504D;1C3111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;26;43;MJSCJ0203504D;1C3111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;26;44;MJSCJ0203504D;1C3111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;27;1;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;2;MJSCN5403501D;2A2240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;3;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;4;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;5;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;6;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;7;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;8;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;9;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;10;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;11;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;12;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;13;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;14;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;15;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;16;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;17;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;18;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;19;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;20;MJSCN5403501D;2D3240926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;21;MJSCN5403501D;2C1250926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+E;27;22;MJSCP3204339D;5C1240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;27;23;MJSCP3204339D;5C1240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;27;24;MJSCP3204339D;5C1240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;27;25;MJSCP3204339D;5C1240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;27;26;MJSCP3204339D;5C1240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;27;27;MJSCP3204339D;5C1240926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;27;28;MJSCN0302414D;2D2091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;29;MJSCN0302414D;2D2091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;30;MJSCN0302414D;2D2091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;31;MJSCN0302414D;2D2091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;32;MJSCN0302414D;2D2091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;33;MJSCN0302414D;2D2091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;34;MJSCN0302414D;2D2091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;35;MJSCN0302414D;2D2091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;36;MJSCN0302414D;2D2091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;37;MJSCN0302414D;2D2091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;38;MJSCN0302414D;2D2091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;39;MJSCN0302414D;2D2091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;40;MJSCN0302414D;2C3091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;41;MJSCN0302414D;2C3091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;42;MJSCN0302414D;2C3091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;27;43;MJSCN0302414D;2C3091026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+E;28;1;MJSCP3204339D;5A3280926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;2;MJSCP3204339D;5A3280926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;3;MJSCP3204339D;5A3280926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;4;MJSCP3204339D;5A3280926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;5;MJSCP3204339D;5A3280926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;6;MJSCP3204339D;5A3280926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;7;MJSCP3204339D;5A3280926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;8;MJSCP3204339D;5A3280926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;9;MJSCP3204339D;5D1290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;10;MJSCP3204339D;5D1290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;11;MJSCP3204339D;5D1290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;12;MJSCP3204339D;5D1290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;13;MJSCP3204339D;5D1290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;14;MJSCP3204339D;5D1290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;15;MJSCP3204339D;5B2290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;16;MJSCP3204339D;5B2290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;17;MJSCP3204339D;5B2290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;18;MJSCP3204339D;5B2290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;19;MJSCP3204339D;5B2290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;20;MJSCP3204339D;5B2290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;21;MJSCP3204339D;5B2290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;22;MJSCP3204339D;5B2290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;23;MJSCP3204339D;5B2290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;24;MJSCP3204339D;5A3290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;25;MJSCP3204339D;5A3290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;26;MJSCP3204339D;5A3290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;27;MJSCP3204339D;5A3290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;28;MJSCP3204339D;5A3290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;29;MJSCP3204339D;5A3290926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+E;28;30;MJSPS1309102C;2A2210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;28;31;MJSPS1309102C;2A2210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;28;32;MJSPS1309102C;2A2210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;28;33;MJSPS1309102C;2A2210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;28;34;MJSPS1309102C;2A2210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;28;35;MJSPS1309102C;2A2210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;28;36;MJSPS1309102C;2A2210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;28;37;MJSPS1309102C;2A2210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;28;38;MJSPS1309102C;2A2210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+E;20;1;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;2;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;3;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;4;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;5;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;6;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;7;MJSCJ0203504D;1B1111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;8;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;9;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;10;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;11;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;12;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;13;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;14;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;15;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;16;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;17;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;18;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;19;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;20;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;21;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;22;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;23;MJSCJ0203504D;1A2111026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+E;20;24;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;25;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;26;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;27;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;28;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;29;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;30;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;31;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;32;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;33;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;34;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;35;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;36;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;37;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;38;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;39;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;40;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;41;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;42;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;43;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;20;44;MJSCN2902303D;4C3111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+E;3;1;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;2;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;3;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;4;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;5;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;6;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;7;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;8;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;9;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;10;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;11;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;12;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;13;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;14;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;15;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;16;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;17;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;18;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;19;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;20;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;21;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;22;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;23;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;24;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;25;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;26;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;27;MJSPL0313807C;4A2111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;28;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;29;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;3;30;MJSPL0313807C;4C3111026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+E;9;1;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;2;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;3;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;4;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;5;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;6;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;7;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;8;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;9;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;10;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;11;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;12;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;13;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;14;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;15;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;16;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;17;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;18;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;19;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;20;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;21;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;22;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;23;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;24;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;25;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;26;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;27;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;28;MJSPS1210801C;3C3111026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;29;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+E;9;30;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;5;1;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;2;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;3;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;4;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;5;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;6;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;7;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;8;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;9;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;10;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;11;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;12;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;13;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;14;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;15;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;16;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;17;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;18;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;19;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;20;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;21;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;22;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;5;23;MJSPL0313807C;4A5011026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;6;1;MJSCN2902105D;4B3031026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+F;6;2;MJSCN2902105D;4B3031026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+F;6;3;MJSCN2902105D;4B3031026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+F;6;4;MJSCN2902105D;4B3031026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+F;6;5;MJSCN2902105D;4B3031026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+F;6;6;MJSCN2902105D;4B3031026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+F;6;7;MJSCN2902105D;4B3031026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+F;6;8;MJSCN2902105D;4B3031026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+F;6;9;MJSCN2902105D;4B3031026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+F;6;10;MJSCN2902105D;4B3031026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+F;6;11;MJSCN2902105D;4B3031026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+F;6;12;MJSCN2902105D;4B3031026;Cup Natural 200ml, 2.1gr, Full Ring;;Terisi;1;0;0;38400
+F;6;13;MJSPS1309102C;2B1210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;6;14;MJSPS1309102C;2B1210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;6;15;MJSPS1309102C;2B1210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;6;16;MJSPS1309102C;2B1210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;6;17;MJSPS1309102C;2B1210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;6;18;MJSPS1309102C;2B1210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;6;19;MJSPS1309102C;2B1210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;6;20;MJSPS1309102C;2B1210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;6;21;MJSPS1309102C;2B1210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;6;22;MJSPS1309102C;2B1210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;6;23;MJSPS1309102C;2B1210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;6;24;MJSPS1309102C;2A2210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;6;25;MJSPS1309102C;2A2210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;6;26;MJSPS1309102C;2A2210926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;7;1;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;2;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;3;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;4;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;5;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;6;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;7;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;8;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;9;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;10;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;11;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;12;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;13;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;14;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;15;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;16;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;17;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;18;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;19;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;20;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;21;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;22;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;7;23;MJSPL0313807C;4C2021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;8;1;MJSPS1309103C;2B1310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;8;2;MJSPS1309103C;2B1310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;8;3;MJSPS1309103C;2B1310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;8;4;MJSPS1309103C;2B1310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;8;5;MJSPS1309103C;2B1310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;8;6;MJSPS1309103C;2B1310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;8;7;MJSPS1309103C;2B1310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;8;8;MJSPS1309103C;2B1310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;8;9;MJSPS1309103C;2B1310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;8;10;MJSPS1309103C;2B1310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;8;11;MJSPS1309103C;2B1310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;8;12;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;13;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;14;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;15;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;16;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;17;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;18;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;19;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;20;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;21;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;22;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;23;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;24;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;25;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;26;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;8;27;MJSCN3802703D;1D1300926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;9;1;;;;;;;;;
+F;9;2;;;;;;;;;
+F;9;3;;;;;;;;;
+F;9;4;;;;;;;;;
+F;9;5;;;;;;;;;
+F;9;6;;;;;;;;;
+F;9;7;;;;;;;;;
+F;9;8;;;;;;;;;
+F;9;9;;;;;;;;;
+F;9;10;;;;;;;;;
+F;9;11;;;;;;;;;
+F;9;12;;;;;;;;;
+F;9;13;;;;;;;;;
+F;9;14;;;;;;;;;
+F;9;15;;;;;;;;;
+F;9;16;;;;;;;;;
+F;9;17;MJSCN3802703D;1B2290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;9;18;MJSCN3802703D;1B2290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;9;19;MJSCN3802703D;1B2290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;9;20;MJSCN3802703D;1B2290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;9;21;MJSCN3802703D;1B2290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;9;22;MJSCN3802703D;1B2290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;9;23;MJSCN3802703D;1B2290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;9;24;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;9;25;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;9;26;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;9;27;MJSCN3802703D;1A3290926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;10;1;MJSCP0103514D;1C2140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;10;2;MJSCP0103514D;1C2140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;10;3;MJSCP0103514D;1C2140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;10;4;MJSCP0103514D;1C2140926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;10;5;MJSPS1309102C;2D3230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;10;6;MJSPS1309102C;2D3230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;10;7;MJSPS1309102C;2D3230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;10;8;MJSPS1309102C;2D3230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;10;9;MJSPS1309102C;2D3230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;10;10;MJSPS1309102C;2D3230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;10;11;MJSPS1309102C;2D3230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;10;12;MJSPS1309102C;2D3230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;10;13;MJSPS1309102C;2D3230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;10;14;MJSPS1309102C;2D3230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;10;15;MJSPS1309102C;2D3230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;10;16;MJSPS1309102C;2D3230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;10;17;MJSPS1309102C;2D3230926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;10;18;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;10;19;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;10;20;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;10;21;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;10;22;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;10;23;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;10;24;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;10;25;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;10;26;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;10;27;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;10;28;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;10;29;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;10;30;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;10;31;;;;;;;;;
+F;11;1;;;;;;;;;
+F;11;2;;;;;;;;;
+F;11;3;;;;;;;;;
+F;11;4;MJSPS0512502C;3D2051026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+F;11;5;MJSPS0512502C;3D2051026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+F;11;6;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+F;11;7;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+F;11;8;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+F;11;9;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+F;11;10;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+F;11;11;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+F;11;12;MJSCN2902303D;4B1111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+F;11;13;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+F;11;14;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+F;11;15;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+F;11;16;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+F;11;17;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+F;11;18;MJSCN2902303D;4A2111026;Cup Natural 200ml, 2.3gr, Full Ring;;Terisi;1;0;0;38400
+F;11;19;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;11;20;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;11;21;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;11;22;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;11;23;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;11;24;MJSPS1210801C;3B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;11;25;;;;;;;;;
+F;11;26;;;;;;;;;
+F;11;27;;;;;;;;;
+F;11;28;;;;;;;;;
+F;11;29;;;;;;;;;
+F;11;30;;;;;;;;;
+F;11;31;;;;;;;;;
+F;12;1;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;2;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;3;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;4;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;5;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;6;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;7;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;8;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;9;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;10;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;11;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;12;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;13;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;14;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;15;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;16;MJSPS1706406C;3D3250126;Preform Short Neck AMDK 220ml, 6.35gr, Sky Blue;;Terisi;1;0;0;24000
+F;12;17;MJSPS1309103C;2B2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;12;18;MJSPS1309103C;2B2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;12;19;MJSPS1309103C;2A2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;12;20;MJSPS1309103C;2A2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;12;21;MJSPS1309103C;2A2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;12;22;MJSPS1309103C;2A2310826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;12;23;MJSCN3802703D;1C1250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;12;24;MJSCN3802703D;1B2250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;12;25;MJSCN3802703D;1B2250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;12;26;MJSCN3802703D;1B2250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;12;27;MJSCN3802703D;1B2250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;12;28;MJSCN3802703D;1B2250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;12;29;MJSCN3802703D;1B2250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;12;30;MJSCN3802703D;1B2250926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;13;1;;;;;;;;;
+F;13;2;;;;;;;;;
+F;13;3;;;;;;;;;
+F;13;4;;;;;;;;;
+F;13;5;;;;;;;;;
+F;13;6;;;;;;;;;
+F;13;7;;;;;;;;;
+F;13;8;;;;;;;;;
+F;13;9;;;;;;;;;
+F;13;10;;;;;;;;;
+F;13;11;;;;;;;;;
+F;13;12;;;;;;;;;
+F;13;13;;;;;;;;;
+F;13;14;;;;;;;;;
+F;13;15;;;;;;;;;
+F;13;16;;;;;;;;;
+F;13;17;;;;;;;;;
+F;13;18;;;;;;;;;
+F;13;19;;;;;;;;;
+F;13;20;;;;;;;;;
+F;13;21;;;;;;;;;
+F;13;22;;;;;;;;;
+F;13;23;;;;;;;;;
+F;13;24;;;;;;;;;
+F;13;25;;;;;;;;;
+F;13;26;;;;;;;;;
+F;13;27;;;;;;;;;
+F;13;28;;;;;;;;;
+F;13;29;;;;;;;;;
+F;13;30;;;;;;;;;
+F;13;31;;;;;;;;;
+F;14;1;MJSCN1202501D;Bongkaran Cikarang;Cup Natural 150ml, 2.5gr, KIPAS;;Terisi;1;0;0;30000
+F;14;2;MJSCN1202501D;Bongkaran Cikarang;Cup Natural 150ml, 2.5gr, KIPAS;;Terisi;1;0;0;30000
+F;14;3;MJSCN1202501D;Bongkaran Cikarang;Cup Natural 150ml, 2.5gr, KIPAS;;Terisi;1;0;0;30000
+F;14;4;MJSCN1202501D;Bongkaran Cikarang;Cup Natural 150ml, 2.5gr, KIPAS;;Terisi;1;0;0;30000
+F;14;5;MJSCN1202501D;Bongkaran Cikarang;Cup Natural 150ml, 2.5gr, KIPAS;;Terisi;1;0;0;30000
+F;14;6;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+F;14;7;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+F;14;8;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+F;14;9;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+F;14;10;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+F;14;11;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+F;14;12;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+F;14;13;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+F;14;14;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+F;14;15;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+F;14;16;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+F;14;17;MJSPS1706509C;3B3051026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+F;15;1;MJSCN3902902G;1A1071026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;15;2;MJSCN3902902G;1A1071026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;15;3;MJSCN3902902G;1A1071026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;15;4;MJSCN3902902G;1A1071026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;15;5;MJSCN3902902G;1A1071026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;15;6;MJSCN3902902G;1A1071026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;15;7;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;8;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;9;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;10;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;11;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;12;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;13;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;14;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;15;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;16;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;17;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;18;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;19;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;20;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;21;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;22;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;23;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;24;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;15;25;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;1;MJSPS1309102C;2D3220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;16;2;MJSPS1309102C;2D3220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;16;3;MJSPS1309102C;2D3220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;16;4;MJSPS1309102C;2D3220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;16;5;MJSPS1309102C;2D3220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;16;6;MJSPS1309102C;2D3220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;16;7;MJSPS1309102C;2D3220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;16;8;MJSPS1309102C;2D3220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;16;9;MJSPS1309102C;2D3220926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+F;16;10;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;11;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;12;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;13;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;14;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;15;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;16;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;17;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;18;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;19;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;20;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;21;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;22;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;23;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;24;MJSPL0313808C;4C2041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+F;16;25;MJSCN3802703D;1D1300926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;16;26;MJSCN3802703D;1D1300926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;16;27;MJSCN3802703D;1D1300926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;16;28;MJSCN3802703D;1D1300926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;16;29;MJSCN3802703D;1D1300926;Cup Natural 145ml, 2.7gr, JDO Diamond;;Terisi;1;0;0;43200
+F;17;1;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;2;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;3;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;4;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;5;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;6;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;7;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;8;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;9;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;10;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;11;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;12;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;13;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;14;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;15;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;16;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;17;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;18;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;19;MJSPL0313807C;4D1021026;Preform Long Neck AMDK 600ml, 13.80gr, Clear Natural;;Terisi;1;0;0;12800
+F;17;20;MJSCN0302414D;2B1101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;21;MJSCN0302414D;2B1101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;22;MJSCN0302414D;2B1101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;23;MJSCN0302414D;2B1101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;24;MJSCN0302414D;2B1101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;25;MJSCN0302414D;2B1101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;26;MJSCN0302414D;2B1101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;27;MJSCN0302414D;2B1101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;28;MJSCN0302414D;2B1101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;29;MJSCN0302414D;2A2101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;30;MJSCN0302414D;2A2101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;31;MJSCN0302414D;2A2101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;32;MJSCN0302414D;2A2101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;33;MJSCN0302414D;2A2101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;34;MJSCN0302414D;2A2101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;35;MJSCN0302414D;2A2101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;36;MJSCN0302414D;2A2101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;37;MJSCN0302414D;2A2101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;38;MJSCN0302414D;2A2101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;39;MJSCN0302414D;2A2101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;40;MJSCN0302414D;2A2101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;41;MJSCN0302414D;2C3101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;42;MJSCN0302414D;2C3101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;43;MJSCN0302414D;2C3101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;17;44;MJSCN0302414D;2C3101026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;18;1;MJSCP2902933D;4C1170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;2;MJSCP2902933D;4C1170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;3;MJSCP2902933D;4C1170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;4;MJSCP2902933D;4C1170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;5;MJSCP2902933D;4C1170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;6;MJSCP2902933D;4C1170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;7;MJSCP2902933D;4C1170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;8;MJSCP2902933D;4C1170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;9;MJSCP2902933D;4B2170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;10;MJSCP2902933D;4B2170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;11;MJSCP2902933D;4B2170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;12;MJSCP2902933D;4B2170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;13;MJSCP2902933D;4B2170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;14;MJSCP2902933D;4B2170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;15;MJSCP2902933D;4B2170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;16;MJSCP2902933D;4D3170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;17;MJSCP2902933D;4D3170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;18;MJSCP2902933D;4D3170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;19;MJSCP2902933D;4D3170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;20;MJSCP2902933D;4D3170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;21;MJSCP2902933D;4D3170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;22;MJSCP2902933D;4D3170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;23;MJSCP2902933D;4D3170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;24;MJSCP2902933D;4D3170826;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+F;18;25;MJSCP3204341D;5C2041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;18;26;MJSCP3204341D;5C2041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;18;27;MJSCP3204341D;5C2041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;18;28;MJSCP3204341D;5C2041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;18;29;MJSCP3204341D;5C2041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;18;30;MJSCP3204341D;5C2041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;18;31;MJSCP3204341D;5C2041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;18;32;MJSCP3204341D;5C2041026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;18;33;MJSCP3902941D;4B1101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;18;34;MJSCP3902941D;4B1101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;18;35;MJSCP3902941D;4B1101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;18;36;MJSCP3902941D;4B1101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;18;37;MJSCP3902941D;4B1101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;18;38;MJSCP3902941D;4B1101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;18;39;MJSCP3902941D;4B1101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;18;40;MJSCP3902941D;4A2101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;18;41;MJSCP3902941D;4A2101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;18;42;MJSCP3902941D;4A2101026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;19;1;MJSCP0103514D;1D1100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;19;2;MJSCP0103514D;1D1100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;19;3;MJSCP0103514D;1D1100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;19;4;MJSCP0103514D;1C2100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;19;5;MJSCP0103514D;1C2100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;19;6;MJSCP0103514D;1C2100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;19;7;MJSCP0103514D;1D1100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;19;8;MJSCP0103514D;1C2100926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;19;9;MJSCP3204341D;5B1200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;19;10;MJSCP3204341D;5B1200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;19;11;MJSCP3204341D;5B1200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;19;12;MJSCP3204341D;5B1200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;19;13;MJSCP3204341D;5B1200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;19;14;MJSCP3204341D;5B1200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;19;15;MJSCP3204341D;5B1200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;19;16;MJSCP3204341D;5A2200926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;19;17;MJSCP3204340D;5D3250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;18;MJSCP3204340D;5D3250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;19;MJSCP3204340D;5D3250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;20;MJSCP3204340D;5D3250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;21;MJSCP3204340D;5D3250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;22;MJSCP3204340D;5D3250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;23;MJSCP3204340D;5D3250926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;24;MJSCP3204340D;5C1260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;25;MJSCP3204340D;5C1260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;26;MJSCP3204340D;5C1260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;27;MJSCP3204340D;5C1260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;28;MJSCP3204340D;5C1260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;29;MJSCP3204340D;5C1260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;30;MJSCP3204340D;5C1260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;31;MJSCP3204340D;5C1260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;32;MJSCP3204340D;5C1260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;33;MJSCP3204340D;5C1260926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;;Terisi;1;0;0;25200
+F;19;34;MJSCN0302414D;2B1121026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;19;35;MJSCN0302414D;2B1121026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;19;36;MJSCN0302414D;2B1121026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;19;37;MJSCN0302414D;2B1121026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;19;38;MJSCN0302414D;2B1121026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;19;39;MJSCN0302414D;2B1121026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;19;40;MJSCN0302414D;2B1121026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;19;41;MJSCN0302414D;2B1121026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;19;42;MJSCN0302414D;2B1121026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;19;43;MJSCN0302414D;2B1121026;Cup Natural 220ml, 2.4gr, Combinasi Non Neck T 95mm;;Terisi;1;0;0;36000
+F;19;44;;;;;;;;;
+F;20;1;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;2;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;3;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;4;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;5;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;6;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;7;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;8;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;9;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;10;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;11;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;12;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;13;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;14;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;15;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;16;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;17;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;18;MJSCN2902501D;4C3081026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;19;MJSCN2902501D;4B1091026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;20;MJSCN2902501D;4B1091026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;21;MJSCN2902501D;4B1091026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;22;MJSCN2902501D;4B1091026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;23;MJSCN2902501D;4B1091026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+F;20;24;MJSCP3902941D;1B3031026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;25;MJSCP3902941D;1B3031026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;26;MJSCP3902941D;1B3031026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;0;2;0;4200
+F;20;27;;;;;;;;;
+F;20;28;;;;;;;;;
+F;20;29;;;;;;;;;
+F;20;30;;;;;;;;;
+F;20;31;MJSCP3902941D;1A1041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;32;MJSCP3902941D;1A1041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;33;MJSCP3902941D;1A1041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;34;MJSCP3902941D;1A1041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;35;MJSCP3902941D;1A1041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;36;MJSCP3902941D;1A1041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;37;MJSCP3902941D;1A1041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;38;MJSCP3902941D;1A1041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;39;MJSCP3902941D;1A1041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;40;MJSCP3902941D;1A1041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;41;MJSCP3902941D;1C2041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;42;MJSCP3902941D;1C2041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;43;MJSCP3902941D;1C2041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;20;44;MJSCP3902941D;1C2041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;21;1;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;2;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;3;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;4;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;5;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;6;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;7;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;8;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;9;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;10;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;11;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;12;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;13;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;14;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;15;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;16;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;17;MJSPS2122302C;3A3270926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+F;21;18;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;21;19;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;21;20;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;21;21;MJSPS2122301D;3C2011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;21;22;MJSPS2122301D;3A3011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;21;23;MJSPS2122301D;3A3011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;21;24;MJSPS2122301D;3A3011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;21;25;MJSPS2122301D;3A3011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;21;26;MJSPS2122301D;3A3011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;21;27;MJSPS2122301D;3A3011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;21;28;MJSPS2122301D;3A3011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;21;29;MJSPS2122301D;3A3011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;21;30;MJSPS2122301D;3A3011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;21;31;MJSCP3902941D;4B4454026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;21;32;MJSCP3902941D;4B4454026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;21;33;MJSCP3902941D;4B4454026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;21;34;MJSCP3902941D;4B4454026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;21;35;MJSCP3902941D;4B4454026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;21;36;MJSCP3902941D;4B4454026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;21;37;MJSCP3902941D;4B4454026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;21;38;MJSCP3902941D;4B4454026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;21;39;MJSCP3902941D;4B4454026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;22;1;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;2;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;3;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;4;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;5;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;6;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;7;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;8;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;9;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;10;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;11;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;12;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;13;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;14;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;15;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;16;MJSPS2122301D;3C2220826;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;22;17;MJSCP0103514D;1D1120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;18;MJSCP0103514D;1D1120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;19;MJSCP0103514D;1D1120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;20;MJSCP0103514D;1D1120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;21;MJSCP0103514D;1D1120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;22;MJSCP0103514D;1C2120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;23;MJSCP0103514D;1C2120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;24;MJSCP0103514D;1C2120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;25;MJSCP0103514D;1C2120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;26;MJSCP0103514D;1C2120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;27;MJSCP0103514D;1C2120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;28;MJSCP0103514D;1C2120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;29;MJSCP0103514D;1C2120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;30;MJSCP0103514D;1B3120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;31;MJSCP0103514D;1B3120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;32;MJSCP0103514D;1B3120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;33;MJSCP0103514D;1B3120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;34;MJSCP0103514D;1B3120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;35;MJSCP0103514D;1B3120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;36;MJSCP0103514D;1B3120926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;37;MJSCP0103514D;1D1130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;38;MJSCP0103514D;1D1130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;39;MJSCP0103514D;1D1130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;40;MJSCP0103514D;1D1130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;41;MJSCP0103514D;1D1130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;42;MJSCP0103514D;1D1130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;43;MJSCP0103514D;1D1130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;22;44;MJSCP0103514D;1C2130926;Cup Printing 170ml, 3.5gr, Panther Mix Fruit (BTU);;Terisi;1;0;0;30000
+F;23;1;MJSPS1309103C;2C3300826;Preform Short Neck AMDK 330ml, 9.1gr, Sky Blue;;Terisi;1;0;0;20000
+F;23;2;MJSCP3903130D;4B2300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;3;MJSCP3903130D;4B2300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;4;MJSCP3903130D;4B2300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;5;MJSCP3903130D;4B2300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;6;MJSCP3903130D;4B2300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;7;MJSCP3903130D;4B2300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;8;MJSCP3903130D;4B2300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;9;MJSCP3903130D;4A3300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;10;MJSCP3903130D;4A3300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;11;MJSCP3903130D;4A3300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;12;MJSCP3903130D;4A3300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;13;MJSCP3903130D;4A3300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;14;MJSCP3903130D;4A3300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;15;MJSCP3903130D;4A3300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;16;MJSCP3903130D;4A3300726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;17;MJSCP3903130D;4D1310726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;18;MJSCP3903130D;4D1310726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;19;MJSCP3903130D;4D1310726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+F;23;20;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;21;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;22;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;23;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;24;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;25;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;26;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;27;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;28;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;29;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;30;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;31;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;32;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;33;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;34;MJSPS2122301D;3A3300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;35;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;36;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;37;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;38;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;39;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;40;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;41;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;42;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;43;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;23;44;MJSPS2122301D;3D1011026;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;24;1;MJSCP3204341D;5D2170926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;2;MJSCP3204341D;5D2170926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;3;MJSCP3204341D;5D2170926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;4;MJSCP3204341D;5C3170926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;5;MJSCP3204341D;5C3170926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;6;MJSCP3204341D;5C3170926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;7;MJSCP3204341D;5C3170926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;8;MJSCP3204341D;5C3170926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;9;MJSCP3204341D;5C3170926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;10;MJSCP3204341D;5C3170926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;11;MJSCP3204341D;5C3170926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;12;MJSCP3204341D;5C3170926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;13;MJSCP3204341D;5A1180926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;14;MJSCP3204341D;5A1180926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;15;MJSCP3204341D;5A1180926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;16;MJSCP3204341D;5A1180926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;17;MJSCP3204341D;5A1180926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;18;MJSCP3204341D;5A1180926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;19;MJSCP3204341D;5A1180926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;20;MJSCP3204341D;5A1180926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;21;MJSCP3204341D;5A1180926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+F;24;22;MJSCP3204339D;5B1101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;24;23;MJSCP3204339D;5B1101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;24;24;MJSCP3204339D;5B1101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;24;25;MJSCP3204339D;5B1101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;24;26;MJSCP3204339D;5B1101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;24;27;MJSCP3204339D;5B1101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;24;28;MJSCP3204339D;5B1101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;24;29;MJSCP3204339D;5B1101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;24;30;MJSCP3204339D;5B1101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;24;31;MJSCP3204339D;5B1101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;24;32;MJSCP3204339D;5A2101026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;24;33;MJSPS1210801C;2B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;24;34;MJSPS1210801C;2B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;24;35;MJSPS1210801C;2B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;24;36;MJSPS1210801C;2B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;24;37;MJSPS1210801C;2B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;24;38;MJSPS1210801C;2B1121026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+F;24;39;;;;;;;;;
+F;24;40;;;;;;;;;
+F;24;41;;;;;;;;;
+F;25;1;MJSCN0302703D;2A1071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;2;MJSCN0302703D;2A1071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;3;MJSCN0302703D;2A1071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;4;MJSCN0302703D;2A1071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;5;MJSCN0302703D;2A1071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;6;MJSCN0302703D;2A1071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;7;MJSCN0302703D;2A1071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;8;MJSCN0302703D;2A1071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;9;MJSCN0302703D;2A1071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;10;MJSCN0302703D;2A1071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;11;MJSCN0302703D;2A1071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;12;MJSCN0302703D;2A1071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;13;MJSCN0302703D;2A1071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;14;MJSCN0302703D;2D2071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;15;MJSCN0302703D;2D2071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;16;MJSCN0302703D;2D2071026;Cup Natural 220ml, 2.7gr, Combinasi;;Terisi;1;0;0;32000
+F;25;17;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;25;18;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;25;19;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;25;20;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;25;21;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;25;22;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;25;23;MJSCN5403501D;2B1230926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;25;24;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;25;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;26;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;27;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;28;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;29;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;30;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;31;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;32;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;33;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;34;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;35;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;36;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;37;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;38;MJSPS2122301D;3D1300926;Preform Short Neck AMDK 1500ml, 22.30gr, Clear Natural;;Terisi;1;0;0;8250
+F;25;39;MJSCP3903140D;1D2081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;25;40;MJSCP3903140D;1C3081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;25;41;MJSCP3903140D;1C3081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;25;42;MJSCP3903140D;1C3081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;26;1;MJSCN5403501D;2D2180926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;26;2;MJSCN5403501D;2D2180926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;26;3;MJSCN5403501D;2D2180926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;26;4;MJSCN5403501D;2D2180926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;26;5;MJSCN5403501D;2D2180926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;26;6;MJSCN5403501D;2D2180926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;26;7;MJSCN5403501D;2D2180926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;26;8;MJSCN5403501D;2D2180926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;26;9;MJSCN5403501D;2D2180926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;26;10;MJSCN5403501D;2C3180926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;26;11;MJSCN5403501D;2C3180926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;26;12;;;;;;;;;
+F;26;13;;;;;;;;;
+F;26;14;;;;;;;;;
+F;26;15;;;;;;;;;
+F;26;16;;;;;;;;;
+F;26;17;;;;;;;;;
+F;26;18;;;;;;;;;
+F;26;19;;;;;;;;;
+F;26;20;;;;;;;;;
+F;26;21;;;;;;;;;
+F;26;22;;;;;;;;;
+F;26;23;;;;;;;;;
+F;26;24;;;;;;;;;
+F;26;25;;;;;;;;;
+F;26;26;MJSCP0103519D;1D3060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+F;26;27;MJSCP0103519D;1D3060926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+F;26;28;MJSCP0103519D;1C1070926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+F;26;29;MJSCP0103519D;1C1070926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+F;26;30;MJSCP0103519D;1C1070926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+F;26;31;MJSCP0103519D;1C1070926;Cup Printing 170ml, 3.5gr, Panther Stroberi (BTU);;Terisi;1;0;0;30000
+F;26;32;MJSCP3903140D;1A1081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;26;33;MJSCP3903140D;1A1081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;26;34;MJSCP3903140D;1A1081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;26;35;MJSCP3903140D;1D2081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;26;36;MJSCP3903140D;1D2081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;26;37;MJSCP3903140D;1D2081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;26;38;MJSCP3903140D;1D2081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;26;39;MJSCP3903140D;1D2081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;26;40;MJSCP3903140D;1D2081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;26;41;MJSCP3903140D;1D2081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;26;42;MJSCP3903140D;1D2081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+F;27;1;MJSCN5403501D;2B1220926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;27;2;MJSCN5403501D;2B1220926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;27;3;MJSCN5403501D;2B1220926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;27;4;MJSCN5403501D;2B1220926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;27;5;MJSCN5403501D;2B1220926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;27;6;MJSCN5403501D;2B1220926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;27;7;MJSCN5403501D;2B1220926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;27;8;MJSCN5403501D;2B1220926;Cup Natural 240ml, 3.50gr, Emboos Santri;;Terisi;1;0;0;24000
+F;27;9;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;10;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;11;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;12;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;13;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;14;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;15;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;16;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;17;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;18;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;19;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;20;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;21;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;22;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;23;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;24;MJSCN3902902G;1B3041026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+F;27;25;MJSCP3204339D;5C2300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;26;MJSCP3204339D;5C2300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;27;MJSCP3204339D;5C2300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;28;MJSCP3204339D;5C2300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;29;MJSCP3204339D;5C2300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;30;MJSCP3204339D;5C2300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;31;MJSCP3204339D;5C2300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;32;MJSCP3204339D;5A3300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;33;MJSCP3204339D;5A3300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;34;MJSCP3204339D;5A3300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;35;MJSCP3204339D;5A3300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;36;MJSCP3204339D;5A3300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;37;MJSCP3204339D;5A3300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;38;MJSCP3204339D;5A3300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;39;MJSCP3204339D;5A3300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;40;MJSCP3204339D;5A3300926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;41;MJSCP3204339D;5D1011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;42;MJSCP3204339D;5D1011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;43;MJSCP3204339D;5D1011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;27;44;MJSCP3204339D;5D1011026;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX STROBERI;;Terisi;1;0;0;25200
+F;28;1;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;2;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;3;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;4;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;5;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;6;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;7;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;8;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;9;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;10;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;11;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;12;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;13;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;14;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;15;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;16;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;17;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;18;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;19;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;20;MJSCJ0802501D;4D2091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;21;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;22;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;23;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;24;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;25;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;26;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;27;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;28;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;29;MJSCJ0802501D;4C3091026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+F;28;30;MJSCP3902941D;1B3041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;28;31;MJSCP3902941D;1B3041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;28;32;MJSCP3902941D;1B3041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;28;33;MJSCP3902941D;1B3041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;28;34;MJSCP3902941D;1B3041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;28;35;MJSCP3902941D;1B3041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;28;36;MJSCP3902941D;1B3041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;28;37;MJSCP3902941D;1B3041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;28;38;MJSCP3902941D;1B3041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;28;39;MJSCP3902941D;1B3041026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+F;28;40;MJSCP3204345D;5D1100926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JERUK 01 REPLIKA;;Terisi;1;0;0;25200
+F;28;41;MJSCP3204345D;5D1100926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JERUK 01 REPLIKA;;Terisi;1;0;0;25200
+F;28;42;MJSCP3204345D;5D1100926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JERUK 01 REPLIKA;;Terisi;1;0;0;25200
+F;28;43;MJSCP3204345D;5D1100926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JERUK 01 REPLIKA;;Terisi;1;0;0;25200
+F;28;44;MJSCP3204345D;5D1100926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JERUK 01 REPLIKA;;Terisi;1;0;0;25200
+F;28;45;MJSCP3204345D;5D1100926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JERUK 01 REPLIKA;;Terisi;0;8;0;16800
+G;17;1;MJSPS1706509C;3A1041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;2;MJSPS1706509C;3A1041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;3;MJSPS1706509C;3A1041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;4;MJSPS1706509C;3A1041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;5;MJSPS1706509C;3A1041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;6;MJSPS1706509C;3A1041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;7;MJSPS1706509C;3C2041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;8;MJSPS1706509C;3C2041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;9;MJSPS1706509C;3C2041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;10;MJSPS1706509C;3C2041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;11;MJSPS1706509C;3C2041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;12;MJSPS1706509C;3C2041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;13;MJSPS1706509C;3C2041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;14;MJSPS1706509C;3C2041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;15;MJSPS1706509C;3C2041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;16;MJSPS1706509C;3C2041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;17;MJSPS1706509C;3C2041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;;Terisi;1;0;0;24000
+G;17;18;MJSPS1706509C;3C2041026;Preform Short Neck AMDK 220ml, 6.50gr, Sky Blue;Pecahan: 2 qty;Terisi;0;2;0;3000
+G;17;19;MJSCJ0203504D;1B1101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;20;MJSCJ0203504D;1B1101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;21;MJSCJ0203504D;1B1101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;22;MJSCJ0203504D;1B1101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;23;MJSCJ0203504D;1B1101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;24;MJSCJ0203504D;1B1101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;25;MJSCJ0203504D;1B1101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;26;MJSCJ0203504D;1B1101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;27;MJSCJ0203504D;1A2101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;28;MJSCJ0203504D;1A2101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;29;MJSCJ0203504D;1A2101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;30;MJSCJ0203504D;1A2101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;31;MJSCJ0203504D;1A2101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;32;MJSCJ0203504D;1A2101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;33;MJSCJ0203504D;1A2101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;34;MJSCJ0203504D;1A2101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;35;MJSCJ0203504D;1A2101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;36;MJSCJ0203504D;1A2101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;1;0;0;24000
+G;17;37;MJSCJ0203504D;1C3101026;Cup Color White 180ml, 3.5gr, Wings;;Terisi;0;1;0;24000
+G;17;38;;;;;;;;;
+G;17;39;;;;;;;;;
+G;17;40;;;;;;;;;
+G;17;41;;;;;;;;;
+G;17;42;;;;;;;;;
+G;17;43;;;;;;;;;
+G;19;1;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;2;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;3;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;4;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;5;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;6;MJSCP3903128D;1A1071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;7;MJSCP3903128D;1A1071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;8;MJSCP3903128D;1A1071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;9;MJSCP3903128D;1A1071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;10;MJSCP3903128D;1A1071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;11;MJSCP3903128D;1A1071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;12;MJSCP3903128D;1A1071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;13;MJSCP3903128D;1D2071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;14;MJSCP3903128D;1D2071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;15;MJSCP3903128D;1D2071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;16;MJSCP3903128D;1D2071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;17;MJSCP3903128D;1D2071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;18;MJSCP3903128D;1D2071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;19;MJSCP3903128D;1D2071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;20;MJSCP3903128D;1D2071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;21;MJSCP3903128D;1D2071026;Cup Printing 155ml, 3.1gr, MTB4/MFTBL8 04 BLACKCURRANT (D : 73.5);;Terisi;1;0;0;25200
+G;19;22;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;23;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;24;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;25;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;26;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;27;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;28;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;29;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;30;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;31;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;32;MJSPS0512502D;1B3031026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;33;MJSPS0512502D;1A1041026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;34;MJSPS0512502D;1A1041026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;35;MJSPS0512502D;1A1041026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;36;MJSPS0512502D;1A1041026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;37;MJSPS0512502D;1A1041026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;38;MJSPS0512502D;1A1041026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;39;MJSPS0512502D;1A1041026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;40;MJSPS0512502D;1A1041026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;19;41;MJSPS0512502D;1A1041026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;16500
+G;20;1;MJSCN3902902G;1C2021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;2;MJSCN3902902G;1C2021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;3;MJSCN3902902G;1C2021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;4;MJSCN3902902G;1C2021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;5;MJSCN3902902G;1C2021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;6;MJSCN3902902G;1C2021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;7;MJSCN3902902G;1C2021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;8;MJSCN3902902G;1C2021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;9;MJSCN3902902G;1C2021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;10;MJSCN3902902G;1C2021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;11;MJSCN3902902G;1C2021026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;12;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;13;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;14;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;15;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;16;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;17;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;18;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;19;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;20;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;21;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;22;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;23;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;24;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;25;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;26;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;27;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;28;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;29;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;30;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;31;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;32;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;33;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;34;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;35;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;36;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;37;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;38;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;39;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;40;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;41;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;42;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;20;43;MJSCN3902902G;1B3031026;Cup Natural 160ml, 2.9gr, Mountea;;Terisi;1;0;0;25200
+G;21;1;MJSCP3204341D;5C3190926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+G;21;2;MJSCP3204341D;5C3190926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+G;21;3;MJSCP3204341D;5C3190926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+G;21;4;MJSCP3204341D;5C3190926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+G;21;5;MJSCP3204341D;5C3190926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+G;21;6;MJSCP3204341D;5C3190926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+G;21;7;MJSCP3204341D;5C3190926;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX BLACKCURRANT;;Terisi;1;0;0;25200
+G;21;8;MJSCP3204343D;5D1060426;Cup Printing 220ml, 4.3gr, OKKY KOKO ION;;Terisi;1;0;0;25200
+G;21;9;MJSCP3204343D;5D1060426;Cup Printing 220ml, 4.3gr, OKKY KOKO ION;;Terisi;1;0;0;25200
+G;21;10;MJSCP3204343D;5D1060426;Cup Printing 220ml, 4.3gr, OKKY KOKO ION;;Terisi;1;0;0;25200
+G;21;11;MJSCP3204343D;5D1060426;Cup Printing 220ml, 4.3gr, OKKY KOKO ION;;Terisi;1;0;0;25200
+G;21;12;MJSCP3204343D;5D1060426;Cup Printing 220ml, 4.3gr, OKKY KOKO ION;;Terisi;1;0;0;25200
+G;21;13;MJSCP3204343D;5D1060426;Cup Printing 220ml, 4.3gr, OKKY KOKO ION;;Terisi;1;0;0;25200
+G;21;14;MJSCP3204343D;5D1060426;Cup Printing 220ml, 4.3gr, OKKY KOKO ION;;Terisi;1;0;0;25200
+G;21;15;MJSCP3204343D;5D1060426;Cup Printing 220ml, 4.3gr, OKKY KOKO ION;;Terisi;1;0;0;25200
+G;21;16;MJSCP3204343D;5D1060426;Cup Printing 220ml, 4.3gr, OKKY KOKO ION;;Terisi;1;0;0;25200
+G;21;17;MJSCP3204343D;5D1060426;Cup Printing 220ml, 4.3gr, OKKY KOKO ION;;Terisi;1;0;0;25200
+G;21;18;MJSCP3204343D;5B3050426;Cup Printing 220ml, 4.3gr, OKKY KOKO ION;;Terisi;1;0;0;25200
+G;21;19;MJSPS1309102C;2C3200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+G;21;20;MJSPS1309102C;2C3200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+G;21;21;MJSPS1309102C;2C3200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+G;21;22;MJSPS1309102C;2C3200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+G;21;23;MJSPS1309102C;2C3200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+G;21;24;MJSPS1309102C;2C3200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+G;21;25;MJSPS1309102C;2C3200926;Preform Short Neck AMDK 330ml, 9.1gr, Blue;;Terisi;1;0;0;20000
+G;21;26;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;27;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;28;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;29;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;30;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;31;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;32;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;33;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;34;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;35;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;36;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;37;MJSPL0313808C;4B3041026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;38;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;39;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;40;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;41;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;21;42;MJSPL0313808C;4A1051026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;22;1;MJSCP3903140D;1D2071026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+G;22;2;MJSCP3903140D;1C3071026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+G;22;3;MJSCP3903140D;1C3071026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+G;22;4;MJSCP3903140D;1C3071026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+G;22;5;MJSCP3903140D;1C3071026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+G;22;6;MJSCP3903140D;1C3071026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+G;22;7;MJSCP3903140D;1A1081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+G;22;8;MJSCP3903140D;1A1081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+G;22;9;MJSCP3903140D;1A1081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+G;22;10;MJSCP3903140D;1A1081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+G;22;11;MJSCP3903140D;1A1081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+G;22;12;MJSCP3903140D;1A1081026;Cup Printing 155ml, 3.10gr, MTB4 04 BLACKCURRANT LOB (D:73.5);;Terisi;1;0;0;25200
+G;22;13;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+G;22;14;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+G;22;15;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+G;22;16;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+G;22;17;MJSCP3902941D;4B1111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;18;MJSCP3902941D;4B1111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;19;MJSCP3902941D;4B1111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;20;MJSCP3902941D;4B1111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;21;MJSCP3902941D;4B1111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;22;MJSCP3902941D;4B1111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;23;MJSCP3902941D;4B1111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;24;MJSCP3902941D;4B1111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;25;MJSCP3902941D;4B1111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;26;MJSCP3902941D;4A2111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;27;MJSCP3902941D;4A2111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;28;MJSCP3902941D;4A2111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;29;MJSCP3902941D;4A2111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;30;MJSCP3902941D;4A2111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;31;MJSCP3902941D;4A2111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;32;MJSCP3902941D;4A2111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;33;MJSCP3902941D;4A2111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;34;MJSCP3902941D;4A2111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;35;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+G;22;36;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+G;22;37;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+G;22;38;MJSCJ0802501D;4C3101026;Cup Natural 200ml, 2.5gr, Full Ring (JASA);;Terisi;1;0;0;38400
+G;22;39;MJSCP3902941D;4C3111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;40;MJSCP3902941D;4C3111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;41;MJSCP3902941D;4C3111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;42;MJSCP3902941D;4C3111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;43;MJSCP3902941D;4C3111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;44;MJSCP3902941D;4C3111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;45;MJSCP3902941D;4C3111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;22;46;MJSCP3902941D;4C3111026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;23;1;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;2;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;3;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;4;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;5;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;6;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;7;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;8;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;9;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;10;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;11;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;12;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;13;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;14;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;15;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;16;MJSPL0313808C;4B3061026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;17;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;18;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;19;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;20;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;21;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;22;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;23;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;24;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;25;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;26;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;27;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;28;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;29;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;30;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;31;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;32;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;33;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;34;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;35;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;36;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;37;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;38;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;39;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;40;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;41;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;23;42;MJSPL0313808C;4A1071026;Preform Long Neck AMDK 600ml, 13.80gr, Blue Arjuna;;Terisi;1;0;0;12800
+G;24;1;;;;;;;;;
+G;24;2;;;;;;;;;
+G;24;3;;;;;;;;;
+G;24;4;;;;;;;;;
+G;24;5;;;;;;;;;
+G;24;6;;;;;;;;;
+G;24;7;;;;;;;;;
+G;24;8;;;;;;;;;
+G;24;9;;;;;;;;;
+G;24;10;;;;;;;;;
+G;24;11;;;;;;;;;
+G;24;12;;;;;;;;;
+G;24;13;;;;;;;;;
+G;24;14;;;;;;;;;
+G;24;15;;;;;;;;;
+G;24;16;;;;;;;;;
+G;24;17;;;;;;;;;
+G;24;18;;;;;;;;;
+G;24;19;;;;;;;;;
+G;24;20;;;;;;;;;
+G;24;21;;;;;;;;;
+G;24;22;;;;;;;;;
+G;24;23;;;;;;;;;
+G;24;24;;;;;;;;;
+G;24;25;;;;;;;;;
+G;24;26;;;;;;;;;
+G;24;27;;;;;;;;;
+G;24;28;;;;;;;;;
+G;24;29;;;;;;;;;
+G;24;30;;;;;;;;;
+G;24;31;;;;;;;;;
+G;24;32;;;;;;;;;
+G;24;33;;;;;;;;;
+G;24;34;;;;;;;;;
+G;24;35;;;;;;;;;
+G;24;36;;;;;;;;;
+G;24;37;;;;;;;;;
+G;24;38;;;;;;;;;
+G;24;39;;;;;;;;;
+G;24;40;;;;;;;;;
+G;24;41;;;;;;;;;
+G;24;42;;;;;;;;;
+G;24;43;;;;;;;;;
+G;24;44;;;;;;;;;
+G;25;1;MJSCP3902941D;1B3051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;2;MJSCP3902941D;1B3051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;3;MJSCP3902941D;1B3051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;4;MJSCP3902941D;1B3051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;5;MJSCP3902941D;1B3051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;6;MJSCP3902941D;1B3051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;7;MJSCP3902941D;1B3051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;8;MJSCP3902941D;1B3051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;9;MJSCP3902941D;1B3051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;10;MJSCP3902941D;1B3051026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;11;MJSCP3902941D;1A1061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;12;MJSCP3902941D;1A1061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;13;MJSCP3902941D;1A1061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;14;MJSCP3902941D;1A1061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;15;MJSCP3902941D;1A1061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;16;MJSCP3902941D;1A1061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;17;MJSCP3902941D;1A1061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;18;MJSCP3902941D;1A1061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;19;MJSCP3902941D;1A1061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;20;MJSCP3902941D;1D2061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;21;MJSCP3902941D;1D2061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;22;MJSCP3902941D;1D2061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;23;MJSCP3902941D;1D2061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;24;MJSCP3902941D;1D2061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;25;MJSCP3902941D;1D2061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;26;MJSCP3902941D;1D2061026;Cup Printing 155ml, 2.90gr, MTB4/MFTBL8 04 BLACKCURRANT SMW (D: 70.5);;Terisi;1;0;0;25200
+G;25;27;;;;;;;;;
+G;25;28;;;;;;;;;
+G;25;29;;;;;;;;;
+G;25;30;;;;;;;;;
+G;25;31;;;;;;;;;
+G;25;32;;;;;;;;;
+G;25;33;;;;;;;;;
+G;25;34;;;;;;;;;
+G;25;35;;;;;;;;;
+G;25;36;;;;;;;;;
+G;25;37;;;;;;;;;
+G;25;38;;;;;;;;;
+G;25;39;;;;;;;;;
+G;25;40;;;;;;;;;
+G;25;41;;;;;;;;;
+G;25;42;;;;;;;;;
+G;25;43;;;;;;;;;
+G;25;44;;;;;;;;;
+G;27;1;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;2;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;3;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;4;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;5;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;6;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;7;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;8;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;9;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;10;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;11;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;12;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;13;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;14;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;15;MJSPS2122302C;3B2260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;16;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;17;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;18;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;19;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;20;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;21;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;22;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;23;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;24;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;25;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;26;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;27;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;28;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;29;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;30;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;31;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;32;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;33;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;34;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;35;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;36;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;37;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;38;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;39;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;40;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;41;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;27;42;MJSPS2122302C;3D3260926;Preform Short Neck AMDK 1500ml, 22.30gr, Blue;;Terisi;1;0;0;7200
+G;28;1;MJSCP3204348D;5C3081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+G;28;2;MJSCP3204348D;5C3081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+G;28;3;MJSCP3204348D;5C3081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+G;28;4;MJSCP3204348D;5C3081026;Cup Printing 215ml, 4.3gr, MOUNTEA TEH MANIS EXTRA OPTITEA;;Terisi;1;0;0;25200
+G;28;5;;;;;;;;;
+G;28;6;;;;;;;;;
+G;28;7;;;;;;;;;
+G;28;8;;;;;;;;;
+G;28;9;;;;;;;;;
+G;28;10;;;;;;;;;
+G;28;11;;;;;;;;;
+G;28;12;;;;;;;;;
+G;28;13;;;;;;;;;
+G;28;14;;;;;;;;;
+G;28;15;MJSCP3204340D;5B3270826;Cup Printing 220ml, 4.3gr, OKKY JELLY MAXX JAMBU;Pecahan: 11 qty;Terisi;0;11;0;23100
+G;28;16;MJSCP3903130D;4D3280726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+G;28;17;MJSCP3903130D;4D3280726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+G;28;18;MJSCP3903130D;4C1290726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+G;28;19;MJSCP3903130D;4C1290726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+G;28;20;MJSCP3903130D;4C1290726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+G;28;21;MJSCP3903130D;4C1290726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+G;28;22;MJSCP3903130D;4B2290726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;1;0;0;25200
+G;28;23;MJSCP3903130D;4B2290726;Cup Printing 155ml, 3.1gr, MTA4/MFTAP8 04 APEL (D : 73.5);;Terisi;0;5;0;10500
+G;28;24;MJSCP2902933D;5B3160926;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+G;28;25;MJSCP2902933D;5B3160926;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+G;28;26;MJSCP2902933D;5B3160926;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+G;28;27;MJSCP2902933D;5B3160926;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+G;28;28;MJSCP2902933D;5B3160926;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+G;28;29;MJSCP2902933D;5B3160926;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+G;28;30;MJSCP2902933D;5B3160926;Cup Printing 155ml, 2,90gr, MTR4/MFTAH8 04 APEL MERAH (D: 70,5);;Terisi;1;0;0;25200
+G;28;31;MJSCP3902931D;4D1290926;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+G;28;32;MJSCP3902931D;4D1290926;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+G;28;33;MJSCP3902931D;4B2290926;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+G;28;34;MJSCP3902931D;4B2290926;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+G;28;35;MJSCP3902931D;4B2290926;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+G;28;36;MJSCP3902931D;4B2290926;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+G;28;37;MJSCP3902931D;4B2290926;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+G;28;38;MJSCP3902931D;4B2290926;Cup Printing 155ml, 2.9gr, MTA4/MFTAP8 04 APEL (D : 70.5);;Terisi;1;0;0;25200
+G;26;1;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;2;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;3;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;4;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;5;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;6;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;7;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;8;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;9;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;10;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;11;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;12;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;13;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;14;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;15;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;16;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;17;MJSPS1210801C;3C3091026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;Pecahan: 7 qty;Terisi;0;7;0;7000
+G;26;18;MJSPS1210801C;3B1101026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;19;MJSPS1210801C;3B1101026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;20;MJSPS1210801C;3B1101026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;21;MJSPS1210801C;3B1101026;Preform Short Neck AMDK 600ml, 10.8gr, Clear Natural;;Terisi;1;0;0;16000
+G;26;22;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;23;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;24;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;25;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;26;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;27;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;28;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;29;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;30;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;31;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;32;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;33;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;34;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;35;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;36;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;37;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;38;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;39;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;40;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;41;MJSCN2902501D;4B1101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;42;MJSCN2902501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;26;43;MJSCN2902501D;4A2101026;Cup Natural 200ml, 2.5gr, Full Ring;;Terisi;1;0;0;38400
+G;18;1;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;2;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;3;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;4;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;5;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;6;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;7;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;8;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;9;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;10;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;11;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;12;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;13;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;14;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;15;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;16;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;17;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;18;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;19;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;20;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;21;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;22;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;23;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;24;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;25;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;26;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;27;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;28;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;29;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;30;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;31;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;32;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;33;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;34;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;35;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;36;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;37;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;38;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;39;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;;Terisi;1;0;0;14400
+G;18;40;MJSPS0512502C;1D2081026;Preform Short Neck AMDK 600ml, 12.50gr, Clear Natural;Pecahan: 8 qty;Terisi;0;8;0;7200
