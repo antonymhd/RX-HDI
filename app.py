@@ -130,9 +130,9 @@ def process_matrix_data(df, search_term, prod_col):
 matrix_info, total_critical, total_kosong, kolom_list, baris_list = process_matrix_data(df, search_query, product_col)
 
 # ==========================================================
-# MODAL POP-UP
+# MODAL POP-UP (VERSI LENGKAP DENGAN REKAP QTY)
 # ==========================================================
-@st.dialog("📦 Rincian Rak (OFFLINE)", width="large")
+@st.dialog("📦 Rincian Detail Rak & Konversi Stok", width="large")
 def show_rack_detail(k, b, info):
     st.subheader(f"📍 Lokasi Racking: {k} - Baris {b}")
     c1, c2, c3 = st.columns(3)
@@ -141,12 +141,72 @@ def show_rack_detail(k, b, info):
     c3.metric("Space Kosong", f"{info['usable_space']} Slot")
     
     st.divider()
+    
     if info['sku_cnt'] > 0:
+        # 1. BACA MASTER PRODUK UNTUK RUMUS KONVERSI
+        try:
+            df_master = pd.read_csv("Master_Produk.csv", sep=";") if ";" in open("Master_Produk.csv").readline() else pd.read_csv("Master_Produk.csv", sep=",")
+            df_master['Part Number Clean'] = df_master['Part Number'].astype(str).str.strip().str.upper()
+        except: 
+            df_master = pd.DataFrame()
+
         df_terisi = info['df_sub'][info['df_sub']['Part Number'].astype(str).str.strip() != ""]
+        
+        # 2. BUAT TABEL REKAPITULASI (PALLET UTUH & TOTAL PCS)
+        rekap_data = []
+        for part_num in df_terisi['Part Number'].astype(str).str.strip().unique():
+            df_prod = df_terisi[df_terisi['Part Number'].astype(str).str.strip() == part_num]
+            prod_name = df_prod[product_col].iloc[0] if product_col in df_prod.columns else "-"
+            
+            # Hitung Utuh
+            jml_utuh = df_prod[~df_prod['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)].shape[0]
+            
+            # Hitung Pecahan/Eceran
+            pecahan_rows = df_prod[df_prod['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)]
+            val_pecahan = val_eceran = 0
+            if not pecahan_rows.empty:
+                ket_str = str(pecahan_rows['Keterangan'].iloc[0]).lower()
+                mp = re.search(r'pecahan:\s*(\d+)', ket_str)
+                if mp: val_pecahan = int(mp.group(1))
+                me = re.search(r'eceran:\s*(\d+)', ket_str)
+                if me: val_eceran = int(me.group(1))
+
+            # Ambil Rumus dari Master
+            ip = pb = ps = 0
+            pnc = part_num.upper()
+            if not df_master.empty and pnc in df_master['Part Number Clean'].values:
+                mr = df_master[df_master['Part Number Clean'] == pnc].iloc[0]
+                ip = float(mr.get('Isi 1 Pallet (pcs)', 0) or 0)
+                pb = float(mr.get('Box / Pallet', 0) or 0)
+                ps = float(mr.get('Sac / Pallet', 0) or 0)
+
+            sc = "Dus" if pnc.endswith('D') else "Sak"
+            pss = pb if pnc.endswith('D') else ps
+            
+            # Buat Teks Konversi
+            if ip > 0:
+                tot = (jml_utuh * ip) + (val_pecahan * pss) + val_eceran
+                teks_rincian = f"{jml_utuh} Pallet * {ip:,.0f}"
+                if val_pecahan > 0: teks_rincian += f" + {val_pecahan} {sc} * {pss:,.0f}"
+                if val_eceran > 0: teks_rincian += f" + {val_eceran} Pcs"
+                teks_rincian += f" = **Total {tot:,.0f} Pcs**"
+            else:
+                teks_rincian = f"{jml_utuh} Pallet"
+
+            rekap_data.append({'Part Number': pnc, 'Nama Produk': prod_name, 'Pallet Utuh': jml_utuh, 'Konversi Total Pcs': teks_rincian})
+        
+        # TAMPILKAN TABEL REKAP
+        st.markdown("#### 📊 Rekapitulasi Stok per Baris Rak")
+        st.dataframe(pd.DataFrame(rekap_data), use_container_width=True, hide_index=True)
+        st.write("") # Spasi
+        
+        # 3. TAMPILKAN TABEL RINCIAN MENTAH
+        st.markdown("#### 📑 Rincian Posisi per Pallet")
         avail = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', product_col, 'Keterangan', 'Grand Total Pcs'] if c in df_terisi.columns]
         df_tampil = df_terisi[avail].copy()
         if 'Pallet Ke' in df_tampil.columns: df_tampil = df_tampil.sort_values(by='Pallet Ke', ascending=True)
         st.dataframe(df_tampil, use_container_width=True, hide_index=True)
+        
     else:
         st.success("✅ Baris ini KOSONG. Siap digunakan!")
 
