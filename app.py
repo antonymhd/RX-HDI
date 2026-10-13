@@ -13,7 +13,7 @@ st.set_page_config(
 # SIDEBAR
 # ==========================================================
 st.sidebar.header("🔄 Mode Offline")
-st.sidebar.warning("Aplikasi sedang berjalan tanpa internet ke Firebase untuk melindungi kuota. Menampilkan data backup semalam.")
+st.sidebar.warning("Aplikasi sedang berjalan tanpa internet ke Firebase untuk melindungi kuota. Menampilkan data backup CSV terbaru.")
 st.sidebar.divider()
 
 st.sidebar.header("👁️ Mode Tampilan Grid")
@@ -24,7 +24,7 @@ mode_tampilan = st.sidebar.radio(
 
 # TOMBOL CLEAR CACHE MANUAL DI SIDEBAR
 st.sidebar.divider()
-if st.sidebar.button("🧹 Bersihkan Cache (Jika Error File)"):
+if st.sidebar.button("🧹 Bersihkan Cache (Reset App)", use_container_width=True):
     st.cache_data.clear()
     st.success("Cache berhasil dibersihkan! Silakan refresh layar.")
     st.rerun()
@@ -41,29 +41,32 @@ def load_data_from_csv():
         nama_file_csv = "Audit_Stok_WMS_20261012.csv"
         
         # Coba baca dengan pemisah titik koma, jika gagal pakai koma
-        try: df = pd.read_csv(nama_file_csv, sep=";")
-        except: df = pd.read_csv(nama_file_csv, sep=",")
+        try: 
+            df = pd.read_csv(nama_file_csv, sep=";")
+        except: 
+            df = pd.read_csv(nama_file_csv, sep=",")
         
-        # STANDARISASI NAMA KOLOM (Menyelesaikan masalah 'Palet ke' vs 'Pallet Ke')
-        if 'Palet ke' in df.columns:
-            df.rename(columns={'Palet ke': 'Pallet Ke'}, inplace=True)
-            
-        if 'Pallet ke' in df.columns:
-            df.rename(columns={'Pallet ke': 'Pallet Ke'}, inplace=True)
+        # Standarisasi nama kolom 'Palet ke' / 'Pallet ke' -> 'Pallet Ke'
+        for c in df.columns:
+            if c.strip().lower() in ['palet ke', 'pallet ke']:
+                df.rename(columns={c: 'Pallet Ke'}, inplace=True)
         
         # Pastikan kolom tipe angka
         for col in ['Baris', 'Pallet Ke']:
             if col in df.columns: 
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
         
-        if 'Kolom' not in df.columns: return pd.DataFrame()
+        if 'Kolom' not in df.columns: 
+            return pd.DataFrame()
+            
         return df
     except Exception as e:
-        st.error(f"🚨 Gagal memuat CSV: {e}. Pastikan nama file adalah 'Audit_Stok_WMS_20261012.csv' di GitHub.")
+        st.error(f"🚨 Gagal memuat CSV: {e}. Pastikan file 'Audit_Stok_WMS_20261012.csv' ada di folder GitHub.")
         return None
 
 df = load_data_from_csv()
-if df is None or df.empty: st.stop()
+if df is None or df.empty: 
+    st.stop()
 
 product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 
@@ -121,16 +124,14 @@ def process_matrix_data(df, search_term, prod_col):
             if sku >= 4: total_critical += 1
             elif sku == 0: total_kosong += 1
                 
-            matrix_info[(k, b)] = {
-                'exist': True, 'sku_cnt': sku, 'filled': filled, 'usable_space': usable_space,
-                'max_slot': max_slot, 'df_sub': sub, 'is_match': is_match
-            }
+            matrix_info[(k, b)] = {'exist': True, 'sku_cnt': sku, 'filled': filled, 'usable_space': usable_space, 'max_slot': max_slot, 'df_sub': sub, 'is_match': is_match}
+            
     return matrix_info, total_critical, total_kosong, kolom_list, baris_list
 
 matrix_info, total_critical, total_kosong, kolom_list, baris_list = process_matrix_data(df, search_query, product_col)
 
 # ==========================================================
-# MODAL POP-UP (VERSI LENGKAP DENGAN REKAP QTY)
+# MODAL POP-UP (KEBAL ERROR DENGAN REKAP QTY & KONVERSI)
 # ==========================================================
 @st.dialog("📦 Rincian Detail Rak & Konversi Stok", width="large")
 def show_rack_detail(k, b, info):
@@ -156,7 +157,13 @@ def show_rack_detail(k, b, info):
         rekap_data = []
         for part_num in df_terisi['Part Number'].astype(str).str.strip().unique():
             df_prod = df_terisi[df_terisi['Part Number'].astype(str).str.strip() == part_num]
-            prod_name = df_prod[product_col].iloc[0] if product_col in df_prod.columns else "-"
+            
+            # Pengaman ekstra dari IndexError
+            prod_name = "-"
+            if product_col in df_prod.columns and not df_prod.empty:
+                valid_names = df_prod[product_col].dropna().values
+                if len(valid_names) > 0:
+                    prod_name = str(valid_names[0])
             
             # Hitung Utuh
             jml_utuh = df_prod[~df_prod['Keterangan'].astype(str).str.contains('Pecahan|Eceran', case=False, na=False)].shape[0]
