@@ -180,7 +180,10 @@ def show_rack_detail(k, b, info):
 
             # Ambil Rumus dari Master
             ip = pb = ps = 0
-            pnc = part_num.upper()
+            
+            # [PERBAIKAN KEBAL ERROR FLOAT/NAN UNTUK UPPER]
+            pnc = str(part_num).strip().upper() 
+            
             if not df_master.empty and pnc in df_master['Part Number Clean'].values:
                 mr = df_master[df_master['Part Number Clean'] == pnc].iloc[0]
                 ip = float(mr.get('Isi 1 Pallet (pcs)', 0) or 0)
