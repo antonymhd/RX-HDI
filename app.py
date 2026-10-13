@@ -273,6 +273,17 @@ st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
 
 def render_grid_area(title, start_baris, end_baris):
     st.markdown(f"### {title}")
+    
+    # --- TAMBAHAN BARU: HEADER NOMOR BARIS DI ATAS ---
+    header_cols = st.columns([0.6] + [1] * 16, gap="small")
+    with header_cols[0]: 
+        st.empty() # Sudut kiri atas dikosongkan
+    for idx, b in enumerate(list(range(start_baris, end_baris + 1))):
+        with header_cols[idx + 1]:
+            # Menampilkan angka baris (1, 2, 3, dst)
+            st.markdown(f"<div style='text-align:center; font-weight:900; font-size:14px; color:#94a3b8; margin-bottom:4px;'>{b}</div>", unsafe_allow_html=True)
+    # -------------------------------------------------
+    
     for k in kolom_list:
         cols = st.columns([0.6] + [1] * 16, gap="small")
         with cols[0]: st.markdown(f"<div style='font-weight:900;'>{k}</div>", unsafe_allow_html=True)
