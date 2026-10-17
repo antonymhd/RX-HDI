@@ -5,7 +5,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 
 # ==========================================================
-# 1. CONFIG HALAMAN
+# 1. KONFIGURASI HALAMAN
 # ==========================================================
 st.set_page_config(
     page_title="Warehouse 2D Racking",
@@ -15,7 +15,7 @@ st.set_page_config(
 )
 
 # ==========================================================
-# 2. FIREBASE
+# 2. INIT FIREBASE
 # ==========================================================
 NAMA_DATABASE = "uji_coba_rak"
 
@@ -25,7 +25,7 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 # ==========================================================
-# 3. HELPER
+# 3. FUNGSI BANTU
 # ==========================================================
 def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
@@ -56,6 +56,7 @@ def normalize_column_names(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+
 def is_valid_part_number(value) -> bool:
     if pd.isna(value):
         return False
@@ -66,11 +67,13 @@ def is_valid_part_number(value) -> bool:
         return False
     return True
 
+
 def get_product_column(df: pd.DataFrame) -> str:
     for col in ["Nama Produk", "Nama Barang"]:
         if col in df.columns:
             return col
     return ""
+
 
 def is_rack_exist(kolom: str, baris: int) -> bool:
     if kolom == "F" and baris < 5:
@@ -79,11 +82,13 @@ def is_rack_exist(kolom: str, baris: int) -> bool:
         return False
     return True
 
+
 def safe_contains(series, keyword: str) -> bool:
     if not keyword or keyword.strip() == "":
         return False
     keyword = keyword.strip()
     return series.astype(str).str.contains(keyword, case=False, na=False, regex=False).any()
+
 
 def load_master_produk():
     try:
@@ -97,8 +102,9 @@ def load_master_produk():
     except Exception:
         return pd.DataFrame()
 
+
 # ==========================================================
-# 4. LOAD DATA
+# 4. LOAD DATA DARI FIREBASE
 # ==========================================================
 @st.cache_data(ttl=300)
 def load_data_from_firebase():
@@ -115,7 +121,9 @@ def load_data_from_firebase():
 
     df = pd.DataFrame(semua_data)
     df = normalize_column_names(df)
+
     return df
+
 
 # ==========================================================
 # 5. BUILD MATRIX SUMMARY
@@ -189,179 +197,5 @@ def build_matrix_summary(df: pd.DataFrame, search_term: str, product_col: str):
             "sku_cnt": sku_count,
             "filled": filled,
             "usable_space": usable_space,
-            "max_slot": max_slot,
-            "is_match": is_match,
-            "sub": sub,
-        }
-
-        if sku_count >= 4:
-            total_critical += 1
-        elif sku_count == 0:
-            total_kosong += 1
-
-    for k in kolom_list:
-        for b in baris_list:
-            if not is_rack_exist(k, b):
-                matrix_info[(k, b)] = {"exist": False}
-            else:
-                matrix_info[(k, b)] = summary.get((k, b), {
-                    "exist": True,
-                    "sku_cnt": 0,
-                    "filled": 0,
-                    "usable_space": 31 if b <= 16 else 44,
-                    "max_slot": 31 if b <= 16 else 44,
-                    "is_match": False,
-                    "sub": df[(df["Kolom"] == k) & (df["Baris"] == b)].copy(),
-                })
-
-    return matrix_info, total_critical, total_kosong, kolom_list, baris_list
-
-# ==========================================================
-# 6. DETAIL DIALOG
-# ==========================================================
-@st.dialog("📦 Rincian Detail Rak", width="large")
-def show_rack_detail(k: str, b: int, info: dict):
-    st.subheader(f"📍 Lokasi Racking: {k} - Baris {b}")
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Variasi SKU", f"{info['sku_cnt']} Jenis")
-    c2.metric("Slot Fisik Terpakai", f"{info['filled']} / {info['max_slot']}")
-    c3.metric("Space Kosong", f"{info['usable_space']} Slot")
-
-    st.divider()
-
-    df_sub = info.get("sub", pd.DataFrame())
-    if df_sub.empty:
-        st.success("✅ Rak Kosong. Aman untuk diisi.")
-        return
-
-    if info["sku_cnt"] > 0:
-        df_master = load_master_produk()
-
-        valid_mask = (
-            df_sub["Part Number"].astype(str).str.strip().map(is_valid_part_number)
-            if "Part Number" in df_sub.columns else pd.Series([False] * len(df_sub))
-        )
-        df_terisi = df_sub.loc[valid_mask].copy()
-
-        rekap_data = []
-
-        for part_num in df_terisi["Part Number"].astype(str).str.strip().unique():
-            part_num = str(part_num).strip()
-            if not part_num:
-                continue
-
-            df_prod = df_terisi[df_terisi["Part Number"].astype(str).str.strip() == part_num].copy()
-
-            prod_name = "-"
-            if product_col in df_prod.columns and not df_prod.empty:
-                valid_names = df_prod[product_col].dropna().astype(str).unique()
-                if len(valid_names) > 0:
-                    prod_name = str(valid_names[0])
-
-            jml_utuh = 0
-            val_pecahan = 0
-            val_eceran = 0
-
-            for _, row in df_prod.iterrows():
-                ket_str = str(row.get("Keterangan", "")).lower()
-                is_pecahan = "pecahan" in ket_str or "eceran" in ket_str
-
-                if not is_pecahan:
-                    jml_utuh += 1
-                else:
-                    mp = re.search(r"pecahan:\s*(\d+)", ket_str)
-                    if mp:
-                        val_pecahan += int(mp.group(1))
-                    else:
-                        nums = re.findall(r"\d+", ket_str)
-                        if nums and "pecahan" in ket_str:
-                            val_pecahan += int(nums[0])
-
-                    me = re.search(r"eceran:\s*(\d+)", ket_str)
-                    if me:
-                        val_eceran += int(me.group(1))
-
-            ip = 0
-            pb = 0
-            ps = 0
-
-            pnc = part_num.strip().upper()
-            if not df_master.empty and "Part Number Clean" in df_master.columns and pnc in df_master["Part Number Clean"].values:
-                mr = df_master[df_master["Part Number Clean"] == pnc].iloc[0]
-                ip = pd.to_numeric(mr.get("Isi 1 Pallet (pcs)", 0), errors="coerce")
-                ip = 0 if pd.isna(ip) else float(ip)
-
-                pb = pd.to_numeric(mr.get("Box / Pallet", 0), errors="coerce")
-                pb = 0 if pd.isna(pb) else float(pb)
-
-                ps = pd.to_numeric(mr.get("Sac / Pallet", 0), errors="coerce")
-                ps = 0 if pd.isna(ps) else float(ps)
-
-            sc = "Dus" if pnc.endswith("D") else "Sak"
-            pss = pb if pnc.endswith("D") else ps
-
-            if ip > 0:
-                total_pcs = (jml_utuh * ip) + (val_pecahan * pss) + val_eceran
-                teks_rincian = f"{jml_utuh} Pallet * {ip:,.0f}"
-                if val_pecahan > 0:
-                    teks_rincian += f" + {val_pecahan} {sc} * {pss:,.0f}"
-                if val_eceran > 0:
-                    teks_rincian += f" + {val_eceran} Pcs"
-                teks_rincian += f" = **Total {total_pcs:,.0f} Pcs**"
-            else:
-                teks_rincian = f"{jml_utuh} Pallet"
-
-            rekap_data.append({
-                "Part Number": pnc,
-                "Nama Produk": prod_name,
-                "Pallet Utuh": jml_utuh,
-                "Konversi Total Pcs": teks_rincian,
-            })
-
-        st.markdown("#### 📊 Rekapitulasi Stok (Otomatis)")
-        st.dataframe(pd.DataFrame(rekap_data), use_container_width=True, hide_index=True)
-        st.write("")
-
-        st.markdown("#### 📑 Rincian Posisi per Pallet")
-        available_cols = [c for c in ["Pallet Ke", "Part Number", "Lot Number", product_col, "Keterangan"] if c in df_terisi.columns]
-        df_tampil = df_terisi[available_cols].copy()
-        if "Pallet Ke" in df_tampil.columns:
-            df_tampil = df_tampil.sort_values(by="Pallet Ke", ascending=True)
-        st.dataframe(df_tampil, use_container_width=True, hide_index=True)
-    else:
-        st.success("✅ Rak Kosong. Aman untuk diisi.")
-
-# ==========================================================
-# 7. RENDER GRID
-# ==========================================================
-def render_grid_area(title: str, start_baris: int, end_baris: int):
-    st.markdown(f"### {title}")
-
-    st.markdown("<div class='rack-grid-shell'>", unsafe_allow_html=True)
-
-    header_cols = st.columns([0.6] + [1] * 16, gap="small")
-    with header_cols[0]:
-        st.empty()
-
-    row_numbers = list(range(start_baris, end_baris + 1))
-    for idx, b in enumerate(row_numbers):
-        with header_cols[idx + 1]:
-            st.markdown(
-                f"<div style='text-align:center; font-weight:900; font-size:14px; color:#94a3b8; margin-bottom:4px;'>{b}</div>",
-                unsafe_allow_html=True,
-            )
-
-    for k in kolom_list:
-        cols = st.columns([0.6] + [1] * 16, gap="small")
-        with cols[0]:
-            st.markdown(f"<div style='font-weight:900; padding-top:6px;'>{k}</div>", unsafe_allow_html=True)
-
-        for idx, b in enumerate(row_numbers):
-            info = matrix_info.get((k, b), {"exist": False})
-            with cols[idx + 1]:
-                if info.get("exist", False):
-                    lbl = str(info["usable_space"]) if mode_tampilan == "Sisa Slot Kosong" else str(info["sku_cnt"])
-                    if st.button(lbl, key=f"btn_{k}_{b}", use_container_width=True):
-                        show_rack*
+            "max_slot":
 
