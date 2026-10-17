@@ -447,23 +447,23 @@ col_m3.metric("Rak Kosong Bersih", f"{total_kosong} Baris")
 st.divider()
 
 # ==========================================================
-# 10. CSS RESPONSIF
+# CSS RESPONSIF KHUSUS GRID
 # ==========================================================
 dynamic_css = """
-.block-container {
-    max-width: 98% !important;
-    padding-top: 3.5rem !important;
-    padding-bottom: 2rem !important;
-}
-
+/* jangan global semua streamlit block */
 div[data-testid="stHorizontalBlock"] {
-    flex-wrap: wrap !important;
+    flex-wrap: nowrap !important;
 }
 
-.grid-wrapper {
+/* wrapper khusus rak */
+.rack-grid-shell {
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
-    padding-bottom: 0.75rem;
+    padding-bottom: 0.6rem;
+    margin-top: 0.3rem;
+}
+.rack-grid-shell > div {
+    min-width: 980px;
 }
 
 div[data-testid="stColumn"] {
@@ -475,7 +475,7 @@ div[class^="st-key-btn_"] button {
     aspect-ratio: 1/1 !important;
     width: 100% !important;
     min-width: 32px !important;
-    max-width: 60px !important;
+    max-width: 58px !important;
     padding: 0px !important;
     margin: 0px !important;
     border: 1px solid #475569 !important;
@@ -493,54 +493,17 @@ div[class^="st-key-btn_"] button:hover {
     z-index: 10;
 }
 
-@media (max-width: 600px) {
+@media (max-width: 768px) {
+    .rack-grid-shell > div {
+        min-width: 820px;
+    }
     div[class^="st-key-btn_"] button {
         min-width: 24px !important;
-        max-width: 42px !important;
+        max-width: 40px !important;
         font-size: 10px !important;
-        border-radius: 5px !important;
-    }
-
-    .block-container {
-        padding-left: 0.4rem !important;
-        padding-right: 0.4rem !important;
     }
 }
 """
-
-color_map = {
-    "match": {"bg": "deepskyblue", "txt": "black", "sel": []},
-    "critical": {"bg": "crimson", "txt": "white", "sel": []},
-    "warning": {"bg": "gold", "txt": "black", "sel": []},
-    "ideal": {"bg": "palegreen", "txt": "black", "sel": []},
-    "empty": {"bg": "gainsboro", "txt": "gray", "sel": []},
-}
-
-for k in kolom_list:
-    for b in baris_list:
-        info = matrix_info.get((k, b))
-        if not info or not info.get("exist", False):
-            continue
-
-        sku = info.get("sku_cnt", 0)
-        sel = f".st-key-btn_{k}_{b} button"
-
-        if info.get("is_match", False):
-            color_map["match"]["sel"].append(sel)
-        elif sku >= 4:
-            color_map["critical"]["sel"].append(sel)
-        elif sku == 3:
-            color_map["warning"]["sel"].append(sel)
-        elif sku in [1, 2]:
-            color_map["ideal"]["sel"].append(sel)
-        else:
-            color_map["empty"]["sel"].append(sel)
-
-for group in color_map.values():
-    if group["sel"]:
-        dynamic_css += f"\n{', '.join(group['sel'])} {{ background-color: {group['bg']} !important; color: {group['txt']} !important; }}"
-
-st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
 
 # ==========================================================
 # 11. VISUAL GRID
