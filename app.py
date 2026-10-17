@@ -42,12 +42,10 @@ def load_data_from_firebase():
         
     df = pd.DataFrame(semua_data)
     
-    # Standarisasi nama kolom Pallet Ke
     for c in df.columns:
         if c.strip().lower() in ['palet ke', 'pallet ke']:
             df.rename(columns={c: 'Pallet Ke'}, inplace=True)
             
-    # Pastikan tipe data baris dan pallet adalah integer
     for col in ['Baris', 'Pallet Ke']:
         if col in df.columns: 
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
@@ -86,7 +84,6 @@ if df.empty or 'Kolom' not in df.columns:
 
 product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 
-# Filter pencarian yang aman dari NaN
 st.sidebar.header("🔍 Cari Barang")
 if product_col in df.columns:
     valid_mask = ~df['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])
@@ -180,7 +177,6 @@ def show_rack_detail(k, b, info):
     st.divider()
     
     if info['sku_cnt'] > 0:
-        # Load referensi Master Produk
         try:
             try: df_master = pd.read_csv("Master_Produk.csv", sep=";")
             except: df_master = pd.read_csv("Master_Produk.csv", sep=",")
@@ -188,7 +184,6 @@ def show_rack_detail(k, b, info):
         except: 
             df_master = pd.DataFrame()
 
-        # Filter slot yang terisi saja
         df_terisi = info['df_sub'][~info['df_sub']['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])]
         
         rekap_data = []
@@ -205,7 +200,6 @@ def show_rack_detail(k, b, info):
             val_pecahan = 0
             val_eceran = 0
             
-            # Hitung total utuh, pecahan, dan eceran dalam baris ini
             for _, row in df_prod.iterrows():
                 ket_str = str(row.get('Keterangan', '')).lower()
                 is_pecahan = 'pecahan' in ket_str or 'eceran' in ket_str
@@ -225,7 +219,6 @@ def show_rack_detail(k, b, info):
                     if me: 
                         val_eceran += int(me.group(1))
 
-            # Konversi matematika dengan Master_Produk
             ip = 0; pb = 0; ps = 0
             pnc = str(part_num).strip().upper() 
             if not df_master.empty and 'Part Number Clean' in df_master.columns and pnc in df_master['Part Number Clean'].values:
@@ -243,7 +236,6 @@ def show_rack_detail(k, b, info):
             sc = "Dus" if pnc.endswith('D') else "Sak"
             pss = pb if pnc.endswith('D') else ps
             
-            # Output String
             if ip > 0:
                 tot = (jml_utuh * ip) + (val_pecahan * pss) + val_eceran
                 teks_rincian = f"{jml_utuh} Pallet * {ip:,.0f}"
@@ -275,7 +267,7 @@ def show_rack_detail(k, b, info):
         st.success("✅ Rak Kosong. Aman untuk diisi.")
 
 # ==========================================================
-# 8. RENDER METRIK & GRID UI (WARNA AMAN CSS)
+# 8. RENDER METRIK & GRID UI (RESPONSIF & WARNA AMAN CSS)
 # ==========================================================
 col_m1, col_m2, col_m3 = st.columns(3)
 col_m1.metric("Total Baris Aktif", "156 Baris")
@@ -284,16 +276,41 @@ col_m3.metric("Rak Kosong Bersih", f"{total_kosong} Baris")
 st.divider()
 
 dynamic_css = """
-.block-container { max-width: 98% !important; padding-top: 3.5rem !important; padding-bottom: 2rem !important; }
+.block-container { max-width: 98% !important; padding-top: 2rem !important; padding-bottom: 2rem !important; }
 div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
 div[data-testid="stColumn"] { padding-left: 2px !important; padding-right: 2px !important; }
 div[data-testid="stColumn"]:nth-child(1) { display: flex; align-items: center; justify-content: center; }
+
+/* Styling Dasar Kotak Rak */
 div[class^="st-key-btn_"] button {
-    aspect-ratio: 1/1 !important; width: 100% !important; min-width: 22px !important;
-    padding: 0px !important; margin: 0px !important; border: 1px solid #475569 !important;
-    border-radius: 4px !important; display: flex !important; align-items: center !important; font-weight: 900 !important;
+    aspect-ratio: 1/1 !important; 
+    width: 100% !important; 
+    min-width: 20px !important;
+    padding: 0px !important; 
+    margin: 0px !important; 
+    border: 1px solid #475569 !important;
+    border-radius: 4px !important; 
+    display: flex !important; 
+    align-items: center !important; 
+    justify-content: center !important;
+    font-weight: 900 !important;
 }
+
 div[class^="st-key-btn_"] button:hover { transform: scale(1.15); border: 2px solid #fff !important; z-index: 10; }
+
+/* Teks Angka yang Responsif (Otomatis menyesuaikan layar PC vs Tablet) */
+div[class^="st-key-btn_"] button p {
+    margin: 0 !important;
+    line-height: 1 !important;
+    font-size: clamp(9px, 1.2vw, 14px) !important;
+}
+
+/* Penyesuaian Ekstrem Khusus Layar Tablet Portrait / Smartphone (Di bawah 800px) */
+@media (max-width: 800px) {
+    div[data-testid="stColumn"] { padding-left: 1px !important; padding-right: 1px !important; }
+    div[class^="st-key-btn_"] button { min-width: 15px !important; border-radius: 2px !important; }
+    div[data-testid="stColumn"]:nth-child(1) { font-size: 11px !important; }
+}
 """
 
 color_map = {
