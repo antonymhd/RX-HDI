@@ -107,8 +107,12 @@ def process_matrix_data(df, search_term, prod_col):
     kolom_list = ['G', 'F', 'E', 'D', 'C', 'B', 'A']
     baris_list = list(range(1, 29))
     matrix_info = {}
-    total_critical = 0
-    total_kosong = 0
+    
+    # Inisialisasi variabel penghitung Metrik
+    total_critical = 0  # Merah (>= 4 SKU)
+    total_warning = 0   # Kuning (2-3 SKU)
+    total_ideal = 0     # Hijau (1 SKU)
+    total_kosong = 0    # Abu-abu (0 SKU)
     
     for k in kolom_list:
         for b in baris_list:
@@ -144,8 +148,13 @@ def process_matrix_data(df, search_term, prod_col):
             max_slot = int(32 if b <= 16 else 46) if is_all_box else int(31 if b <= 16 else 44)
             usable_space = max(0, max_slot - filled)
             
+            # Mendata metrik berdasarkan variasi SKU
             if sku >= 4: 
                 total_critical += 1
+            elif sku in [2, 3]: 
+                total_warning += 1
+            elif sku == 1:
+                total_ideal += 1
             elif sku == 0: 
                 total_kosong += 1
                 
@@ -159,9 +168,10 @@ def process_matrix_data(df, search_term, prod_col):
                 'is_match': is_match
             }
             
-    return matrix_info, total_critical, total_kosong, kolom_list, baris_list
+    return matrix_info, total_critical, total_warning, total_ideal, total_kosong, kolom_list, baris_list
 
-matrix_info, total_critical, total_kosong, kolom_list, baris_list = process_matrix_data(df, search_query, product_col)
+# Tangkap semua metrik yang baru
+matrix_info, total_critical, total_warning, total_ideal, total_kosong, kolom_list, baris_list = process_matrix_data(df, search_query, product_col)
 
 # ==========================================================
 # 7. POP-UP DETAIL RAK (KALKULASI KONVERSI STOK)
@@ -269,10 +279,14 @@ def show_rack_detail(k, b, info):
 # ==========================================================
 # 8. RENDER METRIK & GRID UI (RESPONSIF & WARNA AMAN CSS)
 # ==========================================================
-col_m1, col_m2, col_m3 = st.columns(3)
+
+# 5 KOLOM METRIK (Sesuai dengan Indikator Warna)
+col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
 col_m1.metric("Total Baris Aktif", "156 Baris")
-col_m2.metric("Rak Kritis (>= 4 SKU)", f"{total_critical} Baris")
-col_m3.metric("Rak Kosong Bersih", f"{total_kosong} Baris")
+col_m2.metric("🟢 Rak Ideal (1 SKU)", f"{total_ideal} Baris")
+col_m3.metric("🟡 Rak Campur (2-3 SKU)", f"{total_warning} Baris")
+col_m4.metric("🔴 Rak Kritis (>= 4 SKU)", f"{total_critical} Baris")
+col_m5.metric("⚪ Rak Kosong Bersih", f"{total_kosong} Baris")
 st.divider()
 
 dynamic_css = """
