@@ -73,7 +73,7 @@ mode_tampilan = st.sidebar.radio(
 # ==========================================================
 # 5. MEMUAT DATA UTAMA & PENCARIAN
 # ==========================================================
-st.title("📦 Visualisasi Grid Gudang (Live Monitor)")
+st.title(" 📦 Visualisasi Grid Gudang (Live Monitor)")
 st.caption(f"Layar pantau Read-Only. Terhubung ke database: {NAMA_DATABASE}")
 
 df = load_data_from_firebase()
