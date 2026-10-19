@@ -328,11 +328,12 @@ for k in kolom_list:
         sku = info['sku_cnt']
         sel = f".st-key-btn_{k}_{b} button"
         
+        # LOGIKA PEWARNAAN BARU
         if info['is_match']: color_map['match']['sel'].append(sel)
         elif sku >= 4: color_map['critical']['sel'].append(sel)
-        elif sku == 3: color_map['warning']['sel'].append(sel)
-        elif sku in [1, 2]: color_map['ideal']['sel'].append(sel)
-        else: color_map['empty']['sel'].append(sel)
+        elif sku in [2, 3]: color_map['warning']['sel'].append(sel) # 2-3 SKU (Kuning)
+        elif sku == 1: color_map['ideal']['sel'].append(sel)        # 1 SKU (Hijau)
+        else: color_map['empty']['sel'].append(sel)                 # 0 SKU (Abu-abu)
 
 for group in color_map.values():
     if group['sel']: 
