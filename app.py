@@ -282,7 +282,9 @@ def show_rack_detail(k, b, info):
 
 # 5 KOLOM METRIK (Sesuai dengan Indikator Warna)
 col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
-col_m1.metric("Total Baris Aktif", "156 Baris")
+# Hitung otomatis dari total seluruh status rak
+total_baris_hitung = total_ideal + total_warning + total_critical + total_kosong
+col_m1.metric("Total Baris Aktif", f"{total_baris_hitung} Baris")
 col_m2.metric("🟢 Rak Ideal (1 SKU)", f"{total_ideal} Baris")
 col_m3.metric("🟡 Rak Campur (2-3 SKU)", f"{total_warning} Baris")
 col_m4.metric("🔴 Rak Kritis (>= 4 SKU)", f"{total_critical} Baris")
