@@ -113,6 +113,9 @@ def process_matrix_data(df, search_term, prod_col):
     total_ideal = 0     # Hijau (1 SKU)
     total_kosong = 0    # Abu-abu (0 SKU)
     
+    total_slot_ideal = 0    # Kapasitas slot di zona hijau
+    total_slot_warning = 0  # Kapasitas slot di zona kuning
+    
     for k in kolom_list:
         for b in baris_list:
             if not is_rack_exist(k, b):
@@ -147,13 +150,17 @@ def process_matrix_data(df, search_term, prod_col):
             max_slot = int(32 if b <= 16 else 46) if is_all_box else int(31 if b <= 16 else 44)
             usable_space = max(0, max_slot - filled)
             
-            # ATURAN SKU BARU: Hijau = 1 SKU, Kuning = 2 SKU, Merah >= 3 SKU
+            # ATURAN SKU BARU & PENGHITUNGAN SLOT KOSONG
             if sku >= 3: 
                 total_critical += 1
             elif sku == 2: 
                 total_warning += 1
+                if usable_space > 1:
+                    total_slot_warning += usable_space
             elif sku == 1:
                 total_ideal += 1
+                if usable_space > 1:
+                    total_slot_ideal += usable_space
             elif sku == 0: 
                 total_kosong += 1
                 
@@ -167,9 +174,9 @@ def process_matrix_data(df, search_term, prod_col):
                 'is_match': is_match
             }
             
-    return matrix_info, total_critical, total_warning, total_ideal, total_kosong, kolom_list, baris_list
+    return matrix_info, total_critical, total_warning, total_ideal, total_kosong, total_slot_ideal, total_slot_warning, kolom_list, baris_list
 
-matrix_info, total_critical, total_warning, total_ideal, total_kosong, kolom_list, baris_list = process_matrix_data(df, search_query, product_col)
+matrix_info, total_critical, total_warning, total_ideal, total_kosong, total_slot_ideal, total_slot_warning, kolom_list, baris_list = process_matrix_data(df, search_query, product_col)
 
 # ==========================================================
 # 7. POP-UP DETAIL RAK (KALKULASI KONVERSI STOK)
@@ -280,19 +287,19 @@ def show_rack_detail(k, b, info):
 
 col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
 total_baris_hitung = total_ideal + total_warning + total_critical + total_kosong
+
 col_m1.metric("Total Baris Aktif", f"{total_baris_hitung} Baris")
-col_m2.metric("🟢 Rak Ideal (1 SKU)", f"{total_ideal} Baris")
-col_m3.metric("🟡 Rak Campur (2 SKU)", f"{total_warning} Baris")
-col_m4.metric("🔴 Rak Kritis (>= 3 SKU)", f"{total_critical} Baris")
+col_m2.metric("🟢 Rak Ideal (1 SKU)", f"{total_ideal} Baris", f"{total_slot_ideal} Slot Siap Isi", delta_color="normal")
+col_m3.metric("🟡 Rak Campur (2 SKU)", f"{total_warning} Baris", f"{total_slot_warning} Slot Siap Isi", delta_color="normal")
+col_m4.metric("🔴 Rak Kritis (>= 3 SKU)", f"{total_critical} Baris", "Hindari Inbound", delta_color="off")
 col_m5.metric("⚪ Rak Kosong Bersih", f"{total_kosong} Baris")
 st.divider()
 
-# Menggunakan string biasa tanpa multiline string yang berisiko syntax error
 css_block_1 = ".block-container { max-width: 98% !important; padding-top: 2rem !important; padding-bottom: 2rem !important; }"
-css_block_2 = "div[data-testid=\"stHorizontalBlock\"] { flex-wrap: nowrap !important; }"
-css_block_3 = "div[data-testid=\"stColumn\"] { padding-left: 2px !important; padding-right: 2px !important; }"
-css_block_4 = "div[data-testid=\"stColumn\"]:nth-child(1) { display: flex; align-items: center; justify-content: center; }"
-css_btn = """
+css_block_2 = 'div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }'
+css_block_3 = 'div[data-testid="stColumn"] { padding-left: 2px !important; padding-right: 2px !important; }'
+css_block_4 = 'div[data-testid="stColumn"]:nth-child(1) { display: flex; align-items: center; justify-content: center; }'
+css_btn = '''
 div[class^="st-key-btn_"] button {
     aspect-ratio: 1/1 !important; 
     width: 100% !important; 
@@ -312,7 +319,12 @@ div[class^="st-key-btn_"] button p {
     line-height: 1 !important;
     font-size: clamp(9px, 1.2vw, 14px) !important;
 }
-"""
+@media (max-width: 800px) {
+    div[data-testid="stColumn"] { padding-left: 1px !important; padding-right: 1px !important; }
+    div[class^="st-key-btn_"] button { min-width: 15px !important; border-radius: 2px !important; }
+    div[data-testid="stColumn"]:nth-child(1) { font-size: 11px !important; }
+}
+'''
 
 dynamic_css = f"{css_block_1}\n{css_block_2}\n{css_block_3}\n{css_block_4}\n{css_btn}"
 
@@ -331,7 +343,7 @@ for k in kolom_list:
         sku = info['sku_cnt']
         sel = f".st-key-btn_{k}_{b} button"
         
-        # LOGIKA PEWARNAAN BARU: Hijau = 1 SKU, Kuning = 2 SKU, Merah >= 3 SKU
+        # LOGIKA PEWARNAAN BARU
         if info['is_match']: color_map['match']['sel'].append(sel)
         elif sku >= 3: color_map['critical']['sel'].append(sel)
         elif sku == 2: color_map['warning']['sel'].append(sel)
