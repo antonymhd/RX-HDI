@@ -108,9 +108,8 @@ def process_matrix_data(df, search_term, prod_col):
     baris_list = list(range(1, 29))
     matrix_info = {}
     
-    # Inisialisasi variabel penghitung Metrik
-    total_critical = 0  # Merah (>= 4 SKU)
-    total_warning = 0   # Kuning (2-3 SKU)
+    total_critical = 0  # Merah (>= 3 SKU)
+    total_warning = 0   # Kuning (2 SKU)
     total_ideal = 0     # Hijau (1 SKU)
     total_kosong = 0    # Abu-abu (0 SKU)
     
@@ -148,10 +147,10 @@ def process_matrix_data(df, search_term, prod_col):
             max_slot = int(32 if b <= 16 else 46) if is_all_box else int(31 if b <= 16 else 44)
             usable_space = max(0, max_slot - filled)
             
-            # Mendata metrik berdasarkan variasi SKU
-            if sku >= 4: 
+            # ATURAN SKU BARU: Hijau = 1 SKU, Kuning = 2 SKU, Merah >= 3 SKU
+            if sku >= 3: 
                 total_critical += 1
-            elif sku in [2, 3]: 
+            elif sku == 2: 
                 total_warning += 1
             elif sku == 1:
                 total_ideal += 1
@@ -170,7 +169,6 @@ def process_matrix_data(df, search_term, prod_col):
             
     return matrix_info, total_critical, total_warning, total_ideal, total_kosong, kolom_list, baris_list
 
-# Tangkap semua metrik yang baru
 matrix_info, total_critical, total_warning, total_ideal, total_kosong, kolom_list, baris_list = process_matrix_data(df, search_query, product_col)
 
 # ==========================================================
@@ -280,24 +278,21 @@ def show_rack_detail(k, b, info):
 # 8. RENDER METRIK & GRID UI (RESPONSIF & WARNA AMAN CSS)
 # ==========================================================
 
-# 5 KOLOM METRIK (Sesuai dengan Indikator Warna)
 col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
-# Hitung otomatis dari total seluruh status rak
 total_baris_hitung = total_ideal + total_warning + total_critical + total_kosong
 col_m1.metric("Total Baris Aktif", f"{total_baris_hitung} Baris")
 col_m2.metric("🟢 Rak Ideal (1 SKU)", f"{total_ideal} Baris")
-col_m3.metric("🟡 Rak Campur (2-3 SKU)", f"{total_warning} Baris")
-col_m4.metric("🔴 Rak Kritis (>= 4 SKU)", f"{total_critical} Baris")
+col_m3.metric("🟡 Rak Campur (2 SKU)", f"{total_warning} Baris")
+col_m4.metric("🔴 Rak Kritis (>= 3 SKU)", f"{total_critical} Baris")
 col_m5.metric("⚪ Rak Kosong Bersih", f"{total_kosong} Baris")
 st.divider()
 
-dynamic_css = """
-.block-container { max-width: 98% !important; padding-top: 2rem !important; padding-bottom: 2rem !important; }
-div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; }
-div[data-testid="stColumn"] { padding-left: 2px !important; padding-right: 2px !important; }
-div[data-testid="stColumn"]:nth-child(1) { display: flex; align-items: center; justify-content: center; }
-
-/* Styling Dasar Kotak Rak */
+# Menggunakan string biasa tanpa multiline string yang berisiko syntax error
+css_block_1 = ".block-container { max-width: 98% !important; padding-top: 2rem !important; padding-bottom: 2rem !important; }"
+css_block_2 = "div[data-testid=\"stHorizontalBlock\"] { flex-wrap: nowrap !important; }"
+css_block_3 = "div[data-testid=\"stColumn\"] { padding-left: 2px !important; padding-right: 2px !important; }"
+css_block_4 = "div[data-testid=\"stColumn\"]:nth-child(1) { display: flex; align-items: center; justify-content: center; }"
+css_btn = """
 div[class^="st-key-btn_"] button {
     aspect-ratio: 1/1 !important; 
     width: 100% !important; 
@@ -311,23 +306,15 @@ div[class^="st-key-btn_"] button {
     justify-content: center !important;
     font-weight: 900 !important;
 }
-
 div[class^="st-key-btn_"] button:hover { transform: scale(1.15); border: 2px solid #fff !important; z-index: 10; }
-
-/* Teks Angka yang Responsif (Otomatis menyesuaikan layar PC vs Tablet) */
 div[class^="st-key-btn_"] button p {
     margin: 0 !important;
     line-height: 1 !important;
     font-size: clamp(9px, 1.2vw, 14px) !important;
 }
-
-/* Penyesuaian Ekstrem Khusus Layar Tablet Portrait / Smartphone (Di bawah 800px) */
-@media (max-width: 800px) {
-    div[data-testid="stColumn"] { padding-left: 1px !important; padding-right: 1px !important; }
-    div[class^="st-key-btn_"] button { min-width: 15px !important; border-radius: 2px !important; }
-    div[data-testid="stColumn"]:nth-child(1) { font-size: 11px !important; }
-}
 """
+
+dynamic_css = f"{css_block_1}\n{css_block_2}\n{css_block_3}\n{css_block_4}\n{css_btn}"
 
 color_map = {
     'match': {"bg": "deepskyblue", "txt": "black", "sel": []},
@@ -344,12 +331,12 @@ for k in kolom_list:
         sku = info['sku_cnt']
         sel = f".st-key-btn_{k}_{b} button"
         
-        # LOGIKA PEWARNAAN BARU
+        # LOGIKA PEWARNAAN BARU: Hijau = 1 SKU, Kuning = 2 SKU, Merah >= 3 SKU
         if info['is_match']: color_map['match']['sel'].append(sel)
-        elif sku >= 4: color_map['critical']['sel'].append(sel)
-        elif sku in [2, 3]: color_map['warning']['sel'].append(sel) # 2-3 SKU (Kuning)
-        elif sku == 1: color_map['ideal']['sel'].append(sel)        # 1 SKU (Hijau)
-        else: color_map['empty']['sel'].append(sel)                 # 0 SKU (Abu-abu)
+        elif sku >= 3: color_map['critical']['sel'].append(sel)
+        elif sku == 2: color_map['warning']['sel'].append(sel)
+        elif sku == 1: color_map['ideal']['sel'].append(sel)
+        else: color_map['empty']['sel'].append(sel)
 
 for group in color_map.values():
     if group['sel']: 
