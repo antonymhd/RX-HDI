@@ -15,7 +15,7 @@ st.set_page_config(
 )
 
 # ==========================================================
-# 2. INIT FIREBASE
+# 2. INIT FIREBASE (DATABASE UJI COBA)
 # ==========================================================
 NAMA_DATABASE = 'uji_coba_rak'
 
@@ -71,7 +71,7 @@ mode_tampilan = st.sidebar.radio(
 )
 
 # ==========================================================
-# 5. MEMUAT DATA UTAMA & PENCARIAN
+# 5. MEMUAT DATA UTAMA & PENCARIAN (PRODUK / LOT)
 # ==========================================================
 st.title("📦 Visualisasi Grid Gudang (Live Monitor)")
 st.caption(f"Layar pantau Read-Only. Terhubung ke database: {NAMA_DATABASE}")
@@ -84,16 +84,34 @@ if df.empty or 'Kolom' not in df.columns:
 
 product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 
-st.sidebar.header("🔍 Cari Barang")
-if product_col in df.columns:
-    valid_mask = ~df['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])
-    df_valid = df[valid_mask]
-    daftar_barang = sorted(df_valid[product_col].dropna().astype(str).unique().tolist())
-else:
-    daftar_barang = []
-    
-pilihan_pencarian = st.sidebar.selectbox("Cari Posisi Barang:", options=["-- Tampilkan Semua --"] + daftar_barang)
-search_query = "" if pilihan_pencarian == "-- Tampilkan Semua --" else pilihan_pencarian
+st.sidebar.header("🔍 Pencarian Spesifik")
+tipe_cari = st.sidebar.radio("Metode Pencarian:", ["Berdasarkan Produk", "Berdasarkan No. Lot"])
+
+search_query = ""
+search_lot = ""
+
+if tipe_cari == "Berdasarkan Produk":
+    if product_col in df.columns:
+        valid_mask = ~df['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])
+        df_valid = df[valid_mask]
+        daftar_barang = sorted(df_valid[product_col].dropna().astype(str).unique().tolist())
+    else:
+        daftar_barang = []
+        
+    pilihan_pencarian = st.sidebar.selectbox("Pilih Produk:", options=["-- Tampilkan Semua --"] + daftar_barang)
+    search_query = "" if pilihan_pencarian == "-- Tampilkan Semua --" else pilihan_pencarian
+
+else: # Berdasarkan No. Lot
+    if 'Lot Number' in df.columns:
+        # Kecualikan data kosong atau strip
+        valid_mask = ~df['Lot Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>", "-", "0"])
+        df_lot_valid = df[valid_mask]
+        daftar_lot = sorted(df_lot_valid['Lot Number'].dropna().astype(str).unique().tolist())
+    else:
+        daftar_lot = []
+        
+    pilihan_lot = st.sidebar.selectbox("Pilih No. Lot:", options=["-- Tampilkan Semua --"] + daftar_lot)
+    search_lot = "" if pilihan_lot == "-- Tampilkan Semua --" else pilihan_lot
 
 # ==========================================================
 # 6. LOGIKA MATRIKS RAK (ANTI TYPE-ERROR)
@@ -103,7 +121,7 @@ def is_rack_exist(kolom, baris):
     if kolom == 'G' and baris < 17: return False
     return True
 
-def process_matrix_data(df, search_term, prod_col):
+def process_matrix_data(df, search_term, search_lot_term, prod_col):
     kolom_list = ['G', 'F', 'E', 'D', 'C', 'B', 'A']
     baris_list = list(range(1, 29))
     matrix_info = {}
@@ -140,12 +158,17 @@ def process_matrix_data(df, search_term, prod_col):
                 if not p_valid.empty:
                     is_all_box = bool(p_valid.str.upper().str.endswith(('D', 'G')).all())
                     
+                # LOGIKA PENCARIAN MATCHING KOTAK BIRU
                 if search_term:
                     m_part = p_series.str.contains(search_term, case=False, na=False, regex=False).any()
                     m_prod = False
                     if prod_col in sub.columns:
                         m_prod = sub[prod_col].astype(str).str.contains(search_term, case=False, na=False, regex=False).any()
                     is_match = bool(m_part or m_prod)
+                elif search_lot_term:
+                    if 'Lot Number' in sub.columns:
+                        l_series = sub['Lot Number'].astype(str).str.strip()
+                        is_match = l_series.str.contains(search_lot_term, case=False, na=False, regex=False).any()
             
             max_slot = int(32 if b <= 16 else 46) if is_all_box else int(31 if b <= 16 else 44)
             usable_space = max(0, max_slot - filled)
@@ -176,7 +199,7 @@ def process_matrix_data(df, search_term, prod_col):
             
     return matrix_info, total_critical, total_warning, total_ideal, total_kosong, total_slot_ideal, total_slot_warning, kolom_list, baris_list
 
-matrix_info, total_critical, total_warning, total_ideal, total_kosong, total_slot_ideal, total_slot_warning, kolom_list, baris_list = process_matrix_data(df, search_query, product_col)
+matrix_info, total_critical, total_warning, total_ideal, total_kosong, total_slot_ideal, total_slot_warning, kolom_list, baris_list = process_matrix_data(df, search_query, search_lot, product_col)
 
 # ==========================================================
 # 7. POP-UP DETAIL RAK (KALKULASI KONVERSI STOK)
