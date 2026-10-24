@@ -408,17 +408,28 @@ st.divider()
 render_grid_area("📍 Area 2 (Rak 17 - 28)", 17, 28)
 
 # ==========================================================
-# 9. DAFTAR LOKASI RAK BERDASARKAN STATUS WARNA
+# 9. DAFTAR LOKASI RAK & SARAN RELOKASI CERDAS (OPTIMASI)
 # ==========================================================
 st.divider()
-st.markdown("### 📋 Daftar Lokasi Berdasarkan Status Rak")
 
-list_merah = []
-list_kuning = []
-list_hijau = []
-list_abu = []
+# Fungsi pembantu untuk merapikan daftar rak per Blok (A, B, C...)
+def group_by_block(rack_list):
+    if not rack_list: return "Tidak ada rak."
+    grouped = {}
+    for r in rack_list:
+        k, b = r.split('-')
+        if k not in grouped: grouped[k] = []
+        grouped[k].append(r)
+    
+    res = ""
+    for k in sorted(grouped.keys()):
+        res += f"**Blok {k}:** {', '.join(grouped[k])}<br>"
+    return res
 
-# Ekstrak data dari matrix_info
+list_merah, list_kuning, list_hijau, list_abu = [], [], [], []
+rack_profiles = {}
+
+# Ekstrak data dan profil tiap rak untuk algoritma relokasi
 for k in kolom_list:
     for b in baris_list:
         info = matrix_info.get((k, b))
@@ -426,31 +437,106 @@ for k in kolom_list:
             sku = info['sku_cnt']
             lokasi = f"{k}-{b}"
             
-            if sku >= 3:
-                list_merah.append(lokasi)
-            elif sku == 2:
-                list_kuning.append(lokasi)
-            elif sku == 1:
-                list_hijau.append(lokasi)
-            elif sku == 0:
-                list_abu.append(lokasi)
+            if sku >= 3: list_merah.append(lokasi)
+            elif sku == 2: list_kuning.append(lokasi)
+            elif sku == 1: list_hijau.append(lokasi)
+            elif sku == 0: list_abu.append(lokasi)
+            
+            # Kumpulkan isi detail rak untuk analisa relokasi
+            df_sub = info['df_sub']
+            items = {}
+            if 'Part Number' in df_sub.columns:
+                valid_df = df_sub[~df_sub['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])]
+                for _, row in valid_df.iterrows():
+                    pn = str(row['Part Number']).strip().upper()
+                    prod = str(row.get('Nama Produk', pn)).strip()
+                    if pn not in items:
+                        items[pn] = {'qty': 0, 'name': prod}
+                    items[pn]['qty'] += 1
+                    
+            rack_profiles[(k, b)] = {
+                'sku_cnt': sku,
+                'usable': info['usable_space'],
+                'items': items
+            }
 
-# Tampilkan dalam bentuk 4 Kolom
+st.markdown("### 📋 Daftar Lokasi Berdasarkan Status Rak (Dikelompokkan per Blok)")
+
 col_list1, col_list2, col_list3, col_list4 = st.columns(4)
 
 with col_list1:
     st.markdown(f"**⚪ Kosong ({len(list_abu)} Rak)**")
-    teks_abu = ", ".join(list_abu) if list_abu else "Tidak ada rak kosong."
-    st.markdown(f"<div style='background-color: #f1f5f9; padding: 16px; border-radius: 8px; color: #475569; border: 1px solid #cbd5e1;'>{teks_abu}</div>", unsafe_allow_html=True)
+    st.markdown(f"<div style='background-color: #f8fafc; padding: 10px; border-radius: 6px; font-size: 13px; color: #475569; border: 1px solid #cbd5e1;'>{group_by_block(list_abu)}</div>", unsafe_allow_html=True)
 
 with col_list2:
     st.markdown(f"**🟢 Ideal ({len(list_hijau)} Rak)**")
-    st.success(", ".join(list_hijau) if list_hijau else "Tidak ada rak hijau.")
+    st.markdown(f"<div style='background-color: #f0fdf4; padding: 10px; border-radius: 6px; font-size: 13px; color: #166534; border: 1px solid #bbf7d0;'>{group_by_block(list_hijau)}</div>", unsafe_allow_html=True)
 
 with col_list3:
     st.markdown(f"**🟡 Campur ({len(list_kuning)} Rak)**")
-    st.warning(", ".join(list_kuning) if list_kuning else "Tidak ada rak kuning.")
+    st.markdown(f"<div style='background-color: #fefce8; padding: 10px; border-radius: 6px; font-size: 13px; color: #854d0e; border: 1px solid #fef08a;'>{group_by_block(list_kuning)}</div>", unsafe_allow_html=True)
 
 with col_list4:
     st.markdown(f"**🔴 Kritis ({len(list_merah)} Rak)**")
-    st.error(", ".join(list_merah) if list_merah else "Tidak ada rak merah.")
+    st.markdown(f"<div style='background-color: #fef2f2; padding: 10px; border-radius: 6px; font-size: 13px; color: #991b1b; border: 1px solid #fecaca;'>{group_by_block(list_merah)}</div>", unsafe_allow_html=True)
+
+
+st.divider()
+st.markdown("### 💡 Saran Relokasi Cerdas (Optimasi Rak Kritis)")
+st.caption("Algoritma mencari item di Rak Kritis (Merah) yang seluruh pallet-nya bisa dipindah ke Rak Campur (Kuning), Ideal (Hijau), atau Kosong demi mengurangi jumlah Rak Merah di gudang.")
+
+saran_list = []
+
+# ALGORITMA PENCARIAN SARAN RELOKASI
+for r_loc, r_prof in rack_profiles.items():
+    if r_prof['sku_cnt'] >= 3: # Hanya targetkan Rak Merah
+        for pn, item_data in r_prof['items'].items():
+            qty_to_move = item_data['qty']
+            nama_item = item_data['name']
+            
+            best_dest = None
+            best_score = -1
+            alasan = ""
+            
+            # Cari calon rak tujuan
+            for d_loc, d_prof in rack_profiles.items():
+                if r_loc == d_loc: continue
+                
+                # Pastikan rak tujuan punya sisa ruang yang muat untuk SEMUA pallet item ini
+                if d_prof['usable'] >= qty_to_move:
+                    score = -1
+                    # Prioritas 1: Pindah ke rak (Kuning/Hijau) yang SUDAH ADA item sejenis (Best Practice)
+                    if pn in d_prof['items']:
+                        score = 3
+                        alasan_temp = "Menggabungkan dengan item sejenis (Kapasitas Mumpuni)"
+                    # Prioritas 2: Pindah ke Rak Hijau yang beda item -> Mengubah Hijau jadi Kuning (Sesuai KPI KPI User)
+                    elif d_prof['sku_cnt'] == 1:
+                        score = 2
+                        alasan_temp = "Mengubah Rak Hijau menjadi Kuning (Kapasitas Mumpuni)"
+                    # Prioritas 3: Pindah ke Rak Kosong -> Mengubah Abu jadi Hijau
+                    elif d_prof['sku_cnt'] == 0:
+                        score = 1
+                        alasan_temp = "Mengisi Rak Kosong"
+                    
+                    if score > best_score:
+                        best_score = score
+                        best_dest = d_loc
+                        alasan = alasan_temp
+                        
+            if best_dest:
+                saran_list.append({
+                    'Dari Rak (Asal)': f"{r_loc[0]}-{r_loc[1]}",
+                    'Item yang Dipindah': f"{nama_item} (Total: {qty_to_move} Pallet)",
+                    'Ke Rak (Tujuan)': f"{best_dest[0]}-{best_dest[1]}",
+                    'Alasan / Efek': alasan,
+                    'Skor': best_score
+                })
+
+# Tampilkan Top 15 Saran Relokasi Terbaik
+if saran_list:
+    # Sortir: Prioritaskan penggabungan sejenis (Skor 3), lalu hijau ke kuning (Skor 2)
+    saran_list = sorted(saran_list, key=lambda x: x['Skor'], reverse=True)[:15]
+    df_saran = pd.DataFrame(saran_list).drop(columns=['Skor'])
+    st.dataframe(df_saran, use_container_width=True, hide_index=True)
+else:
+    st.success("🎉 Luar biasa! Saat ini tidak ada rak merah yang perlu direlokasi, atau kapasitas rak lain sedang penuh.")
