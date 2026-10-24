@@ -406,3 +406,51 @@ def render_grid_area(title, start_baris, end_baris):
 render_grid_area("📍 Area 1 (Rak 1 - 16)", 1, 16)
 st.divider()
 render_grid_area("📍 Area 2 (Rak 17 - 28)", 17, 28)
+
+# ==========================================================
+# 9. DAFTAR LOKASI RAK BERDASARKAN STATUS WARNA
+# ==========================================================
+st.divider()
+st.markdown("### 📋 Daftar Lokasi Berdasarkan Status Rak")
+
+list_merah = []
+list_kuning = []
+list_hijau = []
+list_abu = []
+
+# Ekstrak data dari matrix_info
+for k in kolom_list:
+    for b in baris_list:
+        info = matrix_info.get((k, b))
+        if info and info['exist']:
+            sku = info['sku_cnt']
+            lokasi = f"{k}-{b}"
+            
+            if sku >= 3:
+                list_merah.append(lokasi)
+            elif sku == 2:
+                list_kuning.append(lokasi)
+            elif sku == 1:
+                list_hijau.append(lokasi)
+            elif sku == 0:
+                list_abu.append(lokasi)
+
+# Tampilkan dalam bentuk 4 Kolom
+col_list1, col_list2, col_list3, col_list4 = st.columns(4)
+
+with col_list1:
+    st.markdown(f"**⚪ Kosong ({len(list_abu)} Rak)**")
+    teks_abu = ", ".join(list_abu) if list_abu else "Tidak ada rak kosong."
+    st.markdown(f"<div style='background-color: #f1f5f9; padding: 16px; border-radius: 8px; color: #475569; border: 1px solid #cbd5e1;'>{teks_abu}</div>", unsafe_allow_html=True)
+
+with col_list2:
+    st.markdown(f"**🟢 Ideal ({len(list_hijau)} Rak)**")
+    st.success(", ".join(list_hijau) if list_hijau else "Tidak ada rak hijau.")
+
+with col_list3:
+    st.markdown(f"**🟡 Campur ({len(list_kuning)} Rak)**")
+    st.warning(", ".join(list_kuning) if list_kuning else "Tidak ada rak kuning.")
+
+with col_list4:
+    st.markdown(f"**🔴 Kritis ({len(list_merah)} Rak)**")
+    st.error(", ".join(list_merah) if list_merah else "Tidak ada rak merah.")
