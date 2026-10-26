@@ -168,7 +168,6 @@ st.sidebar.caption("Memantau rak yang jumlah fisiknya melebihi kapasitas maksima
 bayangan_data = []
 rak_bermasalah = set()
 
-# Pindai seluruh rak untuk mencari catatan [BAYANGAN]
 for (k, b), info in matrix_info.items():
     if info['exist'] and not info['df_sub'].empty:
         df_sub = info['df_sub']
@@ -180,13 +179,10 @@ for (k, b), info in matrix_info.items():
                     bayangan_data.append(row.to_dict())
 
 if bayangan_data:
-    # Tampilkan daftar rak yang perlu dicek langsung di sidebar
     list_rak = ", ".join(sorted(list(rak_bermasalah)))
     st.sidebar.error(f"⚠️ **Ditemukan {len(rak_bermasalah)} Rak Overlimit:**\n\n{list_rak}")
     
     df_bayangan = pd.DataFrame(bayangan_data)
-    
-    # Susun dan rapikan data sebelum diekspor
     cols_awal = ['Kolom', 'Baris', 'Pallet Ke', 'Part Number', 'Nama Produk', 'Lot Number', 'Keterangan', 'Catatan']
     cols_tersedia = [c for c in cols_awal if c in df_bayangan.columns]
     df_bayangan = df_bayangan[cols_tersedia]
@@ -277,7 +273,7 @@ def show_rack_detail(k, b, info):
         df_tampil = df_terisi[avail].copy()
         if 'Pallet Ke' in df_tampil.columns: df_tampil = df_tampil.sort_values(by='Pallet Ke', ascending=True)
             
-       def highlight_bayangan(row):
+        def highlight_bayangan(row):
             cat = str(row.get('Catatan', '')).upper()
             if 'BAYANGAN' in cat:
                 return ['background-color: #fef2f2; color: #991b1b; font-weight: bold;'] * len(row)
@@ -443,7 +439,6 @@ for r_loc, r_prof in rack_profiles.items():
             for d_loc, d_prof in rack_profiles.items():
                 if r_loc == d_loc: continue
                 
-                # Syarat utama: Ruang muat & Rak tujuan BUKAN rak Kuning (maks 1 SKU saat ini)
                 if d_prof['usable'] >= qty_to_move and d_prof['sku_cnt'] < 2:
                     score = -1
                     
