@@ -277,9 +277,12 @@ def show_rack_detail(k, b, info):
         df_tampil = df_terisi[avail].copy()
         if 'Pallet Ke' in df_tampil.columns: df_tampil = df_tampil.sort_values(by='Pallet Ke', ascending=True)
             
-        def highlight_bayangan(row):
-            if 'BAYANGAN' in str(row.get('Catatan', '')).upper():
+       def highlight_bayangan(row):
+            cat = str(row.get('Catatan', '')).upper()
+            if 'BAYANGAN' in cat:
                 return ['background-color: #fef2f2; color: #991b1b; font-weight: bold;'] * len(row)
+            elif 'BOOKED' in cat:
+                return ['background-color: #eff6ff; color: #1e3a8a; font-weight: bold; border-left: 4px solid #2563eb;'] * len(row)
             return [''] * len(row)
             
         styled_df = df_tampil.style.apply(highlight_bayangan, axis=1)
