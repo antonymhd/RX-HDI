@@ -415,8 +415,8 @@ with col_list4:
     st.markdown(f"<div style='background-color: #fef2f2; padding: 10px; border-radius: 6px; font-size: 13px; color: #991b1b; border: 1px solid #fecaca;'>{group_by_block(list_merah)}</div>", unsafe_allow_html=True)
 
 st.divider()
-st.markdown("### 💡 Saran Relokasi Cerdas (Optimasi Rak Kritis)")
-st.caption("Algoritma mencari item di Rak Kritis (Merah) yang seluruh pallet-nya bisa dipindah ke Rak Campur (Kuning), Ideal (Hijau), atau Kosong demi mengurangi jumlah Rak Merah di gudang.")
+st.markdown("### 💡 Saran Relokasi (Optimasi Rak Kritis)")
+st.caption("Algoritma mencari item di Rak Kritis (Merah) yang seluruh pallet-nya bisa dipindah ke Rak Ideal (Hijau), atau Kosong demi mengurangi jumlah Rak Merah. (Rak Kuning tidak akan ditambah produk lagi agar maksimal 2 jenis item per rak).")
 
 saran_list = []
 
@@ -430,11 +430,17 @@ for r_loc, r_prof in rack_profiles.items():
             
             for d_loc, d_prof in rack_profiles.items():
                 if r_loc == d_loc: continue
-                if d_prof['usable'] >= qty_to_move:
+                
+                # Syarat utama: Ruang muat & Rak tujuan BUKAN rak Kuning (maks 1 SKU saat ini)
+                if d_prof['usable'] >= qty_to_move and d_prof['sku_cnt'] < 2:
                     score = -1
-                    if pn in d_prof['items']: score, alasan_temp = 3, "Menggabungkan dengan item sejenis (Kapasitas Mumpuni)"
-                    elif d_prof['sku_cnt'] == 1: score, alasan_temp = 2, "Mengubah Rak Hijau menjadi Kuning (Kapasitas Mumpuni)"
-                    elif d_prof['sku_cnt'] == 0: score, alasan_temp = 1, "Mengisi Rak Kosong"
+                    
+                    if d_prof['sku_cnt'] == 1 and pn in d_prof['items']: 
+                        score, alasan_temp = 3, "Menggabungkan dengan item sejenis di Rak Ideal (Hijau)"
+                    elif d_prof['sku_cnt'] == 1 and pn not in d_prof['items']: 
+                        score, alasan_temp = 2, "Mengubah Rak Ideal (Hijau) menjadi Campur (Kuning)"
+                    elif d_prof['sku_cnt'] == 0: 
+                        score, alasan_temp = 1, "Mengisi Rak Kosong"
                     
                     if score > best_score:
                         best_score, best_dest, alasan = score, d_loc, alasan_temp
