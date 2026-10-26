@@ -159,44 +159,53 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
 matrix_info, total_critical, total_warning, total_ideal, total_kosong, total_slot_ideal, total_slot_warning, kolom_list, baris_list = process_matrix_data(df, search_query, search_lot, product_col)
 
 # ----------------------------------------------------------
-# FITUR UNDUH SNAPSHOT STOK SELURUH GUDANG DI SIDEBAR
+# FITUR PANTAU RAK OVERLIMIT / ABNORMAL (BAYANGAN)
 # ----------------------------------------------------------
 st.sidebar.divider()
-st.sidebar.header("📥 Ekspor Data (Snapshot)")
-st.sidebar.caption("Unduh seluruh status rak saat ini, termasuk pallet bayangan.")
+st.sidebar.header("🚨 Peringatan Rak Overlimit")
+st.sidebar.caption("Memantau rak yang jumlah fisiknya melebihi kapasitas maksimal sistem. Wajib cek lapangan!")
 
-if st.sidebar.button("Unduh Laporan Stok Gudang", use_container_width=True):
-    export_data = []
-    for (k, b), info in matrix_info.items():
-        if info['exist'] and not info['df_sub'].empty:
-            df_sub = info['df_sub']
-            valid_df = df_sub[~df_sub['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])]
-            for _, row in valid_df.iterrows():
-                export_data.append(row.to_dict())
+bayangan_data = []
+rak_bermasalah = set()
+
+# Pindai seluruh rak untuk mencari catatan [BAYANGAN]
+for (k, b), info in matrix_info.items():
+    if info['exist'] and not info['df_sub'].empty:
+        df_sub = info['df_sub']
+        if 'Catatan' in df_sub.columns:
+            anomali = df_sub[df_sub['Catatan'].astype(str).str.contains('BAYANGAN', case=False, na=False)]
+            if not anomali.empty:
+                rak_bermasalah.add(f"{k}-{b}")
+                for _, row in anomali.iterrows():
+                    bayangan_data.append(row.to_dict())
+
+if bayangan_data:
+    # Tampilkan daftar rak yang perlu dicek langsung di sidebar
+    list_rak = ", ".join(sorted(list(rak_bermasalah)))
+    st.sidebar.error(f"⚠️ **Ditemukan {len(rak_bermasalah)} Rak Overlimit:**\n\n{list_rak}")
     
-    if export_data:
-        df_export = pd.DataFrame(export_data)
+    df_bayangan = pd.DataFrame(bayangan_data)
+    
+    # Susun dan rapikan data sebelum diekspor
+    cols_awal = ['Kolom', 'Baris', 'Pallet Ke', 'Part Number', 'Nama Produk', 'Lot Number', 'Keterangan', 'Catatan']
+    cols_tersedia = [c for c in cols_awal if c in df_bayangan.columns]
+    df_bayangan = df_bayangan[cols_tersedia]
+    
+    if all(c in df_bayangan.columns for c in ['Kolom', 'Baris', 'Pallet Ke']):
+        df_bayangan['Baris'] = pd.to_numeric(df_bayangan['Baris'], errors='coerce')
+        df_bayangan['Pallet Ke'] = pd.to_numeric(df_bayangan['Pallet Ke'], errors='coerce')
+        df_bayangan = df_bayangan.sort_values(by=['Kolom', 'Baris', 'Pallet Ke'])
         
-        cols_awal = ['Kolom', 'Baris', 'Pallet Ke', 'Part Number', 'Nama Produk', 'Lot Number', 'Keterangan', 'Catatan', 'Status']
-        cols_tersedia = [c for c in cols_awal if c in df_export.columns]
-        cols_sisa = [c for c in df_export.columns if c not in cols_tersedia]
-        df_export = df_export[cols_tersedia + cols_sisa]
-        
-        if all(c in df_export.columns for c in ['Kolom', 'Baris', 'Pallet Ke']):
-            df_export['Baris'] = pd.to_numeric(df_export['Baris'], errors='coerce')
-            df_export['Pallet Ke'] = pd.to_numeric(df_export['Pallet Ke'], errors='coerce')
-            df_export = df_export.sort_values(by=['Kolom', 'Baris', 'Pallet Ke'])
-        
-        csv = df_export.to_csv(index=False, sep=";").encode('utf-8-sig')
-        st.sidebar.download_button(
-            label="⬇️ Simpan CSV Sekarang",
-            data=csv,
-            file_name=f"Snapshot_Gudang_{(datetime.utcnow() + timedelta(hours=7)).strftime('%Y%m%d_%H%M')}.csv",
-            mime="text/csv",
-            type="primary"
-        )
-    else:
-        st.sidebar.warning("Gudang kosong, tidak ada data untuk diunduh.")
+    csv = df_bayangan.to_csv(index=False, sep=";").encode('utf-8-sig')
+    st.sidebar.download_button(
+        label="📥 Unduh Daftar Pallet Bayangan",
+        data=csv,
+        file_name=f"Cek_Lapangan_Overlimit_{(datetime.utcnow() + timedelta(hours=7)).strftime('%Y%m%d_%H%M')}.csv",
+        mime="text/csv",
+        type="primary"
+    )
+else:
+    st.sidebar.success("✅ Seluruh rak dalam batas kapasitas normal. Tidak ada pallet bayangan.")
 
 # ==========================================================
 # 7. POP-UP DETAIL RAK (KALKULASI Pcs & STYLING BAYANGAN)
