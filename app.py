@@ -139,7 +139,6 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
                     if 'Lot Number' in sub.columns:
                         is_match = sub['Lot Number'].astype(str).str.strip().str.contains(search_lot_term, case=False, na=False, regex=False).any()
             
-            # Dinamis: 32/46 untuk Box, 31/44 untuk Non-Box
             max_slot = int(32 if b <= 16 else 46) if is_all_box else int(31 if b <= 16 else 44)
             usable_space = max(0, max_slot - filled)
             
@@ -362,7 +361,7 @@ st.divider()
 render_grid_area("📍 Area 2 (Rak 17 - 28)", 17, 28)
 
 # ==========================================================
-# 9. DAFTAR LOKASI RAK & SARAN RELOKASI CERDAS (OPTIMASI)
+# 9. DAFTAR LOKASI RAK & SARAN RELOKASI (BERBASIS POSISI UJUNG & LOT TERMUDA)
 # ==========================================================
 st.divider()
 
@@ -378,6 +377,19 @@ def group_by_block(rack_list):
     for k in sorted(grouped.keys()):
         res += f"**Blok {k}:** {', '.join(grouped[k])}<br>"
     return res
+
+def parse_lot_date(lot_str):
+    cleaned = str(lot_str).strip()
+    if len(cleaned) >= 6:
+        date_str = cleaned[-6:]
+        try:
+            day = int(date_str[0:2])
+            month = int(date_str[2:4])
+            year = int('20' + date_str[4:6])
+            return datetime(year, month, day)
+        except:
+            return datetime(1900, 1, 1)
+    return datetime(1900, 1, 1)
 
 list_merah, list_kuning, list_hijau, list_abu = [], [], [], []
 rack_profiles = {}
@@ -395,16 +407,25 @@ for k in kolom_list:
             elif sku == 0: list_abu.append(lokasi)
             
             df_sub = info['df_sub']
-            items = {}
+            pallets_data = []
             if 'Part Number' in df_sub.columns:
                 valid_df = df_sub[~df_sub['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])]
                 for _, row in valid_df.iterrows():
                     pn = str(row['Part Number']).strip().upper()
                     prod = str(row.get('Nama Produk', pn)).strip()
-                    if pn not in items: items[pn] = {'qty': 0, 'name': prod}
-                    items[pn]['qty'] += 1
+                    lot = str(row.get('Lot Number', '')).strip()
+                    pallet_ke = int(row.get('Pallet Ke', 0))
+                    lot_date = parse_lot_date(lot)
                     
-            rack_profiles[(k, b)] = {'sku_cnt': sku, 'usable': info['usable_space'], 'items': items}
+                    pallets_data.append({
+                        'part_number': pn,
+                        'name': prod,
+                        'lot': lot,
+                        'pallet_ke': pallet_ke,
+                        'lot_date': lot_date
+                    })
+                    
+            rack_profiles[(k, b)] = {'sku_cnt': sku, 'usable': info['usable_space'], 'pallets': pallets_data}
 
 st.markdown("### 📋 Daftar Lokasi Berdasarkan Status Rak (Dikelompokkan per Blok)")
 
@@ -423,16 +444,30 @@ with col_list4:
     st.markdown(f"<div style='background-color: #fef2f2; padding: 10px; border-radius: 6px; font-size: 13px; color: #991b1b; border: 1px solid #fecaca;'>{group_by_block(list_merah)}</div>", unsafe_allow_html=True)
 
 st.divider()
-st.markdown("### 💡 Saran Relokasi (Optimasi Rak Kritis)")
-st.caption("Algoritma mencari item di Rak Kritis (Merah) yang seluruh pallet-nya bisa dipindah ke Rak Ideal (Hijau), atau Kosong demi mengurangi jumlah Rak Merah. (Rak Kuning tidak akan ditambah produk lagi agar maksimal 2 jenis item per rak).")
+st.markdown("### 💡 Saran Relokasi Cerdas (Fokus Posisi Ujung Depan/Belakang & Lot Termuda)")
+st.caption("Algoritma hanya menyaring item yang berada di **ujung Belakang (Pallet Ke besar)** atau **ujung Depan (Pallet Ke = 1)** dengan prioritas utama di **Belakang** (agar tidak mengganggu akses Outbound) serta memiliki No. Lot tanggal produksi termuda/terbaru.")
 
 saran_list = []
 
 for r_loc, r_prof in rack_profiles.items():
-    if r_prof['sku_cnt'] >= 3:
-        for pn, item_data in r_prof['items'].items():
-            qty_to_move = item_data['qty']
-            nama_item = item_data['name']
+    if r_prof['sku_cnt'] >= 3 and r_prof['pallets']:
+        max_pallet = max(p['pallet_ke'] for p in r_prof['pallets'])
+        
+        target_candidates = [p for p in r_prof['pallets'] if p['pallet_ke'] == max_pallet or p['pallet_ke'] == 1]
+        
+        if target_candidates:
+            target_candidates = sorted(target_candidates, key=lambda x: (x['pallet_ke'] == max_pallet, x['lot_date']), reverse=True)
+            target_pallet = target_candidates[0]
+            
+            pn_to_move = target_pallet['part_number']
+            nama_item = target_pallet['name']
+            lot_target = target_pallet['lot']
+            pos_pallet = target_pallet['pallet_ke']
+            
+            posisi_teks = "Ujung Belakang" if pos_pallet == max_pallet else "Ujung Depan"
+            
+            matching_pallets = [p for p in r_prof['pallets'] if p['part_number'] == pn_to_move]
+            qty_to_move = len(matching_pallets)
             
             best_dest, best_score, alasan = None, -1, ""
             
@@ -441,13 +476,14 @@ for r_loc, r_prof in rack_profiles.items():
                 
                 if d_prof['usable'] >= qty_to_move and d_prof['sku_cnt'] < 2:
                     score = -1
+                    dest_items_pn = [p['part_number'] for p in d_prof['pallets']]
                     
-                    if d_prof['sku_cnt'] == 1 and pn in d_prof['items']: 
-                        score, alasan_temp = 3, "Menggabungkan dengan item sejenis di Rak Ideal (Hijau)"
-                    elif d_prof['sku_cnt'] == 1 and pn not in d_prof['items']: 
-                        score, alasan_temp = 2, "Mengubah Rak Ideal (Hijau) menjadi Campur (Kuning)"
+                    if d_prof['sku_cnt'] == 1 and pn_to_move in dest_items_pn: 
+                        score, alasan_temp = 3, f"Digabung ke item sejenis di Rak Ideal | Diambil dari **{posisi_teks}** (#{pos_pallet}, Lot: {lot_target})"
+                    elif d_prof['sku_cnt'] == 1 and pn_to_move not in dest_items_pn: 
+                        score, alasan_temp = 2, f"Mengubah Rak Ideal jadi Campur | Diambil dari **{posisi_teks}** (#{pos_pallet}, Lot: {lot_target})"
                     elif d_prof['sku_cnt'] == 0: 
-                        score, alasan_temp = 1, "Mengisi Rak Kosong"
+                        score, alasan_temp = 1, f"Dipindah ke Rak Kosong | Diambil dari **{posisi_teks}** (#{pos_pallet}, Lot: {lot_target})"
                     
                     if score > best_score:
                         best_score, best_dest, alasan = score, d_loc, alasan_temp
@@ -455,15 +491,22 @@ for r_loc, r_prof in rack_profiles.items():
             if best_dest:
                 saran_list.append({
                     'Dari Rak (Asal)': f"{r_loc[0]}-{r_loc[1]}",
-                    'Item yang Dipindah': f"{nama_item} (Total: {qty_to_move} Pallet)",
+                    'Item & Lot Prioritas Pindah': f"{nama_item} (Lot: {lot_target})",
+                    'Jumlah Pallet': f"{qty_to_move} Pallet",
                     'Ke Rak (Tujuan)': f"{best_dest[0]}-{best_dest[1]}",
-                    'Alasan / Efek': alasan,
+                    'Analisis Dasar Relokasi': alasan,
                     'Skor': best_score
                 })
 
 if saran_list:
-    saran_list = sorted(saran_list, key=lambda x: x['Skor'], reverse=True)[:15]
-    df_saran = pd.DataFrame(saran_list).drop(columns=['Skor'])
+    seen_asal = set()
+    unique_saran = []
+    for s in sorted(saran_list, key=lambda x: x['Skor'], reverse=True):
+        if s['Dari Rak (Asal)'] not in seen_asal:
+            seen_asal.add(s['Dari Rak (Asal)'])
+            unique_saran.append(s)
+            
+    df_saran = pd.DataFrame(unique_saran[:12]).drop(columns=['Skor'])
     st.dataframe(df_saran, use_container_width=True, hide_index=True)
 else:
-    st.success("🎉 Luar biasa! Saat ini tidak ada rak merah yang perlu direlokasi, atau kapasitas rak lain sedang penuh.")
+    st.success("🎉 Luar biasa! Saat ini tidak ada rak merah yang memenuhi kriteria relokasi dari ujung depan/belakang.")
