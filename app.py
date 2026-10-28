@@ -267,11 +267,16 @@ def show_rack_detail(k, b, info):
         st.dataframe(pd.DataFrame(rekap_data), use_container_width=True, hide_index=True)
         st.write("") 
         
-        st.markdown("#### 📑 Rincian Posisi per Pallet")
+        st.markdown("#### 📑 Rincian Posisi per Pallet & Cek Lapangan")
+        st.caption("Gunakan kotak centang (✅) di sebelah kiri saat melakukan audit fisik di lapangan. Kolom lainnya dikunci agar data aman dari perubahan tidak sengaja.")
+        
         avail = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', product_col, 'Keterangan', 'Catatan'] if c in df_terisi.columns]
         df_tampil = df_terisi[avail].copy()
         if 'Pallet Ke' in df_tampil.columns: df_tampil = df_tampil.sort_values(by='Pallet Ke', ascending=True)
             
+        # --- PENAMBAHAN KOLOM CHECKLIST ---
+        df_tampil.insert(0, "✅ Cek Fisik", False)
+        
         def highlight_bayangan(row):
             cat = str(row.get('Catatan', '')).upper()
             if 'BAYANGAN' in cat:
@@ -281,7 +286,14 @@ def show_rack_detail(k, b, info):
             return [''] * len(row)
             
         styled_df = df_tampil.style.apply(highlight_bayangan, axis=1)
-        st.dataframe(styled_df, use_container_width=True, hide_index=True)
+        
+        # --- PENGGUNAAN ST.DATA_EDITOR SEBAGAI PENGGANTI ST.DATAFRAME ---
+        st.data_editor(
+            styled_df, 
+            use_container_width=True, 
+            hide_index=True,
+            disabled=[c for c in df_tampil.columns if c != "✅ Cek Fisik"] # Kunci semua kolom KECUALI checkbox
+        )
     else:
         st.success("✅ Rak Kosong. Aman untuk diisi.")
 
