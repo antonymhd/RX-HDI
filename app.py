@@ -11,9 +11,9 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="Warehouse 2D Racking", page_icon="📦", layout="wide", initial_sidebar_state="expanded")
 
 # ==========================================================
-# 2. INIT FIREBASE (DATABASE PRODUKSI UTAMA)
+# 2. INIT FIREBASE (DATABASE UJI COBA)
 # ==========================================================
-NAMA_DATABASE = 'gudang_hdi_utama'
+NAMA_DATABASE = 'uji_coba_rak'
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(dict(st.secrets["firebase"]))
@@ -96,7 +96,7 @@ else:
     search_lot = "" if pilihan_lot == "-- Tampilkan Semua --" else pilihan_lot
 
 # ==========================================================
-# 6. LOGIKA MATRIKS RAK & PEMROSESAN STOK
+# 6. LOGIKA MATRIKS RAK (MEMBACA KAPASITAS BOX & KARUNG)
 # ==========================================================
 def is_rack_exist(kolom, baris):
     if kolom == 'F' and baris < 5: return False
@@ -158,7 +158,7 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
 matrix_info, total_critical, total_warning, total_ideal, total_kosong, total_slot_ideal, total_slot_warning, kolom_list, baris_list = process_matrix_data(df, search_query, search_lot, product_col)
 
 # ----------------------------------------------------------
-# PEMANTAUAN PALLET BAYANGAN (OVERLIMIT)
+# FITUR PANTAU RAK OVERLIMIT / ABNORMAL (BAYANGAN)
 # ----------------------------------------------------------
 st.sidebar.divider()
 st.sidebar.header("🚨 Peringatan Rak Overlimit")
@@ -200,10 +200,10 @@ if bayangan_data:
         type="primary"
     )
 else:
-    st.sidebar.success("✅ Seluruh rak dalam batas kapasitas normal.")
+    st.sidebar.success("✅ Seluruh rak dalam batas kapasitas normal. Tidak ada pallet bayangan.")
 
 # ==========================================================
-# 7. POP-UP DETAIL RAK
+# 7. POP-UP DETAIL RAK (KALKULASI Pcs & STYLING BAYANGAN)
 # ==========================================================
 @st.dialog("📦 Rincian Detail Rak", width="large")
 def show_rack_detail(k, b, info):
@@ -286,7 +286,7 @@ def show_rack_detail(k, b, info):
         st.success("✅ Rak Kosong. Aman untuk diisi.")
 
 # ==========================================================
-# 8. RENDER METRIK & GRID UI
+# 8. RENDER METRIK & GRID UI (WARNA AMAN CSS)
 # ==========================================================
 col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
 total_baris_hitung = total_ideal + total_warning + total_critical + total_kosong
@@ -313,18 +313,3 @@ div[class^="st-key-btn_"] button {
 }
 div[class^="st-key-btn_"] button:hover { transform: scale(1.15); border: 2px solid #fff !important; z-index: 10; }
 div[class^="st-key-btn_"] button p { margin: 0 !important; line-height: 1 !important; font-size: clamp(9px, 1.2vw, 14px) !important; }
-'''
-
-dynamic_css = f"{css_block_1}\n{css_block_2}\n{css_block_3}\n{css_block_4}\n{css_btn}"
-color_map = {'match': {"bg": "deepskyblue", "txt": "black", "sel": []}, 'critical': {"bg": "crimson", "txt": "white", "sel": []}, 'warning': {"bg": "gold", "txt": "black", "sel": []}, 'ideal': {"bg": "palegreen", "txt": "black", "sel": []}, 'empty': {"bg": "gainsboro", "txt": "gray", "sel": []}}
-
-for k in kolom_list:
-    for b in baris_list:
-        info = matrix_info.get((k, b))
-        if not info or not info['exist']: continue
-        sku = info['sku_cnt']
-        sel = f".st-key-btn_{k}_{b} button"
-        
-        if info['is_match']: color_map['match']['sel'].append(sel)
-        elif sku >= 3: color_map['critical']['sel'].append(sel)
-        elif sku == 2: color_map['warning']['sel'].append(sel)
