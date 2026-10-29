@@ -361,7 +361,7 @@ st.divider()
 render_grid_area("📍 Area 2 (Rak 17 - 28)", 17, 28)
 
 # ==========================================================
-# 9. DAFTAR LOKASI RAK & SARAN RELOKASI (BERBASIS POSISI UJUNG & LOT TERMUDA)
+# 9. DAFTAR LOKASI RAK & SARAN RELOKASI (FOKUS UJUNG DEPAN)
 # ==========================================================
 st.divider()
 
@@ -444,19 +444,22 @@ with col_list4:
     st.markdown(f"<div style='background-color: #fef2f2; padding: 10px; border-radius: 6px; font-size: 13px; color: #991b1b; border: 1px solid #fecaca;'>{group_by_block(list_merah)}</div>", unsafe_allow_html=True)
 
 st.divider()
-st.markdown("### 💡 Saran Relokasi Cerdas (Fokus Posisi Ujung Depan/Belakang & Lot Termuda)")
-st.caption("Algoritma hanya menyaring item yang berada di **ujung Belakang (Pallet Ke besar)** atau **ujung Depan (Pallet Ke = 1)** dengan prioritas utama di **Belakang** (agar tidak mengganggu akses Outbound) serta memiliki No. Lot tanggal produksi termuda/terbaru.")
+st.markdown("### 💡 Saran Relokasi Cerdas (Fokus Eksekusi dari Ujung DEPAN)")
+st.caption("Karena tim Outbound sedang memiliki waktu luang, **algoritma ini secara khusus mencari dan menargetkan item yang berada paling depan (Pallet Ke = 1)** di rak-rak kritis agar tim Outbound bisa menariknya dengan mudah tanpa hambatan fisik dari barang lain.")
 
 saran_list = []
 
 for r_loc, r_prof in rack_profiles.items():
     if r_prof['sku_cnt'] >= 3 and r_prof['pallets']:
-        max_pallet = max(p['pallet_ke'] for p in r_prof['pallets'])
+        # Mencari posisi fisik yang paling depan (idealnya Pallet Ke = 1)
+        min_pallet = min(p['pallet_ke'] for p in r_prof['pallets'])
         
-        target_candidates = [p for p in r_prof['pallets'] if p['pallet_ke'] == max_pallet or p['pallet_ke'] == 1]
+        # Saring hanya kandidat yang berada di baris terdepan tersebut
+        target_candidates = [p for p in r_prof['pallets'] if p['pallet_ke'] == min_pallet]
         
         if target_candidates:
-            target_candidates = sorted(target_candidates, key=lambda x: (x['pallet_ke'] == max_pallet, x['lot_date']), reverse=True)
+            # Sortir berdasarkan tanggal produksi termuda (jika ada lebih dari 1 item di urutan terdepan)
+            target_candidates = sorted(target_candidates, key=lambda x: x['lot_date'], reverse=False)
             target_pallet = target_candidates[0]
             
             pn_to_move = target_pallet['part_number']
@@ -464,26 +467,29 @@ for r_loc, r_prof in rack_profiles.items():
             lot_target = target_pallet['lot']
             pos_pallet = target_pallet['pallet_ke']
             
-            posisi_teks = "Ujung Belakang" if pos_pallet == max_pallet else "Ujung Depan"
+            posisi_teks = "Ujung Depan"
             
+            # Hitung total palet item tersebut yang perlu dipindahkan
             matching_pallets = [p for p in r_prof['pallets'] if p['part_number'] == pn_to_move]
             qty_to_move = len(matching_pallets)
             
             best_dest, best_score, alasan = None, -1, ""
             
+            # Cari rak tujuan yang paling sesuai
             for d_loc, d_prof in rack_profiles.items():
                 if r_loc == d_loc: continue
                 
+                # Hanya rak yang cukup ruang dan statusnya Ideal atau Kosong
                 if d_prof['usable'] >= qty_to_move and d_prof['sku_cnt'] < 2:
                     score = -1
                     dest_items_pn = [p['part_number'] for p in d_prof['pallets']]
                     
                     if d_prof['sku_cnt'] == 1 and pn_to_move in dest_items_pn: 
-                        score, alasan_temp = 3, f"Digabung ke item sejenis di Rak Ideal | Diambil dari **{posisi_teks}** (#{pos_pallet}, Lot: {lot_target})"
+                        score, alasan_temp = 3, f"Gabung ke item sejenis di Rak Ideal | Diambil lewat **{posisi_teks}** (#{pos_pallet}, Lot: {lot_target})"
                     elif d_prof['sku_cnt'] == 1 and pn_to_move not in dest_items_pn: 
-                        score, alasan_temp = 2, f"Mengubah Rak Ideal jadi Campur | Diambil dari **{posisi_teks}** (#{pos_pallet}, Lot: {lot_target})"
+                        score, alasan_temp = 2, f"Ubah Rak Ideal jadi Campur | Diambil lewat **{posisi_teks}** (#{pos_pallet}, Lot: {lot_target})"
                     elif d_prof['sku_cnt'] == 0: 
-                        score, alasan_temp = 1, f"Dipindah ke Rak Kosong | Diambil dari **{posisi_teks}** (#{pos_pallet}, Lot: {lot_target})"
+                        score, alasan_temp = 1, f"Pindah ke Rak Kosong | Diambil lewat **{posisi_teks}** (#{pos_pallet}, Lot: {lot_target})"
                     
                     if score > best_score:
                         best_score, best_dest, alasan = score, d_loc, alasan_temp
@@ -492,15 +498,16 @@ for r_loc, r_prof in rack_profiles.items():
                 saran_list.append({
                     'Dari Rak (Asal)': f"{r_loc[0]}-{r_loc[1]}",
                     'Item & Lot Prioritas Pindah': f"{nama_item} (Lot: {lot_target})",
-                    'Jumlah Pallet': f"{qty_to_move} Pallet",
+                    'Jml Tarik': f"{qty_to_move} Pallet",
                     'Ke Rak (Tujuan)': f"{best_dest[0]}-{best_dest[1]}",
-                    'Analisis Dasar Relokasi': alasan,
+                    'Analisis Relokasi (Via Outbound)': alasan,
                     'Skor': best_score
                 })
 
 if saran_list:
     seen_asal = set()
     unique_saran = []
+    # Mengurutkan rekomendasi terbaik
     for s in sorted(saran_list, key=lambda x: x['Skor'], reverse=True):
         if s['Dari Rak (Asal)'] not in seen_asal:
             seen_asal.add(s['Dari Rak (Asal)'])
@@ -509,4 +516,4 @@ if saran_list:
     df_saran = pd.DataFrame(unique_saran[:12]).drop(columns=['Skor'])
     st.dataframe(df_saran, use_container_width=True, hide_index=True)
 else:
-    st.success("🎉 Luar biasa! Saat ini tidak ada rak merah yang memenuhi kriteria relokasi dari ujung depan/belakang.")
+    st.success("🎉 Saat ini tidak ada rak merah yang bisa direlokasi dari sisi depan.")
