@@ -11,9 +11,9 @@ from datetime import datetime, timedelta
 st.set_page_config(page_title="Warehouse 2D Racking", page_icon="📦", layout="wide", initial_sidebar_state="expanded")
 
 # ==========================================================
-# 2. INIT FIREBASE (DATABASE UJI COBA)
+# 2. INIT FIREBASE (DATABASE PRODUKSI UTAMA)
 # ==========================================================
-NAMA_DATABASE = 'uji_coba_rak'
+NAMA_DATABASE = 'gudang_hdi_utama'
 
 if not firebase_admin._apps:
     cred = credentials.Certificate(dict(st.secrets["firebase"]))
@@ -96,7 +96,7 @@ else:
     search_lot = "" if pilihan_lot == "-- Tampilkan Semua --" else pilihan_lot
 
 # ==========================================================
-# 6. LOGIKA MATRIKS RAK (MEMBACA KAPASITAS BOX & KARUNG)
+# 6. LOGIKA MATRIKS RAK & PEMROSESAN STOK
 # ==========================================================
 def is_rack_exist(kolom, baris):
     if kolom == 'F' and baris < 5: return False
@@ -158,7 +158,7 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
 matrix_info, total_critical, total_warning, total_ideal, total_kosong, total_slot_ideal, total_slot_warning, kolom_list, baris_list = process_matrix_data(df, search_query, search_lot, product_col)
 
 # ----------------------------------------------------------
-# FITUR PANTAU RAK OVERLIMIT / ABNORMAL (BAYANGAN)
+# PEMANTAUAN PALLET BAYANGAN (OVERLIMIT)
 # ----------------------------------------------------------
 st.sidebar.divider()
 st.sidebar.header("🚨 Peringatan Rak Overlimit")
@@ -200,10 +200,10 @@ if bayangan_data:
         type="primary"
     )
 else:
-    st.sidebar.success("✅ Seluruh rak dalam batas kapasitas normal. Tidak ada pallet bayangan.")
+    st.sidebar.success("✅ Seluruh rak dalam batas kapasitas normal.")
 
 # ==========================================================
-# 7. POP-UP DETAIL RAK (KALKULASI Pcs & STYLING BAYANGAN)
+# 7. POP-UP DETAIL RAK
 # ==========================================================
 @st.dialog("📦 Rincian Detail Rak", width="large")
 def show_rack_detail(k, b, info):
@@ -286,7 +286,7 @@ def show_rack_detail(k, b, info):
         st.success("✅ Rak Kosong. Aman untuk diisi.")
 
 # ==========================================================
-# 8. RENDER METRIK & GRID UI (WARNA AMAN CSS)
+# 8. RENDER METRIK & GRID UI
 # ==========================================================
 col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
 total_baris_hitung = total_ideal + total_warning + total_critical + total_kosong
@@ -313,3 +313,177 @@ div[class^="st-key-btn_"] button {
 }
 div[class^="st-key-btn_"] button:hover { transform: scale(1.15); border: 2px solid #fff !important; z-index: 10; }
 div[class^="st-key-btn_"] button p { margin: 0 !important; line-height: 1 !important; font-size: clamp(9px, 1.2vw, 14px) !important; }
+'''
+
+dynamic_css = f"{css_block_1}\n{css_block_2}\n{css_block_3}\n{css_block_4}\n{css_btn}"
+color_map = {'match': {"bg": "deepskyblue", "txt": "black", "sel": []}, 'critical': {"bg": "crimson", "txt": "white", "sel": []}, 'warning': {"bg": "gold", "txt": "black", "sel": []}, 'ideal': {"bg": "palegreen", "txt": "black", "sel": []}, 'empty': {"bg": "gainsboro", "txt": "gray", "sel": []}}
+
+for k in kolom_list:
+    for b in baris_list:
+        info = matrix_info.get((k, b))
+        if not info or not info['exist']: continue
+        sku = info['sku_cnt']
+        sel = f".st-key-btn_{k}_{b} button"
+        
+        if info['is_match']: color_map['match']['sel'].append(sel)
+        elif sku >= 3: color_map['critical']['sel'].append(sel)
+        elif sku == 2: color_map['warning']['sel'].append(sel)
+        elif sku == 1: color_map['ideal']['sel'].append(sel)
+        else: color_map['empty']['sel'].append(sel)
+
+for group in color_map.values():
+    if group['sel']: dynamic_css += f"\n{', '.join(group['sel'])} {{ background-color: {group['bg']} !important; color: {group['txt']} !important; }}"
+
+st.markdown(f"<style>{dynamic_css}</style>", unsafe_allow_html=True)
+
+def render_grid_area(title, start_baris, end_baris):
+    st.markdown(f"### {title}")
+    header_cols = st.columns([0.6] + [1] * 16, gap="small")
+    with header_cols[0]: st.empty() 
+        
+    for idx, b in enumerate(list(range(start_baris, end_baris + 1))):
+        with header_cols[idx + 1]: st.markdown(f"<div style='text-align:center; font-weight:900; font-size:14px; color:#94a3b8; margin-bottom:4px;'>{b}</div>", unsafe_allow_html=True)
+    
+    for k in kolom_list:
+        cols = st.columns([0.6] + [1] * 16, gap="small")
+        with cols[0]: st.markdown(f"<div style='font-weight:900;'>{k}</div>", unsafe_allow_html=True)
+            
+        for idx, b in enumerate(list(range(start_baris, end_baris + 1))):
+            info = matrix_info[(k, b)]
+            with cols[idx + 1]:
+                if info['exist']:
+                    lbl = str(info['usable_space']) if mode_tampilan == "Sisa Slot Kosong" else str(info['sku_cnt'])
+                    if st.button(lbl, key=f"btn_{k}_{b}", use_container_width=True): show_rack_detail(k, b, info)
+
+render_grid_area("📍 Area 1 (Rak 1 - 16)", 1, 16)
+st.divider()
+render_grid_area("📍 Area 2 (Rak 17 - 28)", 17, 28)
+
+# ==========================================================
+# 9. SARAN RESHUFFLE BERBASIS RAK KRITIS (KHUSUS TEPAT 3 SKU)
+# ==========================================================
+st.divider()
+
+def group_by_block(rack_list):
+    if not rack_list: return "Tidak ada rak."
+    grouped = {}
+    for r in rack_list:
+        k, b = r.split('-')
+        if k not in grouped: grouped[k] = []
+        grouped[k].append(r)
+    
+    res = ""
+    for k in sorted(grouped.keys()):
+        res += f"**Blok {k}:** {', '.join(grouped[k])}<br>"
+    return res
+
+def parse_lot_date(lot_str):
+    cleaned = str(lot_str).strip()
+    if len(cleaned) >= 6:
+        date_str = cleaned[-6:]
+        try:
+            day = int(date_str[0:2])
+            month = int(date_str[2:4])
+            year = int('20' + date_str[4:6])
+            return datetime(year, month, day)
+        except:
+            return datetime(1900, 1, 1)
+    return datetime(1900, 1, 1)
+
+list_merah_3, list_merah_over, list_kuning, list_hijau, list_abu = [], [], [], [], []
+rack_profiles = {}
+
+for k in kolom_list:
+    for b in baris_list:
+        info = matrix_info.get((k, b))
+        if info and info['exist']:
+            sku = info['sku_cnt']
+            lokasi = f"{k}-{b}"
+            
+            if sku == 3: list_merah_3.append(lokasi)
+            elif sku > 3: list_merah_over.append(lokasi)
+            elif sku == 2: list_kuning.append(lokasi)
+            elif sku == 1: list_hijau.append(lokasi)
+            elif sku == 0: list_abu.append(lokasi)
+            
+            df_sub = info['df_sub']
+            pallets_data = []
+            if 'Part Number' in df_sub.columns:
+                valid_df = df_sub[~df_sub['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])]
+                for _, row in valid_df.iterrows():
+                    pn = str(row['Part Number']).strip().upper()
+                    prod = str(row.get('Nama Produk', pn)).strip()
+                    lot = str(row.get('Lot Number', '')).strip()
+                    pallet_ke = int(row.get('Pallet Ke', 0))
+                    lot_date = parse_lot_date(lot)
+                    
+                    pallets_data.append({
+                        'part_number': pn,
+                        'name': prod,
+                        'lot': lot,
+                        'pallet_ke': pallet_ke,
+                        'lot_date': lot_date
+                    })
+                    
+            rack_profiles[(k, b)] = {'sku_cnt': sku, 'usable': info['usable_space'], 'pallets': pallets_data}
+
+st.markdown("### 📋 Status Rak Gudang")
+
+col_list1, col_list2, col_list3, col_list4 = st.columns(4)
+with col_list1:
+    st.markdown(f"**⚪ Kosong ({len(list_abu)} Rak)**")
+    st.markdown(f"<div style='background-color: #f8fafc; padding: 10px; border-radius: 6px; font-size: 13px; color: #475569; border: 1px solid #cbd5e1;'>{group_by_block(list_abu)}</div>", unsafe_allow_html=True)
+with col_list2:
+    st.markdown(f"**🟢 Ideal ({len(list_hijau)} Rak)**")
+    st.markdown(f"<div style='background-color: #f0fdf4; padding: 10px; border-radius: 6px; font-size: 13px; color: #166534; border: 1px solid #bbf7d0;'>{group_by_block(list_hijau)}</div>", unsafe_allow_html=True)
+with col_list3:
+    st.markdown(f"**🟡 Campur ({len(list_kuning)} Rak)**")
+    st.markdown(f"<div style='background-color: #fefce8; padding: 10px; border-radius: 6px; font-size: 13px; color: #854d0e; border: 1px solid #fef08a;'>{group_by_block(list_kuning)}</div>", unsafe_allow_html=True)
+with col_list4:
+    st.markdown(f"**🔴 Kritis Prioritas (Tepat 3 SKU: {len(list_merah_3)} Rak)**")
+    st.markdown(f"<div style='background-color: #fef2f2; padding: 10px; border-radius: 6px; font-size: 13px; color: #991b1b; border: 1px solid #fecaca;'>{group_by_block(list_merah_3)}</div>", unsafe_allow_html=True)
+    if list_merah_over:
+        st.caption(f"*(Dilewati: {len(list_merah_over)} Rak yang berisi >3 SKU)*")
+
+st.divider()
+st.markdown("### 🔄 Rekomendasi Reshuffling 2 Rak Kritis (Fokus Tepat 3 SKU)")
+st.caption("Mencocokkan pasangan **Rak Kritis yang berisi TEPAT 3 SKU**. Penataan dilakukan dengan menurunkan Lot Termuda di Ujung Belakang ke Area Transit untuk dikonsolidasi ulang.")
+
+saran_reshuffle = []
+
+# Hanya memproses rak yang berisi TEPAT 3 SKU
+rak_kritis_3 = [loc for loc, prof in rack_profiles.items() if prof['sku_cnt'] == 3 and prof['pallets']]
+
+for i in range(len(rak_kritis_3)):
+    for j in range(i + 1, len(rak_kritis_3)):
+        loc_a, loc_b = rak_kritis_3[i], rak_kritis_3[j]
+        prof_a, prof_b = rack_profiles[loc_a], rack_profiles[loc_b]
+        
+        sku_set_a = set(p['part_number'] for p in prof_a['pallets'])
+        sku_set_b = set(p['part_number'] for p in prof_b['pallets'])
+        
+        common_skus = sku_set_a.intersection(sku_set_b)
+        
+        if common_skus:
+            max_p_a = max(p['pallet_ke'] for p in prof_a['pallets'])
+            max_p_b = max(p['pallet_ke'] for p in prof_b['pallets'])
+            
+            p_belakang_a = [p for p in prof_a['pallets'] if p['pallet_ke'] == max_p_a]
+            p_belakang_b = [p for p in prof_b['pallets'] if p['pallet_ke'] == max_p_b]
+            
+            item_a = sorted(p_belakang_a, key=lambda x: x['lot_date'], reverse=True)[0]
+            item_b = sorted(p_belakang_b, key=lambda x: x['lot_date'], reverse=True)[0]
+            
+            saran_reshuffle.append({
+                'Pasangan Rak 1': f"Rak {loc_a[0]}-{loc_a[1]}",
+                'Item Belakang Rak 1': f"{item_a['name']} (Lot: {item_a['lot']})",
+                'Pasangan Rak 2': f"Rak {loc_b[0]}-{loc_b[1]}",
+                'Item Belakang Rak 2': f"{item_b['name']} (Lot: {item_b['lot']})",
+                'Instruksi Lapangan': f"Tarik item dari Ujung Belakang Rak {loc_a[0]}-{loc_a[1]} dan {loc_b[0]}-{loc_b[1]} ke Area Transit untuk konsolidasi Lot."
+            })
+
+if saran_reshuffle:
+    df_reshuffle = pd.DataFrame(saran_reshuffle[:10])
+    st.dataframe(df_reshuffle, use_container_width=True, hide_index=True)
+else:
+    st.success("🎉 Tidak ditemukan pasangan Rak Kritis (tepat 3 SKU) yang membutuhkan reshuffling transit.")
