@@ -64,7 +64,7 @@ mode_tampilan = st.sidebar.radio("Angka di dalam kotak rak mewakili:", ["Variasi
 # 5. MEMUAT DATA UTAMA & PENCARIAN (PRODUK / LOT)
 # ==========================================================
 st.title("📦 Visualisasi Grid Gudang (Live Monitor)")
-st.caption(f"Layar pantau Read-Only. Terhubung ke database: **{NAMA_DATABASE}**")
+st.caption(f"Layar pantau Read-Only. Terhubung ke database: {NAMA_DATABASE}")
 
 df = load_data_from_firebase()
 
@@ -294,7 +294,7 @@ total_baris_hitung = total_ideal + total_warning + total_critical + total_kosong
 col_m1.metric("Total Baris Aktif", f"{total_baris_hitung} Baris")
 col_m2.metric("🟢 Rak Ideal (1 SKU)", f"{total_ideal} Baris", f"{total_slot_ideal} Slot Siap Isi", delta_color="normal")
 col_m3.metric("🟡 Rak Campur (2 SKU)", f"{total_warning} Baris", f"{total_slot_warning} Slot Siap Isi", delta_color="normal")
-col_m4.metric("🔴 Rak Kritis (>= 3 SKU)", f"{total_critical} Baris", "Fokus Reshuffle", delta_color="off")
+col_m4.metric("🔴 Rak Kritis (>= 3 SKU)", f"{total_critical} Baris", "Hindari Inbound", delta_color="off")
 col_m5.metric("⚪ Rak Kosong Bersih", f"{total_kosong} Baris")
 st.divider()
 
@@ -361,7 +361,7 @@ st.divider()
 render_grid_area("📍 Area 2 (Rak 17 - 28)", 17, 28)
 
 # ==========================================================
-# 9. SARAN RESHUFFLE BERBASIS RAK KRITIS (KHUSUS TEPAT 3 SKU)
+# 9. DAFTAR LOKASI RAK & SARAN RELOKASI (BERBASIS POSISI UJUNG & LOT TERMUDA)
 # ==========================================================
 st.divider()
 
@@ -391,7 +391,7 @@ def parse_lot_date(lot_str):
             return datetime(1900, 1, 1)
     return datetime(1900, 1, 1)
 
-list_merah_3, list_merah_over, list_kuning, list_hijau, list_abu = [], [], [], [], []
+list_merah, list_kuning, list_hijau, list_abu = [], [], [], []
 rack_profiles = {}
 
 for k in kolom_list:
@@ -401,8 +401,7 @@ for k in kolom_list:
             sku = info['sku_cnt']
             lokasi = f"{k}-{b}"
             
-            if sku == 3: list_merah_3.append(lokasi)
-            elif sku > 3: list_merah_over.append(lokasi)
+            if sku >= 3: list_merah.append(lokasi)
             elif sku == 2: list_kuning.append(lokasi)
             elif sku == 1: list_hijau.append(lokasi)
             elif sku == 0: list_abu.append(lokasi)
@@ -428,7 +427,7 @@ for k in kolom_list:
                     
             rack_profiles[(k, b)] = {'sku_cnt': sku, 'usable': info['usable_space'], 'pallets': pallets_data}
 
-st.markdown("### 📋 Status Rak Gudang")
+st.markdown("### 📋 Daftar Lokasi Berdasarkan Status Rak (Dikelompokkan per Blok)")
 
 col_list1, col_list2, col_list3, col_list4 = st.columns(4)
 with col_list1:
@@ -441,95 +440,73 @@ with col_list3:
     st.markdown(f"**🟡 Campur ({len(list_kuning)} Rak)**")
     st.markdown(f"<div style='background-color: #fefce8; padding: 10px; border-radius: 6px; font-size: 13px; color: #854d0e; border: 1px solid #fef08a;'>{group_by_block(list_kuning)}</div>", unsafe_allow_html=True)
 with col_list4:
-    st.markdown(f"**🔴 Kritis Prioritas (Tepat 3 SKU: {len(list_merah_3)} Rak)**")
-    st.markdown(f"<div style='background-color: #fef2f2; padding: 10px; border-radius: 6px; font-size: 13px; color: #991b1b; border: 1px solid #fecaca;'>{group_by_block(list_merah_3)}</div>", unsafe_allow_html=True)
-    if list_merah_over:
-        st.caption(f"*(Dilewati: {len(list_merah_over)} Rak yang berisi >3 SKU)*")
+    st.markdown(f"**🔴 Kritis ({len(list_merah)} Rak)**")
+    st.markdown(f"<div style='background-color: #fef2f2; padding: 10px; border-radius: 6px; font-size: 13px; color: #991b1b; border: 1px solid #fecaca;'>{group_by_block(list_merah)}</div>", unsafe_allow_html=True)
 
 st.divider()
+st.markdown("### 💡 Saran Relokasi Cerdas (Fokus Posisi Ujung Depan/Belakang & Lot Termuda)")
+st.caption("Algoritma hanya menyaring item yang berada di **ujung Belakang (Pallet Ke besar)** atau **ujung Depan (Pallet Ke = 1)** dengan prioritas utama di **Belakang** (agar tidak mengganggu akses Outbound) serta memiliki No. Lot tanggal produksi termuda/terbaru.")
 
-# ----------------------------------------------------------
-# TABEL 1: PENGAMBILAN DARI BELAKANG (LOT MUDA)
-# ----------------------------------------------------------
-st.markdown("### 🔄 1. Rekomendasi Reshuffling (Pengambilan dari BELAKANG)")
-st.caption("Mencocokkan pasangan **Rak Kritis (Tepat 3 SKU)**. Menurunkan Lot Termuda di Ujung Belakang ke Area Transit untuk dikonsolidasi ulang tanpa mengganggu stok siap Outbound di depan.")
+saran_list = []
 
-saran_reshuffle_belakang = []
-rak_kritis_3 = [loc for loc, prof in rack_profiles.items() if prof['sku_cnt'] == 3 and prof['pallets']]
-
-for i in range(len(rak_kritis_3)):
-    for j in range(i + 1, len(rak_kritis_3)):
-        loc_a, loc_b = rak_kritis_3[i], rak_kritis_3[j]
-        prof_a, prof_b = rack_profiles[loc_a], rack_profiles[loc_b]
+for r_loc, r_prof in rack_profiles.items():
+    if r_prof['sku_cnt'] >= 3 and r_prof['pallets']:
+        max_pallet = max(p['pallet_ke'] for p in r_prof['pallets'])
         
-        sku_set_a = set(p['part_number'] for p in prof_a['pallets'])
-        sku_set_b = set(p['part_number'] for p in prof_b['pallets'])
+        target_candidates = [p for p in r_prof['pallets'] if p['pallet_ke'] == max_pallet or p['pallet_ke'] == 1]
         
-        common_skus = sku_set_a.intersection(sku_set_b)
-        
-        if common_skus:
-            max_p_a = max(p['pallet_ke'] for p in prof_a['pallets'])
-            max_p_b = max(p['pallet_ke'] for p in prof_b['pallets'])
+        if target_candidates:
+            target_candidates = sorted(target_candidates, key=lambda x: (x['pallet_ke'] == max_pallet, x['lot_date']), reverse=True)
+            target_pallet = target_candidates[0]
             
-            p_belakang_a = [p for p in prof_a['pallets'] if p['pallet_ke'] == max_p_a]
-            p_belakang_b = [p for p in prof_b['pallets'] if p['pallet_ke'] == max_p_b]
+            pn_to_move = target_pallet['part_number']
+            nama_item = target_pallet['name']
+            lot_target = target_pallet['lot']
+            pos_pallet = target_pallet['pallet_ke']
             
-            # Aman dari error jika array kosong
-            if p_belakang_a and p_belakang_b:
-                item_a = sorted(p_belakang_a, key=lambda x: x['lot_date'], reverse=True)[0]
-                item_b = sorted(p_belakang_b, key=lambda x: x['lot_date'], reverse=True)[0]
+            posisi_teks = "Ujung Belakang" if pos_pallet == max_pallet else "Ujung Depan"
+            
+            matching_pallets = [p for p in r_prof['pallets'] if p['part_number'] == pn_to_move]
+            qty_to_move = len(matching_pallets)
+            
+            best_dest, best_score, alasan = None, -1, ""
+            
+            for d_loc, d_prof in rack_profiles.items():
+                if r_loc == d_loc: continue
                 
-                saran_reshuffle_belakang.append({
-                    'Pasangan Rak 1': f"Rak {loc_a[0]}-{loc_a[1]}",
-                    'Item Ujung Belakang Rak 1': f"{item_a['name']} (Lot: {item_a['lot']})",
-                    'Pasangan Rak 2': f"Rak {loc_b[0]}-{loc_b[1]}",
-                    'Item Ujung Belakang Rak 2': f"{item_b['name']} (Lot: {item_b['lot']})",
-                    'Instruksi Lapangan': f"Tarik item dari Ujung Belakang Rak {loc_a[0]}-{loc_a[1]} & {loc_b[0]}-{loc_b[1]} ke Area Transit."
+                if d_prof['usable'] >= qty_to_move and d_prof['sku_cnt'] < 2:
+                    score = -1
+                    dest_items_pn = [p['part_number'] for p in d_prof['pallets']]
+                    
+                    if d_prof['sku_cnt'] == 1 and pn_to_move in dest_items_pn: 
+                        score, alasan_temp = 3, f"Digabung ke item sejenis di Rak Ideal | Diambil dari **{posisi_teks}** (#{pos_pallet}, Lot: {lot_target})"
+                    elif d_prof['sku_cnt'] == 1 and pn_to_move not in dest_items_pn: 
+                        score, alasan_temp = 2, f"Mengubah Rak Ideal jadi Campur | Diambil dari **{posisi_teks}** (#{pos_pallet}, Lot: {lot_target})"
+                    elif d_prof['sku_cnt'] == 0: 
+                        score, alasan_temp = 1, f"Dipindah ke Rak Kosong | Diambil dari **{posisi_teks}** (#{pos_pallet}, Lot: {lot_target})"
+                    
+                    if score > best_score:
+                        best_score, best_dest, alasan = score, d_loc, alasan_temp
+                        
+            if best_dest:
+                saran_list.append({
+                    'Dari Rak (Asal)': f"{r_loc[0]}-{r_loc[1]}",
+                    'Item & Lot Prioritas Pindah': f"{nama_item} (Lot: {lot_target})",
+                    'Jumlah Pallet': f"{qty_to_move} Pallet",
+                    'Ke Rak (Tujuan)': f"{best_dest[0]}-{best_dest[1]}",
+                    'Analisis Dasar Relokasi': alasan,
+                    'Skor': best_score
                 })
 
-if saran_reshuffle_belakang:
-    st.dataframe(pd.DataFrame(saran_reshuffle_belakang[:10]), use_container_width=True, hide_index=True)
-else:
-    st.success("🎉 Tidak ada rekomendasi reshuffle pengambilan belakang untuk rak tepat 3 SKU.")
-
-st.write("")
-
-# ----------------------------------------------------------
-# TABEL 2: PENGAMBILAN DARI DEPAN (LOT TUA)
-# ----------------------------------------------------------
-st.markdown("### 🔄 2. Rekomendasi Reshuffling (Pengambilan dari DEPAN)")
-st.caption("Mencocokkan pasangan **Rak Kritis (Tepat 3 SKU)**. Menurunkan Lot Paling Tua di Ujung Depan (Pallet Ke = 1) ke Area Transit jika diprioritaskan untuk pengeluaran/penataan ulang cepat.")
-
-saran_reshuffle_depan = []
-
-for i in range(len(rak_kritis_3)):
-    for j in range(i + 1, len(rak_kritis_3)):
-        loc_a, loc_b = rak_kritis_3[i], rak_kritis_3[j]
-        prof_a, prof_b = rack_profiles[loc_a], rack_profiles[loc_b]
-        
-        sku_set_a = set(p['part_number'] for p in prof_a['pallets'])
-        sku_set_b = set(p['part_number'] for p in prof_b['pallets'])
-        
-        common_skus = sku_set_a.intersection(sku_set_b)
-        
-        if common_skus:
-            p_depan_a = [p for p in prof_a['pallets'] if p['pallet_ke'] == 1]
-            p_depan_b = [p for p in prof_b['pallets'] if p['pallet_ke'] == 1]
+if saran_list:
+    seen_asal = set()
+    unique_saran = []
+    for s in sorted(saran_list, key=lambda x: x['Skor'], reverse=True):
+        if s['Dari Rak (Asal)'] not in seen_asal:
+            seen_asal.add(s['Dari Rak (Asal)'])
+            unique_saran.append(s)
             
-            # Aman dari error jika array kosong
-            if p_depan_a and p_depan_b:
-                item_a = sorted(p_depan_a, key=lambda x: x['lot_date'], reverse=False)[0]
-                item_b = sorted(p_depan_b, key=lambda x: x['lot_date'], reverse=False)[0]
-                
-                saran_reshuffle_depan.append({
-                    'Pasangan Rak 1': f"Rak {loc_a[0]}-{loc_a[1]}",
-                    'Item Ujung Depan Rak 1': f"{item_a['name']} (Lot: {item_a['lot']})",
-                    'Pasangan Rak 2': f"Rak {loc_b[0]}-{loc_b[1]}",
-                    'Item Ujung Depan Rak 2': f"{item_b['name']} (Lot: {item_b['lot']})",
-                    'Instruksi Lapangan': f"Tarik item dari Ujung Depan (Pallet #1) Rak {loc_a[0]}-{loc_a[1]} & {loc_b[0]}-{loc_b[1]} ke Area Transit."
-                })
-
-if saran_reshuffle_depan:
-    st.dataframe(pd.DataFrame(saran_reshuffle_depan[:10]), use_container_width=True, hide_index=True)
+    df_saran = pd.DataFrame(unique_saran[:12]).drop(columns=['Skor'])
+    st.dataframe(df_saran, use_container_width=True, hide_index=True)
 else:
-    st.info("ℹ️ Tidak ditemukan rekomendasi reshuffle pengambilan depan untuk rak tepat 3 SKU.")
+    st.success("🎉 Luar biasa! Saat ini tidak ada rak merah yang memenuhi kriteria relokasi dari ujung depan/belakang.")
