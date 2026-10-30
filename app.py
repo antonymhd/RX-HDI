@@ -246,12 +246,19 @@ def show_rack_detail(k, b, info):
             pnc = str(part_num).strip().upper() 
             if not df_master.empty and 'Part Number Clean' in df_master.columns and pnc in df_master['Part Number Clean'].values:
                 mr = df_master[df_master['Part Number Clean'] == pnc].iloc[0]
-                ip = float(pd.to_numeric(mr.get('Isi 1 Pallet (pcs)', 0), errors='coerce') or 0)
-                pb = float(pd.to_numeric(mr.get('Box / Pallet', 0), errors='coerce') or 0)
-                ps = float(pd.to_numeric(mr.get('Sac / Pallet', 0), errors='coerce') or 0)
+                
+                # REFAKTOR: Mengonversi kosong menjadi 0 secara eksplisit agar aman dari "NaN"
+                val_ip = pd.to_numeric(mr.get('Isi 1 Pallet (pcs)', 0), errors='coerce')
+                val_pb = pd.to_numeric(mr.get('Box / Pallet', 0), errors='coerce')
+                val_ps = pd.to_numeric(mr.get('Sac / Pallet', 0), errors='coerce')
+                
+                ip = 0 if pd.isna(val_ip) else float(val_ip)
+                pb = 0 if pd.isna(val_pb) else float(val_pb)
+                ps = 0 if pd.isna(val_ps) else float(val_ps)
 
-            sc = "Dus" if pnc.endswith('D') else "Sak"
-            pss = pb if pnc.endswith('D') else ps
+            # REFAKTOR: Menambahkan identifikasi 'G' sebagai kemasan Dus/Box
+            sc = "Dus" if pnc.endswith(('D', 'G')) else "Sak"
+            pss = pb if pnc.endswith(('D', 'G')) else ps
             
             if ip > 0:
                 tot = (jml_utuh * ip) + (val_pecahan * pss) + val_eceran
