@@ -3,3 +3,4 @@ pandas
 openpyxl
 st-gsheets-connection
 firebase-admin
+plotly
