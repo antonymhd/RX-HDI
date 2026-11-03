@@ -21,7 +21,7 @@ if not firebase_admin._apps:
 db = firestore.client()
 
 # ==========================================================
-# 3. FUNGSI LOAD DATA (SMART CACHE - 5 MENIT)
+# 3. FUNGSI LOAD DATA (SMART CACHE - 5 MENIT PENGHEMAT KUOTA)
 # ==========================================================
 @st.cache_data(ttl=300)
 def load_data_from_firebase():
@@ -47,6 +47,24 @@ def load_data_from_firebase():
     return df
 
 # ==========================================================
+# FUNGSI PARSING TANGGAL LOT (DARI XYNddmmyy KE TANGGAL)
+# ==========================================================
+def parse_lot_date(lot_str):
+    cleaned = str(lot_str).strip()
+    # Mengambil 6 karakter terakhir (ddmmyy) dari nomor Lot
+    if len(cleaned) >= 6:
+        date_str = cleaned[-6:]
+        try:
+            day = int(date_str[0:2])
+            month = int(date_str[2:4])
+            year = int('20' + date_str[4:6])
+            return datetime(year, month, day)
+        except:
+            # Jika lot kosong atau format salah, buang ke tahun 2099 agar tidak dianggap barang tua
+            return datetime(2099, 12, 31)
+    return datetime(2099, 12, 31)
+
+# ==========================================================
 # 4. SIDEBAR & PENGATURAN
 # ==========================================================
 st.sidebar.header("🔄 Sinkronisasi Real-Time")
@@ -61,7 +79,7 @@ st.sidebar.header("👁️ Mode Tampilan Kotak")
 mode_tampilan = st.sidebar.radio("Angka di dalam kotak rak mewakili:", ["Variasi SKU (Jenis Barang)", "Sisa Slot Kosong"])
 
 # ==========================================================
-# 5. MEMUAT DATA UTAMA & PENCARIAN (PRODUK / LOT)
+# 5. MEMUAT DATA UTAMA & FITUR PENCARIAN (DENGAN FIFO)
 # ==========================================================
 st.title("📦 Visualisasi Grid Gudang (Live Monitor)")
 st.caption(f"Layar pantau Read-Only. Terhubung ke database: {NAMA_DATABASE}")
@@ -86,6 +104,32 @@ if tipe_cari == "Berdasarkan Produk":
         
     pilihan_pencarian = st.sidebar.selectbox("Pilih Produk:", options=["-- Tampilkan Semua --"] + daftar_barang)
     search_query = "" if pilihan_pencarian == "-- Tampilkan Semua --" else pilihan_pencarian
+    
+    # --------------------------------------------------------
+    # FITUR TABEL REKOMENDASI LOKASI PENGAMBILAN (FIFO)
+    # --------------------------------------------------------
+    if search_query:
+        st.markdown(f"### 🔎 Lokasi Pengambilan **{search_query}** (Urutan FIFO)")
+        
+        df_search = df[df[product_col].astype(str).str.contains(search_query, case=False, na=False, regex=False)].copy()
+        
+        if not df_search.empty:
+            df_search['Tgl_Produksi'] = df_search['Lot Number'].apply(parse_lot_date)
+            # Urutkan dari Tgl Paling Lama ke Paling Baru
+            df_search = df_search.sort_values(by=['Tgl_Produksi', 'Kolom', 'Baris', 'Pallet Ke'], ascending=[True, True, True, True])
+            
+            df_fifo = df_search[['Kolom', 'Baris', 'Pallet Ke', 'Lot Number', 'Keterangan', 'Tgl_Produksi']].copy()
+            df_fifo['Lokasi Rak'] = df_fifo['Kolom'].astype(str) + "-" + df_fifo['Baris'].astype(str)
+            df_fifo['Tanggal Produksi'] = df_fifo['Tgl_Produksi'].apply(lambda x: x.strftime('%d-%m-%Y') if x.year != 2099 else "Strip/Tidak Valid")
+            
+            df_fifo = df_fifo[['Lokasi Rak', 'Pallet Ke', 'Lot Number', 'Tanggal Produksi', 'Keterangan']]
+            
+            st.info(f"💡 **Rekomendasi Ambil Pertama (Paling Lama):** Rak **{df_fifo.iloc[0]['Lokasi Rak']}** (Lot: {df_fifo.iloc[0]['Lot Number']})")
+            st.dataframe(df_fifo, use_container_width=True, hide_index=True)
+            st.divider()
+        else:
+            st.warning("Produk tidak ditemukan di rak manapun.")
+
 else:
     if 'Lot Number' in df.columns:
         valid_mask = ~df['Lot Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>", "-", "0"])
@@ -246,8 +290,6 @@ def show_rack_detail(k, b, info):
             pnc = str(part_num).strip().upper() 
             if not df_master.empty and 'Part Number Clean' in df_master.columns and pnc in df_master['Part Number Clean'].values:
                 mr = df_master[df_master['Part Number Clean'] == pnc].iloc[0]
-                
-                # REFAKTOR: Mengonversi kosong menjadi 0 secara eksplisit agar aman dari "NaN"
                 val_ip = pd.to_numeric(mr.get('Isi 1 Pallet (pcs)', 0), errors='coerce')
                 val_pb = pd.to_numeric(mr.get('Box / Pallet', 0), errors='coerce')
                 val_ps = pd.to_numeric(mr.get('Sac / Pallet', 0), errors='coerce')
@@ -256,7 +298,6 @@ def show_rack_detail(k, b, info):
                 pb = 0 if pd.isna(val_pb) else float(val_pb)
                 ps = 0 if pd.isna(val_ps) else float(val_ps)
 
-            # REFAKTOR: Menambahkan identifikasi 'G' sebagai kemasan Dus/Box
             sc = "Dus" if pnc.endswith(('D', 'G')) else "Sak"
             pss = pb if pnc.endswith(('D', 'G')) else ps
             
@@ -385,19 +426,6 @@ def group_by_block(rack_list):
         res += f"**Blok {k}:** {', '.join(grouped[k])}<br>"
     return res
 
-def parse_lot_date(lot_str):
-    cleaned = str(lot_str).strip()
-    if len(cleaned) >= 6:
-        date_str = cleaned[-6:]
-        try:
-            day = int(date_str[0:2])
-            month = int(date_str[2:4])
-            year = int('20' + date_str[4:6])
-            return datetime(year, month, day)
-        except:
-            return datetime(1900, 1, 1)
-    return datetime(1900, 1, 1)
-
 list_merah, list_kuning, list_hijau, list_abu = [], [], [], []
 rack_profiles = {}
 
@@ -422,6 +450,8 @@ for k in kolom_list:
                     prod = str(row.get('Nama Produk', pn)).strip()
                     lot = str(row.get('Lot Number', '')).strip()
                     pallet_ke = int(row.get('Pallet Ke', 0))
+                    
+                    # Menggunakan fungsi parse_lot_date yang sama dengan fitur pencarian
                     lot_date = parse_lot_date(lot)
                     
                     pallets_data.append({
