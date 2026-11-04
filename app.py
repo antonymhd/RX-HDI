@@ -51,7 +51,6 @@ def load_data_from_firebase():
 # ==========================================================
 def parse_lot_date(lot_str):
     cleaned = str(lot_str).strip()
-    # Mengambil 6 karakter terakhir (ddmmyy) dari nomor Lot
     if len(cleaned) >= 6:
         date_str = cleaned[-6:]
         try:
@@ -60,7 +59,6 @@ def parse_lot_date(lot_str):
             year = int('20' + date_str[4:6])
             return datetime(year, month, day)
         except:
-            # Jika lot kosong atau format salah, buang ke tahun 2099 agar tidak dianggap barang tua
             return datetime(2099, 12, 31)
     return datetime(2099, 12, 31)
 
@@ -79,7 +77,7 @@ st.sidebar.header("👁️ Mode Tampilan Kotak")
 mode_tampilan = st.sidebar.radio("Angka di dalam kotak rak mewakili:", ["Variasi SKU (Jenis Barang)", "Sisa Slot Kosong"])
 
 # ==========================================================
-# 5. MEMUAT DATA UTAMA & FITUR PENCARIAN (DENGAN FIFO)
+# 5. MEMUAT DATA UTAMA & FITUR PENCARIAN (DENGAN FIFO REVISI)
 # ==========================================================
 st.title("📦 Visualisasi Grid Gudang (Live Monitor)")
 st.caption(f"Layar pantau Read-Only. Terhubung ke database: {NAMA_DATABASE}")
@@ -106,7 +104,7 @@ if tipe_cari == "Berdasarkan Produk":
     search_query = "" if pilihan_pencarian == "-- Tampilkan Semua --" else pilihan_pencarian
     
     # --------------------------------------------------------
-    # FITUR TABEL REKOMENDASI LOKASI PENGAMBILAN (FIFO)
+    # FITUR TABEL REKOMENDASI PENGAMBILAN (AGREGASI FIFO)
     # --------------------------------------------------------
     if search_query:
         st.markdown(f"### 🔎 Lokasi Pengambilan **{search_query}** (Urutan FIFO)")
@@ -115,16 +113,59 @@ if tipe_cari == "Berdasarkan Produk":
         
         if not df_search.empty:
             df_search['Tgl_Produksi'] = df_search['Lot Number'].apply(parse_lot_date)
-            # Urutkan dari Tgl Paling Lama ke Paling Baru
+            # Urutkan dari Tgl Paling Lama
             df_search = df_search.sort_values(by=['Tgl_Produksi', 'Kolom', 'Baris', 'Pallet Ke'], ascending=[True, True, True, True])
             
-            df_fifo = df_search[['Kolom', 'Baris', 'Pallet Ke', 'Lot Number', 'Keterangan', 'Tgl_Produksi']].copy()
-            df_fifo['Lokasi Rak'] = df_fifo['Kolom'].astype(str) + "-" + df_fifo['Baris'].astype(str)
-            df_fifo['Tanggal Produksi'] = df_fifo['Tgl_Produksi'].apply(lambda x: x.strftime('%d-%m-%Y') if x.year != 2099 else "Strip/Tidak Valid")
+            # AGREGASI DATA AGAR TIDAK MUNCUL BARIS PER PALET
+            fifo_summary = []
+            grouped = df_search.groupby(['Kolom', 'Baris', 'Part Number', 'Lot Number', 'Tgl_Produksi'], dropna=False)
             
-            df_fifo = df_fifo[['Lokasi Rak', 'Pallet Ke', 'Lot Number', 'Tanggal Produksi', 'Keterangan']]
+            for name, group in grouped:
+                kolom, baris, part_num, lot, tgl = name
+                
+                # Ekstrak Range Pallet Ke
+                pallets = sorted(group['Pallet Ke'].tolist())
+                pallet_range = f"{pallets[0]} - {pallets[-1]}" if len(pallets) > 1 else str(pallets[0]) if pallets else "-"
+                
+                # Kalkulasi Jumlah Stok Fisik
+                jml_utuh, val_pecahan, val_eceran = 0, 0, 0
+                for _, row in group.iterrows():
+                    ket_str = str(row.get('Keterangan', '')).lower()
+                    if 'pecahan' not in ket_str and 'eceran' not in ket_str:
+                        jml_utuh += 1
+                    else:
+                        mp = re.search(r'pecahan:\s*(\d+)', ket_str)
+                        if mp: val_pecahan += int(mp.group(1))
+                        else:
+                            nums = re.findall(r'\d+', ket_str)
+                            if nums and 'pecahan' in ket_str: val_pecahan += int(nums[0])
+                        me = re.search(r'eceran:\s*(\d+)', ket_str)
+                        if me: val_eceran += int(me.group(1))
+                        
+                stok_str = []
+                if jml_utuh > 0: stok_str.append(f"{jml_utuh} Pallet")
+                if val_pecahan > 0: stok_str.append(f"{val_pecahan} Dus/Sak")
+                if val_eceran > 0: stok_str.append(f"{val_eceran} Pcs")
+                jumlah_stok = " + ".join(stok_str) if stok_str else "0"
+                
+                fifo_summary.append({
+                    'Lokasi Rak': f"{kolom}-{baris}",
+                    'Part Number': part_num,
+                    'Lot Number': lot,
+                    'Tanggal Produksi': tgl,
+                    'Range Pallet Ke': pallet_range,
+                    'Jumlah Stok (Fisik)': jumlah_stok,
+                    'Urutan_Sort': tgl
+                })
+                
+            df_fifo = pd.DataFrame(fifo_summary)
+            df_fifo = df_fifo.sort_values('Urutan_Sort').drop(columns=['Urutan_Sort'])
+            df_fifo['Tanggal Produksi'] = df_fifo['Tanggal Produksi'].apply(lambda x: x.strftime('%d-%m-%Y') if x.year != 2099 else "Strip/Tidak Valid")
             
-            st.info(f"💡 **Rekomendasi Ambil Pertama (Paling Lama):** Rak **{df_fifo.iloc[0]['Lokasi Rak']}** (Lot: {df_fifo.iloc[0]['Lot Number']})")
+            # Menata urutan kolom yang ditampilkan
+            df_fifo = df_fifo[['Lokasi Rak', 'Part Number', 'Lot Number', 'Jumlah Stok (Fisik)', 'Range Pallet Ke', 'Tanggal Produksi']]
+            
+            st.info(f"💡 **Rekomendasi Ambil Pertama (Paling Lama):** Rak **{df_fifo.iloc[0]['Lokasi Rak']}** (Lot: {df_fifo.iloc[0]['Lot Number']}) dengan {df_fifo.iloc[0]['Jumlah Stok (Fisik)']}")
             st.dataframe(df_fifo, use_container_width=True, hide_index=True)
             st.divider()
         else:
@@ -247,7 +288,7 @@ else:
     st.sidebar.success("✅ Seluruh rak dalam batas kapasitas normal. Tidak ada pallet bayangan.")
 
 # ==========================================================
-# 7. POP-UP DETAIL RAK (KALKULASI Pcs & STYLING BAYANGAN)
+# 7. POP-UP DETAIL RAK
 # ==========================================================
 @st.dialog("📦 Rincian Detail Rak", width="large")
 def show_rack_detail(k, b, info):
@@ -334,7 +375,7 @@ def show_rack_detail(k, b, info):
         st.success("✅ Rak Kosong. Aman untuk diisi.")
 
 # ==========================================================
-# 8. RENDER METRIK & GRID UI (WARNA AMAN CSS)
+# 8. RENDER METRIK & GRID UI
 # ==========================================================
 col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
 total_baris_hitung = total_ideal + total_warning + total_critical + total_kosong
@@ -451,7 +492,6 @@ for k in kolom_list:
                     lot = str(row.get('Lot Number', '')).strip()
                     pallet_ke = int(row.get('Pallet Ke', 0))
                     
-                    # Menggunakan fungsi parse_lot_date yang sama dengan fitur pencarian
                     lot_date = parse_lot_date(lot)
                     
                     pallets_data.append({
@@ -480,7 +520,6 @@ with col_list4:
     st.markdown(f"**🔴 Kritis ({len(list_merah)} Rak)**")
     st.markdown(f"<div style='background-color: #fef2f2; padding: 10px; border-radius: 6px; font-size: 13px; color: #991b1b; border: 1px solid #fecaca;'>{group_by_block(list_merah)}</div>", unsafe_allow_html=True)
 
-
 # ==========================================================
 # 10. SARAN RELOKASI: SUBSIDI SILANG (BONGKAR DEPAN)
 # ==========================================================
@@ -494,7 +533,6 @@ rak_campur = {loc: prof for loc, prof in rack_profiles.items() if prof['sku_cnt'
 for r_loc, r_prof in rak_campur.items():
     if not r_prof['pallets']: continue
     
-    # 1. Identifikasi SKU di ujung depan Rak Asal
     min_pallet_asal = min(p['pallet_ke'] for p in r_prof['pallets'])
     kandidat_depan = [p for p in r_prof['pallets'] if p['pallet_ke'] == min_pallet_asal]
     if not kandidat_depan: continue
@@ -509,7 +547,6 @@ for r_loc, r_prof in rak_campur.items():
         
         dest_pns = [p['part_number'] for p in d_prof['pallets']]
         
-        # 2. Rak tujuan harus memiliki pn_target juga (agar bisa disatukan)
         if pn_target in dest_pns:
             min_pallet_tujuan = min(p['pallet_ke'] for p in d_prof['pallets'])
             kandidat_tujuan = [p for p in d_prof['pallets'] if p['pallet_ke'] == min_pallet_tujuan]
@@ -518,12 +555,10 @@ for r_loc, r_prof in rak_campur.items():
             item_depan_tujuan = sorted(kandidat_tujuan, key=lambda x: x['lot_date'])[0]
             pn_penghalang = item_depan_tujuan['part_number']
             
-            # 3. Pastikan item di depan rak tujuan BUKAN pn_target (artinya pn_target tersembunyi di belakangnya)
             if pn_penghalang != pn_target:
                 nama_penghalang = item_depan_tujuan['name']
                 qty_penghalang = len([p for p in d_prof['pallets'] if p['part_number'] == pn_penghalang])
                 
-                # 4. Cek apakah ruang hasil bongkar + sisa slot cukup untuk menampung item dari rak asal
                 estimasi_space = d_prof['usable'] + qty_penghalang
                 
                 if estimasi_space >= qty_asal:
@@ -539,7 +574,6 @@ for r_loc, r_prof in rak_campur.items():
 if saran_list:
     seen_combo = set()
     unique_saran = []
-    # Mengurutkan rekomendasi agar rak yang paling kritis (merah) didahulukan
     for s in sorted(saran_list, key=lambda x: x['Skor'], reverse=True):
         combo_key = f"{s['Rak Asal']}-{s['Rak Tujuan (Bongkar)']}"
         if combo_key not in seen_combo:
