@@ -131,9 +131,8 @@ st.sidebar.divider()
 st.sidebar.header("👁️ Mode Tampilan Kotak")
 mode_tampilan = st.sidebar.radio("Angka di dalam kotak rak mewakili:", [
     "Variasi SKU (Jenis Barang)", 
-    "Sisa Slot Kosong", 
-    "Total Stok (Pcs)"
-])
+    "Sisa Slot Kosong"
+]) # <-- KEMBALI KE 2 OPSI AGAR RINGAN
 
 # ==========================================================
 # 5. MEMUAT DATA UTAMA & PENCARIAN
@@ -202,10 +201,8 @@ if tipe_cari == "Berdasarkan Produk":
                 
                 fisik_str = " + ".join(stok_str) if stok_str else "0"
                 
-                # TAMBAHAN: Menghitung dan menempelkan Total Pcs di tabel FIFO
                 if master_info['ip'] > 0:
                     total_pcs = (jml_utuh * master_info['ip']) + (val_pecahan * pss) + val_eceran
-                    # Format Indonesia (titik untuk ribuan)
                     pcs_format = f"{total_pcs:,.0f}".replace(',', '.')
                     fisik_str += f" ➔ {pcs_format} Pcs"
                 
@@ -238,7 +235,7 @@ else:
     search_lot = "" if pilihan_lot == "-- Tampilkan Semua --" else pilihan_lot
 
 # ==========================================================
-# 6. LOGIKA MATRIKS RAK & KALKULASI TOTAL PCS
+# 6. LOGIKA MATRIKS RAK (MURNI TANPA LOOPING PCS DI AWAL)
 # ==========================================================
 def is_rack_exist(kolom, baris):
     if kolom == 'F' and baris < 5: return False
@@ -260,7 +257,7 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
                 continue
                 
             sub = df[(df['Kolom'] == k) & (df['Baris'] == b)]
-            is_all_box, filled, sku, is_match, total_pcs_rak = False, 0, 0, False, 0
+            is_all_box, filled, sku, is_match = False, 0, 0, False
             
             if 'Part Number' in sub.columns:
                 p_series = sub['Part Number'].astype(str).str.strip()
@@ -281,12 +278,6 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
                     if 'Lot Number' in sub.columns:
                         is_match = sub['Lot Number'].astype(str).str.strip().str.contains(search_lot_term, case=False, na=False, regex=False).any()
                         
-                # Menghitung Total PCS jika ada isi
-                if filled > 0:
-                    valid_sub = sub[valid_mask]
-                    for _, row in valid_sub.iterrows():
-                        total_pcs_rak += hitung_pcs_baris(row.get('Keterangan', ''), row.get('Part Number', ''))
-            
             max_slot = int(32 if b <= 16 else 46) if is_all_box else int(31 if b <= 16 else 44)
             usable_space = max(0, max_slot - filled)
             
@@ -302,7 +293,7 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
             matrix_info[(k, b)] = {
                 'exist': True, 'sku_cnt': sku, 'filled': filled, 
                 'usable_space': usable_space, 'max_slot': max_slot, 
-                'total_pcs': total_pcs_rak, 'df_sub': sub, 'is_match': is_match
+                'df_sub': sub, 'is_match': is_match
             }
             
     return matrix_info, total_critical, total_warning, total_ideal, total_kosong, total_slot_ideal, total_slot_warning, kolom_list, baris_list
@@ -338,16 +329,23 @@ else:
     st.sidebar.success("✅ Seluruh rak dalam batas kapasitas normal.")
 
 # ==========================================================
-# 7. POP-UP DETAIL RAK
+# 7. POP-UP DETAIL RAK (LAZY LOADING KALKULASI PCS)
 # ==========================================================
 @st.dialog("📦 Rincian Detail Rak", width="large")
 def show_rack_detail(k, b, info):
+    # Hitung total Pcs HANYA saat pop-up dibuka
+    grand_total_pcs = 0
+    if info['sku_cnt'] > 0:
+        df_terisi_awal = info['df_sub'][~info['df_sub']['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])]
+        for _, row in df_terisi_awal.iterrows():
+            grand_total_pcs += hitung_pcs_baris(row.get('Keterangan', ''), row.get('Part Number', ''))
+
     st.subheader(f"📍 Lokasi Racking: {k} - Baris {b}")
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Variasi SKU", f"{info['sku_cnt']} Jenis")
     c2.metric("Slot Fisik Terpakai", f"{info['filled']} / {info['max_slot']}")
     c3.metric("Space Kosong", f"{info['usable_space']} Slot")
-    c4.metric("Total Kuantitas", format_compact_number(info['total_pcs']) + " Pcs")
+    c4.metric("Total Kuantitas", format_compact_number(grand_total_pcs) + " Pcs")
     st.divider()
     
     if info['sku_cnt'] > 0:
@@ -472,8 +470,7 @@ def render_grid_area(title, start_baris, end_baris):
             info = matrix_info[(k, b)]
             with cols[idx + 1]:
                 if info['exist']:
-                    if mode_tampilan == "Total Stok (Pcs)": lbl = format_compact_number(info['total_pcs'])
-                    elif mode_tampilan == "Sisa Slot Kosong": lbl = str(info['usable_space'])
+                    if mode_tampilan == "Sisa Slot Kosong": lbl = str(info['usable_space'])
                     else: lbl = str(info['sku_cnt'])
                         
                     if st.button(lbl, key=f"btn_{k}_{b}", use_container_width=True): show_rack_detail(k, b, info)
