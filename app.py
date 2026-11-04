@@ -58,7 +58,7 @@ def load_master_produk():
     except:
         return pd.DataFrame()
 
-# Optimasi: Jadikan Master Data sebagai Dictionary agar lookup O(1) sangat cepat
+# Optimasi RAM: Dictionary O(1) Lookup
 df_master_global = load_master_produk()
 master_dict = {}
 if not df_master_global.empty and 'Part Number Clean' in df_master_global.columns:
@@ -129,7 +129,6 @@ if st.sidebar.button("🔄 Tarik Data Gudang Terbaru", use_container_width=True,
 
 st.sidebar.divider()
 st.sidebar.header("👁️ Mode Tampilan Kotak")
-# OPSI KE-3 DITAMBAHKAN DI SINI
 mode_tampilan = st.sidebar.radio("Angka di dalam kotak rak mewakili:", [
     "Variasi SKU (Jenis Barang)", 
     "Sisa Slot Kosong", 
@@ -179,6 +178,10 @@ if tipe_cari == "Berdasarkan Produk":
                 pallets = sorted(group['Pallet Ke'].tolist())
                 pallet_range = f"{pallets[0]} - {pallets[-1]}" if len(pallets) > 1 else str(pallets[0]) if pallets else "-"
                 
+                pn_clean = str(part_num).strip().upper()
+                master_info = master_dict.get(pn_clean, {'ip': 0, 'pb': 0, 'ps': 0})
+                pss = master_info['pb'] if pn_clean.endswith(('D', 'G')) else master_info['ps']
+                
                 jml_utuh, val_pecahan, val_eceran = 0, 0, 0
                 for _, row in group.iterrows():
                     ket_str = str(row.get('Keterangan', '')).lower()
@@ -197,21 +200,30 @@ if tipe_cari == "Berdasarkan Produk":
                 if val_pecahan > 0: stok_str.append(f"{val_pecahan} Dus/Sak")
                 if val_eceran > 0: stok_str.append(f"{val_eceran} Pcs")
                 
+                fisik_str = " + ".join(stok_str) if stok_str else "0"
+                
+                # TAMBAHAN: Menghitung dan menempelkan Total Pcs di tabel FIFO
+                if master_info['ip'] > 0:
+                    total_pcs = (jml_utuh * master_info['ip']) + (val_pecahan * pss) + val_eceran
+                    # Format Indonesia (titik untuk ribuan)
+                    pcs_format = f"{total_pcs:,.0f}".replace(',', '.')
+                    fisik_str += f" ➔ {pcs_format} Pcs"
+                
                 fifo_summary.append({
                     'Lokasi Rak': f"{kolom}-{baris}",
                     'Part Number': part_num,
                     'Lot Number': lot,
-                    'Tanggal Produksi': tgl,
+                    'Jumlah Stok (Fisik & Pcs)': fisik_str,
                     'Range Pallet Ke': pallet_range,
-                    'Jumlah Stok (Fisik)': " + ".join(stok_str) if stok_str else "0",
+                    'Tanggal Produksi': tgl,
                     'Urutan_Sort': tgl
                 })
                 
             df_fifo = pd.DataFrame(fifo_summary).sort_values('Urutan_Sort').drop(columns=['Urutan_Sort'])
             df_fifo['Tanggal Produksi'] = df_fifo['Tanggal Produksi'].apply(lambda x: x.strftime('%d-%m-%Y') if x.year != 2099 else "Strip/Tidak Valid")
-            df_fifo = df_fifo[['Lokasi Rak', 'Part Number', 'Lot Number', 'Jumlah Stok (Fisik)', 'Range Pallet Ke', 'Tanggal Produksi']]
+            df_fifo = df_fifo[['Lokasi Rak', 'Part Number', 'Lot Number', 'Jumlah Stok (Fisik & Pcs)', 'Range Pallet Ke', 'Tanggal Produksi']]
             
-            st.info(f"💡 **Rekomendasi Ambil Pertama (Paling Lama):** Rak **{df_fifo.iloc[0]['Lokasi Rak']}** (Lot: {df_fifo.iloc[0]['Lot Number']}) dengan {df_fifo.iloc[0]['Jumlah Stok (Fisik)']}")
+            st.info(f"💡 **Rekomendasi Ambil Pertama (Paling Lama):** Rak **{df_fifo.iloc[0]['Lokasi Rak']}** (Lot: {df_fifo.iloc[0]['Lot Number']}) dengan {df_fifo.iloc[0]['Jumlah Stok (Fisik & Pcs)']}")
             st.dataframe(df_fifo, use_container_width=True, hide_index=True)
             st.divider()
         else:
@@ -460,13 +472,9 @@ def render_grid_area(title, start_baris, end_baris):
             info = matrix_info[(k, b)]
             with cols[idx + 1]:
                 if info['exist']:
-                    # LOGIKA PENGGANTIAN LABEL BUTTON ADA DI SINI
-                    if mode_tampilan == "Total Stok (Pcs)":
-                        lbl = format_compact_number(info['total_pcs'])
-                    elif mode_tampilan == "Sisa Slot Kosong":
-                        lbl = str(info['usable_space'])
-                    else:
-                        lbl = str(info['sku_cnt'])
+                    if mode_tampilan == "Total Stok (Pcs)": lbl = format_compact_number(info['total_pcs'])
+                    elif mode_tampilan == "Sisa Slot Kosong": lbl = str(info['usable_space'])
+                    else: lbl = str(info['sku_cnt'])
                         
                     if st.button(lbl, key=f"btn_{k}_{b}", use_container_width=True): show_rack_detail(k, b, info)
 
