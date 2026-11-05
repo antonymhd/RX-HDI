@@ -9,7 +9,12 @@ import plotly.express as px
 # ==========================================================
 # 1. KONFIGURASI HALAMAN
 # ==========================================================
-st.set_page_config(page_title="Warehouse 2D Racking", page_icon="📦", layout="wide", initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="Warehouse 2D Racking", 
+    page_icon="📦", 
+    layout="wide", 
+    initial_sidebar_state="expanded"
+)
 
 # ==========================================================
 # 2. INIT FIREBASE (DATABASE UJI COBA)
@@ -34,7 +39,8 @@ def load_data_from_firebase():
         if 'data' in doc_data:
             semua_data.extend(doc_data['data'])
             
-    if not semua_data: return pd.DataFrame()
+    if not semua_data: 
+        return pd.DataFrame()
         
     df = pd.DataFrame(semua_data)
     for c in df.columns:
@@ -50,8 +56,11 @@ def load_data_from_firebase():
 @st.cache_data(ttl=3600)
 def load_master_produk():
     try:
-        try: df_master = pd.read_csv("Master_Produk.csv", sep=";", encoding='utf-8-sig')
-        except: df_master = pd.read_csv("Master_Produk.csv", sep=",", encoding='utf-8-sig')
+        try: 
+            df_master = pd.read_csv("Master_Produk.csv", sep=";", encoding='utf-8-sig')
+        except: 
+            df_master = pd.read_csv("Master_Produk.csv", sep=",", encoding='utf-8-sig')
+        
         df_master.columns = df_master.columns.str.strip()
         if 'Part Number' in df_master.columns:
             df_master['Part Number Clean'] = df_master['Part Number'].astype(str).str.strip().str.upper()
@@ -106,12 +115,15 @@ def hitung_pcs_baris(row_ket, part_num):
         jml_utuh = 1
     else:
         mp = re.search(r'pecahan:\s*(\d+)', ket_str)
-        if mp: val_pecahan += int(mp.group(1))
+        if mp: 
+            val_pecahan += int(mp.group(1))
         else:
             nums = re.findall(r'\d+', ket_str)
-            if nums and 'pecahan' in ket_str: val_pecahan += int(nums[0])
+            if nums and 'pecahan' in ket_str: 
+                val_pecahan += int(nums[0])
         me = re.search(r'eceran:\s*(\d+)', ket_str)
-        if me: val_eceran += int(me.group(1))
+        if me: 
+            val_eceran += int(me.group(1))
         
     master_info = master_dict.get(pn, {'ip': 0, 'pb': 0, 'ps': 0})
     pss = master_info['pb'] if pn.endswith(('D', 'G')) else master_info['ps']
@@ -157,14 +169,18 @@ if tipe_cari == "Berdasarkan Produk":
     if product_col in df.columns:
         valid_mask = ~df['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])
         daftar_barang = sorted(df[valid_mask][product_col].dropna().astype(str).unique().tolist())
-    else: daftar_barang = []
+    else: 
+        daftar_barang = []
         
     pilihan_pencarian = st.sidebar.selectbox("Pilih Produk:", options=["-- Tampilkan Semua --"] + daftar_barang)
     search_query = "" if pilihan_pencarian == "-- Tampilkan Semua --" else pilihan_pencarian
     
     if search_query:
         st.markdown(f"### 🔎 Lokasi Pengambilan **{search_query}** (Urutan FIFO)")
-        df_search = df[df[product_col].astype(str).str.contains(search_query, case=False, na=False, regex=False)].copy()
+        
+        # REFAKTOR: Exact Match (==) untuk pencarian nama produk
+        q_clean = search_query.strip().lower()
+        df_search = df[df[product_col].astype(str).str.strip().str.lower() == q_clean].copy()
         
         if not df_search.empty:
             df_search['Tgl_Produksi'] = df_search['Lot Number'].apply(parse_lot_date)
@@ -185,15 +201,19 @@ if tipe_cari == "Berdasarkan Produk":
                 jml_utuh, val_pecahan, val_eceran = 0, 0, 0
                 for _, row in group.iterrows():
                     ket_str = str(row.get('Keterangan', '')).lower()
-                    if 'pecahan' not in ket_str and 'eceran' not in ket_str: jml_utuh += 1
+                    if 'pecahan' not in ket_str and 'eceran' not in ket_str: 
+                        jml_utuh += 1
                     else:
                         mp = re.search(r'pecahan:\s*(\d+)', ket_str)
-                        if mp: val_pecahan += int(mp.group(1))
+                        if mp: 
+                            val_pecahan += int(mp.group(1))
                         else:
                             nums = re.findall(r'\d+', ket_str)
-                            if nums and 'pecahan' in ket_str: val_pecahan += int(nums[0])
+                            if nums and 'pecahan' in ket_str: 
+                                val_pecahan += int(nums[0])
                         me = re.search(r'eceran:\s*(\d+)', ket_str)
-                        if me: val_eceran += int(me.group(1))
+                        if me: 
+                            val_eceran += int(me.group(1))
                         
                 stok_str = []
                 if jml_utuh > 0: stok_str.append(f"{jml_utuh} Plt")
@@ -230,7 +250,8 @@ else:
     if 'Lot Number' in df.columns:
         valid_mask = ~df['Lot Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>", "-", "0"])
         daftar_lot = sorted(df[valid_mask]['Lot Number'].dropna().astype(str).unique().tolist())
-    else: daftar_lot = []
+    else: 
+        daftar_lot = []
         
     pilihan_lot = st.sidebar.selectbox("Pilih No. Lot:", options=["-- Tampilkan Semua --"] + daftar_lot)
     search_lot = "" if pilihan_lot == "-- Tampilkan Semua --" else pilihan_lot
@@ -251,6 +272,9 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
     total_critical, total_warning, total_ideal, total_kosong = 0, 0, 0, 0
     total_slot_ideal, total_slot_warning = 0, 0
     
+    term_clean = search_term.strip().lower() if search_term else ""
+    lot_term_clean = search_lot_term.strip().lower() if search_lot_term else ""
+
     for k in kolom_list:
         for b in baris_list:
             if not is_rack_exist(k, b):
@@ -271,25 +295,28 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
                 if not p_valid.empty:
                     is_all_box = bool(p_valid.str.upper().str.endswith(('D', 'G')).all())
                     
-                if search_term:
-                    m_part = p_series.str.contains(search_term, case=False, na=False, regex=False).any()
-                    m_prod = sub[prod_col].astype(str).str.contains(search_term, case=False, na=False, regex=False).any() if prod_col in sub.columns else False
+                # REFAKTOR: Exact Match (==) untuk penyorotan warna biru pada rak
+                if term_clean:
+                    m_part = (p_series.str.lower() == term_clean).any()
+                    m_prod = (sub[prod_col].astype(str).str.strip().str.lower() == term_clean).any() if prod_col in sub.columns else False
                     is_match = bool(m_part or m_prod)
-                elif search_lot_term:
+                elif lot_term_clean:
                     if 'Lot Number' in sub.columns:
-                        is_match = sub['Lot Number'].astype(str).str.strip().str.contains(search_lot_term, case=False, na=False, regex=False).any()
+                        is_match = (sub['Lot Number'].astype(str).str.strip().str.lower() == lot_term_clean).any()
                         
             max_slot = int(32 if b <= 16 else 46) if is_all_box else int(31 if b <= 16 else 44)
             usable_space = max(0, max_slot - filled)
             
-            if sku >= 3: total_critical += 1
+            if sku >= 3: 
+                total_critical += 1
             elif sku == 2: 
                 total_warning += 1
                 if usable_space > 1: total_slot_warning += usable_space
             elif sku == 1:
                 total_ideal += 1
                 if usable_space > 1: total_slot_ideal += usable_space
-            elif sku == 0: total_kosong += 1
+            elif sku == 0: 
+                total_kosong += 1
                 
             matrix_info[(k, b)] = {
                 'exist': True, 'sku_cnt': sku, 'filled': filled, 
@@ -317,7 +344,8 @@ for (k, b), info in matrix_info.items():
             anomali = df_sub[df_sub['Catatan'].astype(str).str.contains('BAYANGAN', case=False, na=False)]
             if not anomali.empty:
                 rak_bermasalah.add(f"{k}-{b}")
-                for _, row in anomali.iterrows(): bayangan_data.append(row.to_dict())
+                for _, row in anomali.iterrows(): 
+                    bayangan_data.append(row.to_dict())
 
 if bayangan_data:
     st.sidebar.error(f"⚠️ **Ditemukan {len(rak_bermasalah)} Rak Overlimit:**\n\n{', '.join(sorted(list(rak_bermasalah)))}")
@@ -325,7 +353,13 @@ if bayangan_data:
     cols_tersedia = [c for c in ['Kolom', 'Baris', 'Pallet Ke', 'Part Number', 'Nama Produk', 'Lot Number', 'Keterangan', 'Catatan'] if c in df_bayangan.columns]
     df_bayangan = df_bayangan[cols_tersedia].sort_values(by=['Kolom', 'Baris', 'Pallet Ke'])
     csv = df_bayangan.to_csv(index=False, sep=";").encode('utf-8-sig')
-    st.sidebar.download_button(label="📥 Unduh Daftar Pallet Bayangan", data=csv, file_name=f"Cek_Lapangan_Overlimit_{(datetime.utcnow() + timedelta(hours=7)).strftime('%Y%m%d_%H%M')}.csv", mime="text/csv", type="primary")
+    st.sidebar.download_button(
+        label="📥 Unduh Daftar Pallet Bayangan", 
+        data=csv, 
+        file_name=f"Cek_Lapangan_Overlimit_{(datetime.utcnow() + timedelta(hours=7)).strftime('%Y%m%d_%H%M')}.csv", 
+        mime="text/csv", 
+        type="primary"
+    )
 else:
     st.sidebar.success("✅ Seluruh rak dalam batas kapasitas normal.")
 
@@ -362,15 +396,19 @@ def show_rack_detail(k, b, info):
             jml_utuh, val_pecahan, val_eceran = 0, 0, 0
             for _, row in df_prod.iterrows():
                 ket_str = str(row.get('Keterangan', '')).lower()
-                if 'pecahan' not in ket_str and 'eceran' not in ket_str: jml_utuh += 1
+                if 'pecahan' not in ket_str and 'eceran' not in ket_str: 
+                    jml_utuh += 1
                 else:
                     mp = re.search(r'pecahan:\s*(\d+)', ket_str)
-                    if mp: val_pecahan += int(mp.group(1))
+                    if mp: 
+                        val_pecahan += int(mp.group(1))
                     else:
                         nums = re.findall(r'\d+', ket_str)
-                        if nums and 'pecahan' in ket_str: val_pecahan += int(nums[0])
+                        if nums and 'pecahan' in ket_str: 
+                            val_pecahan += int(nums[0])
                     me = re.search(r'eceran:\s*(\d+)', ket_str)
-                    if me: val_eceran += int(me.group(1))
+                    if me: 
+                        val_eceran += int(me.group(1))
 
             sc = "Dus" if pnc.endswith(('D', 'G')) else "Sak"
             pss = master_info['pb'] if pnc.endswith(('D', 'G')) else master_info['ps']
@@ -381,7 +419,8 @@ def show_rack_detail(k, b, info):
                 if val_pecahan > 0: teks_rincian += f" + {val_pecahan} {sc} * {pss:,.0f}"
                 if val_eceran > 0: teks_rincian += f" + {val_eceran} Pcs"
                 teks_rincian += f" = **Total {tot:,.0f} Pcs**"
-            else: teks_rincian = f"{jml_utuh} Pallet"
+            else: 
+                teks_rincian = f"{jml_utuh} Pallet"
 
             rekap_data.append({'Part Number': pnc, 'Nama Produk': prod_name, 'Pallet Utuh': jml_utuh, 'Konversi Total Pcs': teks_rincian})
         
@@ -392,7 +431,8 @@ def show_rack_detail(k, b, info):
         st.markdown("#### 📑 Rincian Posisi per Pallet")
         avail = [c for c in ['Pallet Ke', 'Part Number', 'Lot Number', product_col, 'Keterangan', 'Catatan'] if c in df_terisi.columns]
         df_tampil = df_terisi[avail].copy()
-        if 'Pallet Ke' in df_tampil.columns: df_tampil = df_tampil.sort_values(by='Pallet Ke', ascending=True)
+        if 'Pallet Ke' in df_tampil.columns: 
+            df_tampil = df_tampil.sort_values(by='Pallet Ke', ascending=True)
             
         def highlight_bayangan(row):
             cat = str(row.get('Catatan', '')).upper()
@@ -416,7 +456,7 @@ col_m3.metric("🟡 Rak Campur (2 SKU)", f"{total_warning} Baris", f"{total_slot
 col_m4.metric("🔴 Rak Kritis (>= 3 SKU)", f"{total_critical} Baris", "Hindari Inbound", delta_color="off")
 col_m5.metric("⚪ Rak Kosong Bersih", f"{total_kosong} Baris")
 
-# --- MENAMBAHKAN DONUT CHART ---
+# --- DONUT CHART ---
 st.write("")
 col_chart1, col_chart2, col_chart3 = st.columns([1, 2, 1])
 with col_chart2:
@@ -425,7 +465,6 @@ with col_chart2:
         'Jumlah': [total_ideal, total_warning, total_critical, total_kosong]
     })
     
-    # Mapping warna agar persis dengan kotak grid
     warna_pie = {
         '🟢 Ideal': 'palegreen', 
         '🟡 Campur': 'gold', 
@@ -439,7 +478,7 @@ with col_chart2:
         names='Status', 
         color='Status',
         color_discrete_map=warna_pie, 
-        hole=0.4 # Membuatnya menjadi Donut Chart yang elegan
+        hole=0.4
     )
     
     fig.update_traces(
@@ -505,7 +544,8 @@ def render_grid_area(title, start_baris, end_baris):
     with header_cols[0]: st.empty() 
         
     for idx, b in enumerate(list(range(start_baris, end_baris + 1))):
-        with header_cols[idx + 1]: st.markdown(f"<div style='text-align:center; font-weight:900; font-size:14px; color:#94a3b8; margin-bottom:4px;'>{b}</div>", unsafe_allow_html=True)
+        with header_cols[idx + 1]: 
+            st.markdown(f"<div style='text-align:center; font-weight:900; font-size:14px; color:#94a3b8; margin-bottom:4px;'>{b}</div>", unsafe_allow_html=True)
     
     for k in kolom_list:
         cols = st.columns([0.6] + [1] * 16, gap="small")
@@ -515,10 +555,9 @@ def render_grid_area(title, start_baris, end_baris):
             info = matrix_info[(k, b)]
             with cols[idx + 1]:
                 if info['exist']:
-                    if mode_tampilan == "Sisa Slot Kosong": lbl = str(info['usable_space'])
-                    else: lbl = str(info['sku_cnt'])
-                        
-                    if st.button(lbl, key=f"btn_{k}_{b}", use_container_width=True): show_rack_detail(k, b, info)
+                    lbl = str(info['usable_space']) if mode_tampilan == "Sisa Slot Kosong" else str(info['sku_cnt'])
+                    if st.button(lbl, key=f"btn_{k}_{b}", use_container_width=True): 
+                        show_rack_detail(k, b, info)
 
 render_grid_area("📍 Area 1 (Rak 1 - 16)", 1, 16)
 st.divider()
