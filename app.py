@@ -4,6 +4,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import re
 from datetime import datetime, timedelta
+import plotly.express as px
 
 # ==========================================================
 # 1. KONFIGURASI HALAMAN
@@ -132,7 +133,7 @@ st.sidebar.header("👁️ Mode Tampilan Kotak")
 mode_tampilan = st.sidebar.radio("Angka di dalam kotak rak mewakili:", [
     "Variasi SKU (Jenis Barang)", 
     "Sisa Slot Kosong"
-]) # <-- KEMBALI KE 2 OPSI AGAR RINGAN
+])
 
 # ==========================================================
 # 5. MEMUAT DATA UTAMA & PENCARIAN
@@ -235,7 +236,7 @@ else:
     search_lot = "" if pilihan_lot == "-- Tampilkan Semua --" else pilihan_lot
 
 # ==========================================================
-# 6. LOGIKA MATRIKS RAK (MURNI TANPA LOOPING PCS DI AWAL)
+# 6. LOGIKA MATRIKS RAK
 # ==========================================================
 def is_rack_exist(kolom, baris):
     if kolom == 'F' and baris < 5: return False
@@ -329,11 +330,10 @@ else:
     st.sidebar.success("✅ Seluruh rak dalam batas kapasitas normal.")
 
 # ==========================================================
-# 7. POP-UP DETAIL RAK (LAZY LOADING KALKULASI PCS)
+# 7. POP-UP DETAIL RAK
 # ==========================================================
 @st.dialog("📦 Rincian Detail Rak", width="large")
 def show_rack_detail(k, b, info):
-    # Hitung total Pcs HANYA saat pop-up dibuka
     grand_total_pcs = 0
     if info['sku_cnt'] > 0:
         df_terisi_awal = info['df_sub'][~info['df_sub']['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])]
@@ -405,7 +405,7 @@ def show_rack_detail(k, b, info):
         st.success("✅ Rak Kosong. Aman untuk diisi.")
 
 # ==========================================================
-# 8. RENDER METRIK & GRID UI
+# 8. RENDER METRIK, CHART, & GRID UI
 # ==========================================================
 col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
 total_baris_hitung = total_ideal + total_warning + total_critical + total_kosong
@@ -415,6 +415,51 @@ col_m2.metric("🟢 Rak Ideal (1 SKU)", f"{total_ideal} Baris", f"{total_slot_id
 col_m3.metric("🟡 Rak Campur (2 SKU)", f"{total_warning} Baris", f"{total_slot_warning} Slot Siap Isi", delta_color="normal")
 col_m4.metric("🔴 Rak Kritis (>= 3 SKU)", f"{total_critical} Baris", "Hindari Inbound", delta_color="off")
 col_m5.metric("⚪ Rak Kosong Bersih", f"{total_kosong} Baris")
+
+# --- MENAMBAHKAN DONUT CHART ---
+st.write("")
+col_chart1, col_chart2, col_chart3 = st.columns([1, 2, 1])
+with col_chart2:
+    df_pie = pd.DataFrame({
+        'Status': ['🟢 Ideal', '🟡 Campur', '🔴 Kritis', '⚪ Kosong'],
+        'Jumlah': [total_ideal, total_warning, total_critical, total_kosong]
+    })
+    
+    # Mapping warna agar persis dengan kotak grid
+    warna_pie = {
+        '🟢 Ideal': 'palegreen', 
+        '🟡 Campur': 'gold', 
+        '🔴 Kritis': 'crimson', 
+        '⚪ Kosong': 'gainsboro'
+    }
+
+    fig = px.pie(
+        df_pie, 
+        values='Jumlah', 
+        names='Status', 
+        color='Status',
+        color_discrete_map=warna_pie, 
+        hole=0.4 # Membuatnya menjadi Donut Chart yang elegan
+    )
+    
+    fig.update_traces(
+        textposition='inside', 
+        textinfo='percent+label',
+        hovertemplate="<b>%{label}</b><br>Jumlah: %{value} Rak<br>Persentase: %{percent}<extra></extra>",
+        textfont_size=14, 
+        textfont_color='black'
+    )
+    
+    fig.update_layout(
+        margin=dict(t=20, b=20, l=0, r=0), 
+        height=280, 
+        showlegend=False,
+        plot_bgcolor='rgba(0,0,0,0)', 
+        paper_bgcolor='rgba(0,0,0,0)'
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
 st.divider()
 
 css_block_1 = ".block-container { max-width: 98% !important; padding-top: 2rem !important; padding-bottom: 2rem !important; }"
