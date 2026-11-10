@@ -178,7 +178,6 @@ if tipe_cari == "Berdasarkan Produk":
     if search_query:
         st.markdown(f"### 🔎 Lokasi Pengambilan **{search_query}** (Urutan FIFO)")
         
-        # REFAKTOR: Exact Match (==) untuk pencarian nama produk
         q_clean = search_query.strip().lower()
         df_search = df[df[product_col].astype(str).str.strip().str.lower() == q_clean].copy()
         
@@ -188,6 +187,9 @@ if tipe_cari == "Berdasarkan Produk":
             
             fifo_summary = []
             grouped = df_search.groupby(['Kolom', 'Baris', 'Part Number', 'Lot Number', 'Tgl_Produksi'], dropna=False)
+            
+            # --- MULAI BAGIAN BARU: Kalkulasi Grand Total Pcs ---
+            grand_total_search_pcs = 0 
             
             for name, group in grouped:
                 kolom, baris, part_num, lot, tgl = name
@@ -214,7 +216,10 @@ if tipe_cari == "Berdasarkan Produk":
                         me = re.search(r'eceran:\s*(\d+)', ket_str)
                         if me: 
                             val_eceran += int(me.group(1))
-                        
+                
+                total_pcs_group = (jml_utuh * master_info['ip']) + (val_pecahan * pss) + val_eceran
+                grand_total_search_pcs += total_pcs_group
+                
                 stok_str = []
                 if jml_utuh > 0: stok_str.append(f"{jml_utuh} Plt")
                 if val_pecahan > 0: stok_str.append(f"{val_pecahan} Dus/Sak")
@@ -222,9 +227,8 @@ if tipe_cari == "Berdasarkan Produk":
                 
                 fisik_str = " + ".join(stok_str) if stok_str else "0"
                 
-                if master_info['ip'] > 0:
-                    total_pcs = (jml_utuh * master_info['ip']) + (val_pecahan * pss) + val_eceran
-                    pcs_format = f"{total_pcs:,.0f}".replace(',', '.')
+                if master_info['ip'] > 0 or total_pcs_group > 0:
+                    pcs_format = f"{total_pcs_group:,.0f}".replace(',', '.')
                     fisik_str += f" ➔ {pcs_format} Pcs"
                 
                 fifo_summary.append({
@@ -243,6 +247,16 @@ if tipe_cari == "Berdasarkan Produk":
             
             st.info(f"💡 **Rekomendasi Ambil Pertama (Paling Lama):** Rak **{df_fifo.iloc[0]['Lokasi Rak']}** (Lot: {df_fifo.iloc[0]['Lot Number']}) dengan {df_fifo.iloc[0]['Jumlah Stok (Fisik & Pcs)']}")
             st.dataframe(df_fifo, use_container_width=True, hide_index=True)
+            
+            if grand_total_search_pcs > 0:
+                total_semua_format = f"{grand_total_search_pcs:,.0f}".replace(',', '.')
+                st.markdown(
+                    f"<div style='text-align: right; padding-top: 8px; font-size: 16px; color: #475569;'>"
+                    f"Total Kuantitas Keseluruhan: <span style='color: #2563eb; font-weight: 900; font-size: 18px;'>{total_semua_format} Pcs</span>"
+                    f"</div>", 
+                    unsafe_allow_html=True
+                )
+            # --- AKHIR BAGIAN BARU ---
             st.divider()
         else:
             st.warning("Produk tidak ditemukan di rak manapun.")
@@ -295,7 +309,6 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
                 if not p_valid.empty:
                     is_all_box = bool(p_valid.str.upper().str.endswith(('D', 'G')).all())
                     
-                # REFAKTOR: Exact Match (==) untuk penyorotan warna biru pada rak
                 if term_clean:
                     m_part = (p_series.str.lower() == term_clean).any()
                     m_prod = (sub[prod_col].astype(str).str.strip().str.lower() == term_clean).any() if prod_col in sub.columns else False
