@@ -162,24 +162,30 @@ if df.empty or 'Kolom' not in df.columns:
 product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 
 st.sidebar.header("🔍 Pencarian Spesifik")
-tipe_cari = st.sidebar.radio("Metode Pencarian:", ["Berdasarkan Produk", "Berdasarkan No. Lot"])
+# --- TAMBAH OPSI PART NUMBER DI RADIO BUTTON ---
+tipe_cari = st.sidebar.radio("Metode Pencarian:", ["Berdasarkan Produk", "Berdasarkan Part Number", "Berdasarkan No. Lot"])
 search_query, search_lot = "", ""
 
-if tipe_cari == "Berdasarkan Produk":
-    if product_col in df.columns:
-        valid_mask = ~df['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])
-        daftar_barang = sorted(df[valid_mask][product_col].dropna().astype(str).unique().tolist())
+# --- GABUNG LOGIKA PRODUK & PART NUMBER KARENA SAMA-SAMA BUTUH TABEL FIFO ---
+if tipe_cari in ["Berdasarkan Produk", "Berdasarkan Part Number"]:
+    search_col = product_col if tipe_cari == "Berdasarkan Produk" else 'Part Number'
+    
+    if search_col in df.columns:
+        valid_mask = ~df[search_col].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])
+        daftar_pilihan = sorted(df[valid_mask][search_col].dropna().astype(str).unique().tolist())
     else: 
-        daftar_barang = []
+        daftar_pilihan = []
         
-    pilihan_pencarian = st.sidebar.selectbox("Pilih Produk:", options=["-- Tampilkan Semua --"] + daftar_barang)
+    label_selectbox = "Pilih Produk:" if tipe_cari == "Berdasarkan Produk" else "Pilih Part Number:"
+    pilihan_pencarian = st.sidebar.selectbox(label_selectbox, options=["-- Tampilkan Semua --"] + daftar_pilihan)
     search_query = "" if pilihan_pencarian == "-- Tampilkan Semua --" else pilihan_pencarian
     
     if search_query:
         st.markdown(f"### 🔎 Lokasi Pengambilan **{search_query}** (Urutan FIFO)")
         
         q_clean = search_query.strip().lower()
-        df_search = df[df[product_col].astype(str).str.strip().str.lower() == q_clean].copy()
+        # Pencarian difilter dinamis berdasarkan search_col (Produk atau Part Number)
+        df_search = df[df[search_col].astype(str).str.strip().str.lower() == q_clean].copy()
         
         if not df_search.empty:
             df_search['Tgl_Produksi'] = df_search['Lot Number'].apply(parse_lot_date)
@@ -188,7 +194,6 @@ if tipe_cari == "Berdasarkan Produk":
             fifo_summary = []
             grouped = df_search.groupby(['Kolom', 'Baris', 'Part Number', 'Lot Number', 'Tgl_Produksi'], dropna=False)
             
-            # --- MULAI BAGIAN BARU: Kalkulasi Grand Total Pcs ---
             grand_total_search_pcs = 0 
             
             for name, group in grouped:
@@ -256,11 +261,11 @@ if tipe_cari == "Berdasarkan Produk":
                     f"</div>", 
                     unsafe_allow_html=True
                 )
-            # --- AKHIR BAGIAN BARU ---
             st.divider()
         else:
-            st.warning("Produk tidak ditemukan di rak manapun.")
+            st.warning("Data tidak ditemukan di rak manapun.")
 else:
+    # --- LOGIKA KHUSUS JIKA PENCARIAN BERDASARKAN NO. LOT ---
     if 'Lot Number' in df.columns:
         valid_mask = ~df['Lot Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>", "-", "0"])
         daftar_lot = sorted(df[valid_mask]['Lot Number'].dropna().astype(str).unique().tolist())
