@@ -51,6 +51,11 @@ def load_data_from_firebase():
         if col in df.columns: 
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype(int)
             
+    # Filter eksklusif hanya kolom Shuttle Racking (A - G)
+    if 'Kolom' in df.columns:
+        df['Kolom'] = df['Kolom'].astype(str).str.strip().str.upper()
+        df = df[df['Kolom'].isin(['A', 'B', 'C', 'D', 'E', 'F', 'G'])].copy()
+            
     return df
 
 @st.cache_data(ttl=3600)
@@ -90,14 +95,18 @@ def parse_lot_date(lot_str):
     cleaned = str(lot_str).strip()
     if len(cleaned) >= 6:
         date_str = cleaned[-6:]
+        # Ekstrak digit shift (posisi ke-7 dari belakang) sebagai jam (hour) untuk urutan FIFO
+        shift_char = cleaned[-7] if len(cleaned) >= 7 and cleaned[-7].isdigit() else '9'
+        shift_num = int(shift_char)
+        
         try:
             day = int(date_str[0:2])
             month = int(date_str[2:4])
             year = int('20' + date_str[4:6])
-            return datetime(year, month, day)
+            return datetime(year, month, day, hour=shift_num)
         except:
-            return datetime(2099, 12, 31)
-    return datetime(2099, 12, 31)
+            return datetime(2099, 12, 31, hour=23)
+    return datetime(2099, 12, 31, hour=23)
 
 def format_compact_number(num):
     if num >= 1_000_000:
@@ -151,7 +160,7 @@ mode_tampilan = st.sidebar.radio("Angka di dalam kotak rak mewakili:", [
 # 5. MEMUAT DATA UTAMA & PENCARIAN
 # ==========================================================
 st.title("📦 Visualisasi Grid Gudang (Live Monitor)")
-st.caption(f"Layar pantau Read-Only. Terhubung ke database: {NAMA_DATABASE}")
+st.caption(f"Layar pantau Read-Only. Terhubung ke database: {NAMA_DATABASE} (Area Shuttle A - G)")
 
 df = load_data_from_firebase()
 
@@ -162,11 +171,9 @@ if df.empty or 'Kolom' not in df.columns:
 product_col = 'Nama Produk' if 'Nama Produk' in df.columns else 'Nama Barang'
 
 st.sidebar.header("🔍 Pencarian Spesifik")
-# --- TAMBAH OPSI PART NUMBER DI RADIO BUTTON ---
 tipe_cari = st.sidebar.radio("Metode Pencarian:", ["Berdasarkan Produk", "Berdasarkan Part Number", "Berdasarkan No. Lot"])
 search_query, search_lot = "", ""
 
-# --- GABUNG LOGIKA PRODUK & PART NUMBER KARENA SAMA-SAMA BUTUH TABEL FIFO ---
 if tipe_cari in ["Berdasarkan Produk", "Berdasarkan Part Number"]:
     search_col = product_col if tipe_cari == "Berdasarkan Produk" else 'Part Number'
     
@@ -184,8 +191,11 @@ if tipe_cari in ["Berdasarkan Produk", "Berdasarkan Part Number"]:
         st.markdown(f"### 🔎 Lokasi Pengambilan **{search_query}** (Urutan FIFO)")
         
         q_clean = search_query.strip().lower()
-        # Pencarian difilter dinamis berdasarkan search_col (Produk atau Part Number)
-        df_search = df[df[search_col].astype(str).str.strip().str.lower() == q_clean].copy()
+        # Pastikan hanya memproses rak A-G
+        df_search = df[
+            (df[search_col].astype(str).str.strip().str.lower() == q_clean) &
+            (df['Kolom'].isin(['A', 'B', 'C', 'D', 'E', 'F', 'G']))
+        ].copy()
         
         if not df_search.empty:
             df_search['Tgl_Produksi'] = df_search['Lot Number'].apply(parse_lot_date)
@@ -257,15 +267,14 @@ if tipe_cari in ["Berdasarkan Produk", "Berdasarkan Part Number"]:
                 total_semua_format = f"{grand_total_search_pcs:,.0f}".replace(',', '.')
                 st.markdown(
                     f"<div style='text-align: right; padding-top: 8px; font-size: 16px; color: #475569;'>"
-                    f"Total Kuantitas Keseluruhan: <span style='color: #2563eb; font-weight: 900; font-size: 18px;'>{total_semua_format} Pcs</span>"
+                    f"Total Kuantitas Keseluruhan (Rak A-G): <span style='color: #2563eb; font-weight: 900; font-size: 18px;'>{total_semua_format} Pcs</span>"
                     f"</div>", 
                     unsafe_allow_html=True
                 )
             st.divider()
         else:
-            st.warning("Data tidak ditemukan di rak manapun.")
+            st.warning("Data tidak ditemukan di rak A-G.")
 else:
-    # --- LOGIKA KHUSUS JIKA PENCARIAN BERDASARKAN NO. LOT ---
     if 'Lot Number' in df.columns:
         valid_mask = ~df['Lot Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>", "-", "0"])
         daftar_lot = sorted(df[valid_mask]['Lot Number'].dropna().astype(str).unique().tolist())
@@ -276,13 +285,14 @@ else:
     search_lot = "" if pilihan_lot == "-- Tampilkan Semua --" else pilihan_lot
 
 # ==========================================================
-# 6. LOGIKA MATRIKS RAK
+# 6. LOGIKA MATRIKS RAK (CACHED UNTUK POP-UP INSTAN)
 # ==========================================================
 def is_rack_exist(kolom, baris):
     if kolom == 'F' and baris < 5: return False
     if kolom == 'G' and baris < 17: return False
     return True
 
+@st.cache_data(ttl=300)
 def process_matrix_data(df, search_term, search_lot_term, prod_col):
     kolom_list = ['G', 'F', 'E', 'D', 'C', 'B', 'A']
     baris_list = list(range(1, 29))
@@ -294,16 +304,19 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
     term_clean = search_term.strip().lower() if search_term else ""
     lot_term_clean = search_lot_term.strip().lower() if search_lot_term else ""
 
+    # Kelompokkan sekali di awal agar tidak memfilter berulang 176 kali
+    grouped_racks = dict(tuple(df.groupby(['Kolom', 'Baris'])))
+
     for k in kolom_list:
         for b in baris_list:
             if not is_rack_exist(k, b):
                 matrix_info[(k, b)] = {'exist': False}
                 continue
                 
-            sub = df[(df['Kolom'] == k) & (df['Baris'] == b)]
+            sub = grouped_racks.get((k, b), pd.DataFrame(columns=df.columns))
             is_all_box, filled, sku, is_match = False, 0, 0, False
             
-            if 'Part Number' in sub.columns:
+            if 'Part Number' in sub.columns and not sub.empty:
                 p_series = sub['Part Number'].astype(str).str.strip()
                 valid_mask = ~p_series.str.lower().isin(["", "nan", "none", "<na>"])
                 p_valid = p_series[valid_mask]
@@ -368,7 +381,7 @@ for (k, b), info in matrix_info.items():
 if bayangan_data:
     st.sidebar.error(f"⚠️ **Ditemukan {len(rak_bermasalah)} Rak Overlimit:**\n\n{', '.join(sorted(list(rak_bermasalah)))}")
     df_bayangan = pd.DataFrame(bayangan_data)
-    cols_tersedia = [c for c in ['Kolom', 'Baris', 'Pallet Ke', 'Part Number', 'Nama Produk', 'Lot Number', 'Keterangan', 'Catatan'] if c in df_bayangan.columns]
+    cols_tersedia = [c for c in ['Kolom', 'Baris', 'Pallet Ke', 'Part Number', product_col, 'Lot Number', 'Keterangan', 'Catatan'] if c in df_bayangan.columns]
     df_bayangan = df_bayangan[cols_tersedia].sort_values(by=['Kolom', 'Baris', 'Pallet Ke'])
     csv = df_bayangan.to_csv(index=False, sep=";").encode('utf-8-sig')
     st.sidebar.download_button(
@@ -620,7 +633,7 @@ for k in kolom_list:
                 valid_df = df_sub[~df_sub['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])]
                 for _, row in valid_df.iterrows():
                     pn = str(row['Part Number']).strip().upper()
-                    prod = str(row.get('Nama Produk', pn)).strip()
+                    prod = str(row.get(product_col, pn)).strip()
                     lot = str(row.get('Lot Number', '')).strip()
                     pallet_ke = int(row.get('Pallet Ke', 0))
                     lot_date = parse_lot_date(lot)
