@@ -1,8 +1,10 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import firebase_admin
 from firebase_admin import credentials, firestore
 import re
+import io
 from datetime import datetime, timedelta
 import plotly.express as px
 
@@ -89,13 +91,15 @@ if not df_master_global.empty and 'Part Number Clean' in df_master_global.column
         }
 
 # ==========================================================
-# FUNGSI HELPER
+# FUNGSI HELPER & GENERATOR KARTU RACKING
 # ==========================================================
+def get_waktu_jkt():
+    return datetime.utcnow() + timedelta(hours=7)
+
 def parse_lot_date(lot_str):
     cleaned = str(lot_str).strip()
     if len(cleaned) >= 6:
         date_str = cleaned[-6:]
-        # Ekstrak digit shift (posisi ke-7 dari belakang) sebagai jam (hour) untuk urutan FIFO
         shift_char = cleaned[-7] if len(cleaned) >= 7 and cleaned[-7].isdigit() else '9'
         shift_num = int(shift_char)
         
@@ -138,6 +142,355 @@ def hitung_pcs_baris(row_ket, part_num):
     pss = master_info['pb'] if pn.endswith(('D', 'G')) else master_info['ps']
     
     return (jml_utuh * master_info['ip']) + (val_pecahan * pss) + val_eceran
+
+def build_picking_cards(kolom, baris, df_sub, prod_col):
+    """
+    Menyusun kartu racking: 1 kartu per Part Number (item sejenis).
+    Di dalam 1 kartu bisa berisi beberapa baris Lot Number untuk item tersebut.
+    """
+    lokasi_str = f"{kolom}-{baris}"
+    area_str = "Area 1 (1–16)" if baris <= 16 else "Area 2 (17–28)"
+    
+    if df_sub.empty or 'Part Number' not in df_sub.columns:
+        return [{
+            'Lokasi': lokasi_str, 'Area': area_str, 'Part Number': '-',
+            'Nama Produk': 'RAK KOSONG', 'Total Fisik': '0', 'Total Pcs': 0,
+            'Detail Lot': [], 'Is_Empty': True
+        }]
+        
+    valid_df = df_sub[~df_sub['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])].copy()
+    if valid_df.empty:
+        return [{
+            'Lokasi': lokasi_str, 'Area': area_str, 'Part Number': '-',
+            'Nama Produk': 'RAK KOSONG', 'Total Fisik': '0', 'Total Pcs': 0,
+            'Detail Lot': [], 'Is_Empty': True
+        }]
+
+    valid_df['PN_Clean'] = valid_df['Part Number'].astype(str).str.strip().str.upper()
+    if 'Pallet Ke' in valid_df.columns:
+        valid_df = valid_df.sort_values(by='Pallet Ke', ascending=True)
+
+    # Urutkan kemunculan Part Number berdasarkan posisi terdepan (Pallet Ke terkecil)
+    pn_order = valid_df.groupby('PN_Clean')['Pallet Ke'].min().sort_values().index.tolist()
+    cards = []
+
+    for pn in pn_order:
+        df_item = valid_df[valid_df['PN_Clean'] == pn].copy()
+        prod_name = str(df_item[prod_col].dropna().values[0]).strip() if prod_col in df_item.columns and len(df_item[prod_col].dropna().values) > 0 else "-"
+        
+        master_info = master_dict.get(pn, {'ip': 0, 'pb': 0, 'ps': 0})
+        pss = master_info['pb'] if pn.endswith(('D', 'G')) else master_info['ps']
+        satuan_pecahan = "Dus" if pn.endswith(('D', 'G')) else "Sak"
+
+        df_item['Lot_Clean'] = df_item['Lot Number'].fillna('-').astype(str).str.strip()
+        df_item['Tgl_Sort'] = df_item['Lot_Clean'].apply(parse_lot_date)
+        df_item = df_item.sort_values(by=['Tgl_Sort', 'Pallet Ke'], ascending=[True, True])
+
+        lot_details = []
+        tot_item_utuh, tot_item_pecahan, tot_item_eceran, tot_item_pcs = 0, 0, 0, 0
+
+        for lot_val, grp_lot in df_item.groupby('Lot_Clean', sort=False):
+            pallets = sorted(grp_lot['Pallet Ke'].tolist())
+            plt_range = f"{pallets[0]}–{pallets[-1]}" if len(pallets) > 1 else str(pallets[0])
+            
+            u, p_val, e_val = 0, 0, 0
+            catatan_set = set()
+            for _, r in grp_lot.iterrows():
+                ket_str = str(r.get('Keterangan', '')).lower()
+                if 'pecahan' not in ket_str and 'eceran' not in ket_str:
+                    u += 1
+                else:
+                    mp = re.search(r'pecahan:\s*(\d+)', ket_str)
+                    if mp:
+                        p_val += int(mp.group(1))
+                    else:
+                        nums = re.findall(r'\d+', ket_str)
+                        if nums and 'pecahan' in ket_str:
+                            p_val += int(nums[0])
+                    me = re.search(r'eceran:\s*(\d+)', ket_str)
+                    if me:
+                        e_val += int(me.group(1))
+                
+                cat_str = str(r.get('Catatan', '')).strip()
+                if cat_str and cat_str.lower() not in ['nan', 'none', '']:
+                    catatan_set.add(cat_str)
+
+            pcs_lot = (u * master_info['ip']) + (p_val * pss) + e_val
+            tot_item_utuh += u
+            tot_item_pecahan += p_val
+            tot_item_eceran += e_val
+            tot_item_pcs += pcs_lot
+
+            qty_parts = []
+            if u > 0: qty_parts.append(f"{u} Plt")
+            if p_val > 0: qty_parts.append(f"{p_val} {satuan_pecahan}")
+            if e_val > 0: qty_parts.append(f"{e_val} Pcs")
+            qty_str = " + ".join(qty_parts) if qty_parts else "0"
+
+            tgl_dt = parse_lot_date(lot_val)
+            tgl_str = tgl_dt.strftime('%d-%m-%Y') if tgl_dt.year != 2099 else "-"
+
+            lot_details.append({
+                'lot': lot_val,
+                'tgl': tgl_str,
+                'pallet_range': plt_range,
+                'qty_str': qty_str,
+                'pcs': int(pcs_lot),
+                'catatan': ", ".join(sorted(catatan_set)) if catatan_set else "-"
+            })
+
+        tot_parts = []
+        if tot_item_utuh > 0: tot_parts.append(f"{tot_item_utuh} Plt")
+        if tot_item_pecahan > 0: tot_parts.append(f"{tot_item_pecahan} {satuan_pecahan}")
+        if tot_item_eceran > 0: tot_parts.append(f"{tot_item_eceran} Pcs")
+
+        cards.append({
+            'Lokasi': lokasi_str,
+            'Area': area_str,
+            'Part Number': pn,
+            'Nama Produk': prod_name,
+            'Total Fisik': " + ".join(tot_parts) if tot_parts else "0",
+            'Total Pcs': int(tot_item_pcs),
+            'Detail Lot': lot_details,
+            'Is_Empty': False
+        })
+
+    return cards
+
+def render_print_html(cards, judul_dok, waktu_cetak):
+    """Merender kartu racking HTML siap cetak (2 kartu per baris A4, anti-terpotong)."""
+    cards_html = ""
+    for c in cards:
+        if c['Is_Empty']:
+            cards_html += f"""
+            <div class="card empty-card">
+                <div class="card-header">
+                    <div class="loc-badge">{c['Lokasi']}</div>
+                    <div class="area-tag">{c['Area']}</div>
+                </div>
+                <div class="empty-body">
+                    <div class="empty-title">RAK KOSONG</div>
+                    <div class="empty-sub">Siap diisi inbound</div>
+                </div>
+                <div class="card-footer">
+                    <span>Dicetak: {waktu_cetak}</span>
+                    <span>Paraf: ___________</span>
+                </div>
+            </div>
+            """
+        else:
+            rows_html = ""
+            for idx, ld in enumerate(c['Detail Lot'], start=1):
+                pcs_fmt = f"{ld['pcs']:,.0f}".replace(',', '.') if ld['pcs'] > 0 else "-"
+                cat_badge = f"<br><span class='cat-warn'>{ld['catatan']}</span>" if ld['catatan'] != "-" else ""
+                rows_html += f"""
+                <tr>
+                    <td class="center">{idx}</td>
+                    <td class="bold">{ld['lot']}{cat_badge}</td>
+                    <td class="center">{ld['tgl']}</td>
+                    <td class="center bold">{ld['pallet_range']}</td>
+                    <td class="right">{ld['qty_str']}</td>
+                    <td class="right bold">{pcs_fmt}</td>
+                </tr>
+                """
+            tot_pcs_fmt = f"{c['Total Pcs']:,.0f}".replace(',', '.')
+            cards_html += f"""
+            <div class="card">
+                <div class="card-header">
+                    <div class="loc-badge">{c['Lokasi']}</div>
+                    <div class="prod-box">
+                        <div class="pn-text">{c['Part Number']}</div>
+                        <div class="prod-name">{c['Nama Produk']}</div>
+                    </div>
+                </div>
+                <table class="lot-table">
+                    <thead>
+                        <tr>
+                            <th style="width:6%;">#</th>
+                            <th style="width:26%;">Lot Number</th>
+                            <th style="width:18%;">Tgl Prod</th>
+                            <th style="width:14%;">Plt Ke</th>
+                            <th style="width:18%;">Qty Fisik</th>
+                            <th style="width:18%;">Total Pcs</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {rows_html}
+                    </tbody>
+                    <tfoot>
+                        <tr>
+                            <td colspan="4" class="right bold">TOTAL ITEM DI RAK INI:</td>
+                            <td class="right bold">{c['Total Fisik']}</td>
+                            <td class="right bold total-pcs">{tot_pcs_fmt} Pcs</td>
+                        </tr>
+                    </tfoot>
+                </table>
+                <div class="card-footer">
+                    <span>{c['Area']} | {waktu_cetak}</span>
+                    <span>Operator: ______________</span>
+                </div>
+            </div>
+            """
+
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+    <meta charset="utf-8">
+    <style>
+        body {{
+            font-family: 'Segoe UI', Arial, sans-serif;
+            margin: 0;
+            padding: 12px;
+            background: #f1f5f9;
+            color: #0f172a;
+        }}
+        .toolbar {{
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            background: #1e293b;
+            color: white;
+            padding: 10px 16px;
+            border-radius: 8px;
+            margin-bottom: 14px;
+        }}
+        .toolbar-title {{
+            font-size: 14px;
+            font-weight: 700;
+        }}
+        .print-btn {{
+            background: #2563eb;
+            color: white;
+            border: none;
+            padding: 8px 18px;
+            font-size: 14px;
+            font-weight: 700;
+            border-radius: 6px;
+            cursor: pointer;
+        }}
+        .print-btn:hover {{ background: #1d4ed8; }}
+        .grid-cards {{
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+        }}
+        .card {{
+            background: white;
+            border: 2px solid #0f172a;
+            border-radius: 6px;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            page-break-inside: avoid;
+            break-inside: avoid;
+        }}
+        .empty-card {{
+            border: 2px dashed #94a3b8;
+            background: #f8fafc;
+        }}
+        .card-header {{
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            border-bottom: 2px solid #0f172a;
+            padding-bottom: 8px;
+            margin-bottom: 8px;
+        }}
+        .loc-badge {{
+            background: #0f172a;
+            color: white;
+            font-size: 22px;
+            font-weight: 900;
+            padding: 6px 12px;
+            border-radius: 4px;
+            min-width: 64px;
+            text-align: center;
+            letter-spacing: 0.5px;
+        }}
+        .prod-box {{
+            flex: 1;
+            overflow: hidden;
+        }}
+        .pn-text {{
+            font-size: 13px;
+            font-weight: 800;
+            color: #1d4ed8;
+        }}
+        .prod-name {{
+            font-size: 13px;
+            font-weight: 700;
+            color: #0f172a;
+            line-height: 1.25;
+        }}
+        .area-tag {{
+            font-size: 12px;
+            font-weight: 700;
+            color: #475569;
+        }}
+        .lot-table {{
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11px;
+            margin-bottom: 8px;
+        }}
+        .lot-table th, .lot-table td {{
+            border: 1px solid #cbd5e1;
+            padding: 4px 5px;
+        }}
+        .lot-table th {{
+            background: #e2e8f0;
+            font-weight: 800;
+            text-align: center;
+        }}
+        .lot-table tfoot td {{
+            background: #f8fafc;
+            border-top: 2px solid #0f172a;
+            font-size: 11.5px;
+        }}
+        .total-pcs {{ color: #1d4ed8; }}
+        .cat-warn {{
+            font-size: 9.5px;
+            color: #b91c1c;
+            font-weight: 700;
+        }}
+        .center {{ text-align: center; }}
+        .right {{ text-align: right; }}
+        .bold {{ font-weight: 700; }}
+        .empty-body {{
+            text-align: center;
+            padding: 24px 0;
+            color: #64748b;
+        }}
+        .empty-title {{ font-size: 18px; font-weight: 900; }}
+        .empty-sub {{ font-size: 12px; }}
+        .card-footer {{
+            display: flex;
+            justify-content: space-between;
+            font-size: 10.5px;
+            color: #475569;
+            border-top: 1px solid #cbd5e1;
+            padding-top: 5px;
+        }}
+        @media print {{
+            body {{ background: white; padding: 0; }}
+            .toolbar {{ display: none !important; }}
+            .grid-cards {{ gap: 8px; }}
+        }}
+    </style>
+    </head>
+    <body>
+        <div class="toolbar">
+            <div class="toolbar-title">🖨️ {judul_dok} ({len(cards)} Kartu)</div>
+            <button class="print-btn" onclick="window.print()">🖨️ Cetak Kartu Sekarang</button>
+        </div>
+        <div class="grid-cards">
+            {cards_html}
+        </div>
+    </body>
+    </html>
+    """
 
 # ==========================================================
 # 4. SIDEBAR & PENGATURAN
@@ -191,7 +544,6 @@ if tipe_cari in ["Berdasarkan Produk", "Berdasarkan Part Number"]:
         st.markdown(f"### 🔎 Lokasi Pengambilan **{search_query}** (Urutan FIFO)")
         
         q_clean = search_query.strip().lower()
-        # Pastikan hanya memproses rak A-G
         df_search = df[
             (df[search_col].astype(str).str.strip().str.lower() == q_clean) &
             (df['Kolom'].isin(['A', 'B', 'C', 'D', 'E', 'F', 'G']))
@@ -304,7 +656,6 @@ def process_matrix_data(df, search_term, search_lot_term, prod_col):
     term_clean = search_term.strip().lower() if search_term else ""
     lot_term_clean = search_lot_term.strip().lower() if search_lot_term else ""
 
-    # Kelompokkan sekali di awal agar tidak memfilter berulang 176 kali
     grouped_racks = dict(tuple(df.groupby(['Kolom', 'Baris'])))
 
     for k in kolom_list:
@@ -387,7 +738,7 @@ if bayangan_data:
     st.sidebar.download_button(
         label="📥 Unduh Daftar Pallet Bayangan", 
         data=csv, 
-        file_name=f"Cek_Lapangan_Overlimit_{(datetime.utcnow() + timedelta(hours=7)).strftime('%Y%m%d_%H%M')}.csv", 
+        file_name=f"Cek_Lapangan_Overlimit_{get_waktu_jkt().strftime('%Y%m%d_%H%M')}.csv", 
         mime="text/csv", 
         type="primary"
     )
@@ -395,7 +746,7 @@ else:
     st.sidebar.success("✅ Seluruh rak dalam batas kapasitas normal.")
 
 # ==========================================================
-# 7. POP-UP DETAIL RAK
+# 7. POP-UP DETAIL RAK (+ CETAK KARTU CEPAT)
 # ==========================================================
 @st.dialog("📦 Rincian Detail Rak", width="large")
 def show_rack_detail(k, b, info):
@@ -474,6 +825,13 @@ def show_rack_detail(k, b, info):
         st.dataframe(df_tampil.style.apply(highlight_bayangan, axis=1), use_container_width=True, hide_index=True)
     else:
         st.success("✅ Rak Kosong. Aman untuk diisi.")
+
+    # Pratinjau & Cetak Kartu Racking langsung untuk lokasi ini
+    st.divider()
+    with st.expander(f"🖨️ Cetak Kartu Racking Rak {k}-{b} ({max(1, info['sku_cnt'])} Kartu)"):
+        kartu_single = build_picking_cards(k, b, info['df_sub'], product_col)
+        html_single = render_print_html(kartu_single, f"Kartu Racking {k}-{b}", get_waktu_jkt().strftime("%d-%m-%Y %H:%M WIB"))
+        components.html(html_single, height=380, scrolling=True)
 
 # ==========================================================
 # 8. RENDER METRIK, CHART, & GRID UI
@@ -717,3 +1075,155 @@ if saran_list:
     st.dataframe(df_saran, use_container_width=True, hide_index=True)
 else:
     st.info("📌 Belum ada kombinasi subsidi silang yang memenuhi kriteria bongkar-gabung pada area depan saat ini.")
+
+# ==========================================================
+# 11. CETAK KARTU RACKING / PICKING LIST (1 KARTU PER ITEM)
+# ==========================================================
+st.divider()
+st.markdown("### 🖨️ Cetak Kartu Racking / Petunjuk Pengambilan (A-1 s/d G-28)")
+st.caption("0 Kuota Firebase tambahan: kartu disusun langsung dari cache memori aktif. 1 kartu mewakili 1 Part Number (memuat seluruh Lot sejenis di rak tersebut).")
+
+KOLOM_URUT_AG = ['A', 'B', 'C', 'D', 'E', 'F', 'G']
+daftar_semua_lokasi = [
+    f"{k}-{b}"
+    for b in range(1, 29)
+    for k in KOLOM_URUT_AG
+    if is_rack_exist(k, b)
+]
+
+mode_cetak = st.radio(
+    "Pilih Mode Cetak:",
+    ["🎯 Lokasi Spesifik (Pilih / Ketik Bebas)", "📑 Rentang Massal (Per Kolom & Baris)"],
+    horizontal=True,
+    key="print_mode_radio"
+)
+
+target_lokasi_list = []
+
+if mode_cetak.startswith("🎯"):
+    sp_c1, sp_c2 = st.columns([2, 1])
+    with sp_c1:
+        pilih_lokasi_multi = st.multiselect(
+            "Pilih Satu atau Beberapa Lokasi Rak:",
+            options=daftar_semua_lokasi,
+            placeholder="Contoh: A-1, B-2, E-14...",
+            key="print_multi_loc"
+        )
+    with sp_c2:
+        ketik_lokasi_manual = st.text_input(
+            "Atau Ketik Cepat (pisah koma/spasi):",
+            placeholder="Cth: A-1, 5C, E-14",
+            key="print_manual_loc"
+        )
+
+    seen_loc = set()
+    for loc in pilih_lokasi_multi:
+        if loc not in seen_loc:
+            target_lokasi_list.append(loc)
+            seen_loc.add(loc)
+
+    if ketik_lokasi_manual and ketik_lokasi_manual.strip():
+        tokens = re.split(r'[\s,;]+', ketik_lokasi_manual.strip().upper())
+        for tok in tokens:
+            if not tok:
+                continue
+            # Mendukung input format A-1, A1, maupun 1A
+            m1 = re.fullmatch(r'([A-G])-?(\d{1,2})', tok)
+            m2 = re.fullmatch(r'(\d{1,2})-?([A-G])', tok)
+            k_parsed, b_parsed = None, None
+            if m1:
+                k_parsed, b_parsed = m1.group(1), int(m1.group(2))
+            elif m2:
+                b_parsed, k_parsed = int(m2.group(1)), m2.group(2)
+
+            if k_parsed and b_parsed and 1 <= b_parsed <= 28 and is_rack_exist(k_parsed, b_parsed):
+                norm_loc = f"{k_parsed}-{b_parsed}"
+                if norm_loc not in seen_loc:
+                    target_lokasi_list.append(norm_loc)
+                    seen_loc.add(norm_loc)
+            else:
+                st.warning(f"⚠️ Lokasi '{tok}' tidak valid atau tidak tersedia secara fisik (cek batas F5-F28 & G17-G28).")
+else:
+    p_col1, p_col2, p_col3, p_col4 = st.columns([2, 1, 1, 2])
+    with p_col1:
+        pilih_kolom_cetak = st.multiselect(
+            "Pilih Kolom Racking",
+            options=KOLOM_URUT_AG,
+            default=KOLOM_URUT_AG,
+            key="print_kolom_sel"
+        )
+    with p_col2:
+        baris_awal_cetak = st.number_input("Dari Baris", min_value=1, max_value=28, value=1, key="print_b_start")
+    with p_col3:
+        baris_akhir_cetak = st.number_input("Sampai Baris", min_value=1, max_value=28, value=28, key="print_b_end")
+    with p_col4:
+        mode_urutan = st.selectbox(
+            "Urutan Cetak",
+            ["Per Baris (A-1, B-1 ... G-28)", "Per Kolom (A-1, A-2 ... G-28)"],
+            key="print_sort_mode"
+        )
+
+    if pilih_kolom_cetak and baris_awal_cetak <= baris_akhir_cetak:
+        kolom_terurut = [k for k in KOLOM_URUT_AG if k in pilih_kolom_cetak]
+        rentang_baris = range(int(baris_awal_cetak), int(baris_akhir_cetak) + 1)
+        if mode_urutan.startswith("Per Baris"):
+            target_lokasi_list = [f"{k}-{b}" for b in rentang_baris for k in kolom_terurut if is_rack_exist(k, b)]
+        else:
+            target_lokasi_list = [f"{k}-{b}" for k in kolom_terurut for b in rentang_baris if is_rack_exist(k, b)]
+    elif baris_awal_cetak > baris_akhir_cetak:
+        st.error("❌ 'Dari Baris' tidak boleh lebih besar dari 'Sampai Baris'.")
+
+sertakan_kosong = st.checkbox("Sertakan kartu untuk rak kosong", value=False, key="print_include_empty")
+
+if target_lokasi_list:
+    semua_kartu = []
+    for loc in target_lokasi_list:
+        k_id, b_str = loc.split('-')
+        b_num = int(b_str)
+        info_rak = matrix_info.get((k_id, b_num), {})
+        if info_rak.get('exist'):
+            kartu_rak = build_picking_cards(k_id, b_num, info_rak['df_sub'], product_col)
+            for krt in kartu_rak:
+                if krt['Is_Empty'] and not sertakan_kosong:
+                    continue
+                semua_kartu.append(krt)
+
+    if semua_kartu:
+        info_c1, info_c2 = st.columns([2, 1])
+        with info_c1:
+            jml_isi = sum(1 for c in semua_kartu if not c['Is_Empty'])
+            jml_kosong = sum(1 for c in semua_kartu if c['Is_Empty'])
+            st.success(f"✅ Siap Cetak: **{len(semua_kartu)} Kartu Item** dari **{len(target_lokasi_list)} Lokasi** ({jml_isi} Kartu Terisi, {jml_kosong} Kartu Kosong).")
+        with info_c2:
+            csv_rows = []
+            for c in semua_kartu:
+                if c['Is_Empty']:
+                    csv_rows.append({
+                        'Lokasi': c['Lokasi'], 'Part Number': '-', 'Nama Produk': 'RAK KOSONG',
+                        'Lot Number': '-', 'Range Pallet Ke': '-', 'Qty Fisik': '0', 'Total Pcs': 0
+                    })
+                else:
+                    for ld in c['Detail Lot']:
+                        csv_rows.append({
+                            'Lokasi': c['Lokasi'], 'Part Number': c['Part Number'], 'Nama Produk': c['Nama Produk'],
+                            'Lot Number': ld['lot'], 'Range Pallet Ke': ld['pallet_range'],
+                            'Qty Fisik': ld['qty_str'], 'Total Pcs': ld['pcs']
+                        })
+            df_print_csv = pd.DataFrame(csv_rows)
+            csv_print_buf = io.StringIO()
+            df_print_csv.to_csv(csv_print_buf, index=False, sep=";")
+            st.download_button(
+                label="⬇️ Unduh Data Kartu (CSV)",
+                data=csv_print_buf.getvalue(),
+                file_name=f"Kartu_Racking_{get_waktu_jkt().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+        ringkasan_judul = ", ".join(target_lokasi_list[:6]) + (f" (+{len(target_lokasi_list)-6} lainnya)" if len(target_lokasi_list) > 6 else "")
+        judul_dok = f"Kartu Racking: {ringkasan_judul}"
+        waktu_skrg = get_waktu_jkt().strftime("%d-%m-%Y %H:%M WIB")
+        html_cetak = render_print_html(semua_kartu, judul_dok, waktu_skrg)
+        components.html(html_cetak, height=650, scrolling=True)
+    else:
+        st.info("ℹ️ Seluruh lokasi yang dipilih sedang kosong (centang 'Sertakan kartu untuk rak kosong' jika tetap ingin mencetak kartu kosong).")
