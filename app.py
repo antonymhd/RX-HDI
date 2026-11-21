@@ -971,7 +971,6 @@ def group_by_block(rack_list):
     return res
 
 list_merah, list_kuning, list_hijau, list_abu = [], [], [], []
-rack_profiles = {}
 
 for k in kolom_list:
     for b in baris_list:
@@ -984,20 +983,6 @@ for k in kolom_list:
             elif sku == 2: list_kuning.append(lokasi)
             elif sku == 1: list_hijau.append(lokasi)
             elif sku == 0: list_abu.append(lokasi)
-            
-            df_sub = info['df_sub']
-            pallets_data = []
-            if 'Part Number' in df_sub.columns:
-                valid_df = df_sub[~df_sub['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])]
-                for _, row in valid_df.iterrows():
-                    pn = str(row['Part Number']).strip().upper()
-                    prod = str(row.get(product_col, pn)).strip()
-                    lot = str(row.get('Lot Number', '')).strip()
-                    pallet_ke = int(row.get('Pallet Ke', 0))
-                    lot_date = parse_lot_date(lot)
-                    pallets_data.append({'part_number': pn, 'name': prod, 'lot': lot, 'pallet_ke': pallet_ke, 'lot_date': lot_date})
-                    
-            rack_profiles[(k, b)] = {'sku_cnt': sku, 'usable': info['usable_space'], 'pallets': pallets_data}
 
 st.markdown("### 📋 Daftar Lokasi Berdasarkan Status Rak (Dikelompokkan per Blok)")
 
@@ -1016,68 +1001,7 @@ with col_list4:
     st.markdown(f"<div style='background-color: #fef2f2; padding: 10px; border-radius: 6px; font-size: 13px; color: #991b1b; border: 1px solid #fecaca;'>{group_by_block(list_merah)}</div>", unsafe_allow_html=True)
 
 # ==========================================================
-# 10. SARAN RELOKASI: SUBSIDI SILANG (BONGKAR DEPAN)
-# ==========================================================
-st.divider()
-st.markdown("### 💡 Strategi Subsidi Silang (Optimalisasi Outbound)")
-st.caption("Kondisi: Gudang penuh. Tim Outbound luang. \n**Logika:** Tim Outbound membongkar item penghalang di **depan Rak Tujuan**, sehingga tercipta ruang untuk memasukkan item yang sama dari **depan Rak Asal** agar menyatu.")
-
-saran_list = []
-rak_campur = {loc: prof for loc, prof in rack_profiles.items() if prof['sku_cnt'] >= 2}
-
-for r_loc, r_prof in rak_campur.items():
-    if not r_prof['pallets']: continue
-    min_pallet_asal = min(p['pallet_ke'] for p in r_prof['pallets'])
-    kandidat_depan = [p for p in r_prof['pallets'] if p['pallet_ke'] == min_pallet_asal]
-    if not kandidat_depan: continue
-    
-    item_depan_asal = sorted(kandidat_depan, key=lambda x: x['lot_date'])[0]
-    pn_target = item_depan_asal['part_number']
-    nama_target = item_depan_asal['name']
-    qty_asal = len([p for p in r_prof['pallets'] if p['part_number'] == pn_target])
-    
-    for d_loc, d_prof in rak_campur.items():
-        if r_loc == d_loc: continue
-        dest_pns = [p['part_number'] for p in d_prof['pallets']]
-        if pn_target in dest_pns:
-            min_pallet_tujuan = min(p['pallet_ke'] for p in d_prof['pallets'])
-            kandidat_tujuan = [p for p in d_prof['pallets'] if p['pallet_ke'] == min_pallet_tujuan]
-            if not kandidat_tujuan: continue
-            
-            item_depan_tujuan = sorted(kandidat_tujuan, key=lambda x: x['lot_date'])[0]
-            pn_penghalang = item_depan_tujuan['part_number']
-            
-            if pn_penghalang != pn_target:
-                nama_penghalang = item_depan_tujuan['name']
-                qty_penghalang = len([p for p in d_prof['pallets'] if p['part_number'] == pn_penghalang])
-                estimasi_space = d_prof['usable'] + qty_penghalang
-                
-                if estimasi_space >= qty_asal:
-                    saran_list.append({
-                        'Rak Asal': f"{r_loc[0]}-{r_loc[1]}",
-                        'Item Pindah (Tarik dr Depan)': f"{nama_target} ({qty_asal} Plt)",
-                        'Rak Tujuan (Bongkar)': f"{d_loc[0]}-{d_loc[1]}",
-                        'Item Penghalang (Kirim Transit)': f"{nama_penghalang} ({qty_penghalang} Plt)",
-                        'Instruksi Eksekusi Lapangan': f"Tarik '{nama_penghalang}' dari {d_loc[0]}-{d_loc[1]}. Masukkan '{nama_target}' dari {r_loc[0]}-{r_loc[1]} ke {d_loc[0]}-{d_loc[1]}.",
-                        'Skor': r_prof['sku_cnt'] + d_prof['sku_cnt']
-                    })
-
-if saran_list:
-    seen_combo = set()
-    unique_saran = []
-    for s in sorted(saran_list, key=lambda x: x['Skor'], reverse=True):
-        combo_key = f"{s['Rak Asal']}-{s['Rak Tujuan (Bongkar)']}"
-        if combo_key not in seen_combo:
-            seen_combo.add(combo_key)
-            unique_saran.append(s)
-            
-    df_saran = pd.DataFrame(unique_saran[:15]).drop(columns=['Skor'])
-    st.dataframe(df_saran, use_container_width=True, hide_index=True)
-else:
-    st.info("📌 Belum ada kombinasi subsidi silang yang memenuhi kriteria bongkar-gabung pada area depan saat ini.")
-
-# ==========================================================
-# 11. CETAK KARTU RACKING / PICKING LIST (1 KARTU PER ITEM)
+# 10. CETAK KARTU RACKING / PICKING LIST (1 KARTU PER ITEM)
 # ==========================================================
 st.divider()
 st.markdown("### 🖨️ Cetak Kartu Racking / Petunjuk Pengambilan (A-1 s/d G-28)")
@@ -1127,7 +1051,6 @@ if mode_cetak.startswith("🎯"):
         for tok in tokens:
             if not tok:
                 continue
-            # Mendukung input format A-1, A1, maupun 1A
             m1 = re.fullmatch(r'([A-G])-?(\d{1,2})', tok)
             m2 = re.fullmatch(r'(\d{1,2})-?([A-G])', tok)
             k_parsed, b_parsed = None, None
