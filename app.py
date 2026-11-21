@@ -79,19 +79,23 @@ def load_master_produk():
 df_master_global = load_master_produk()
 master_dict = {}
 if not df_master_global.empty and 'Part Number Clean' in df_master_global.columns:
+    # Deteksi kolom kategori tambahan di Master_Produk.csv jika tersedia
+    kat_cols = [c for c in df_master_global.columns if any(k in c.lower() for k in ['kategori', 'jenis', 'group', 'tipe', 'nama'])]
     for _, row in df_master_global.iterrows():
         pn = row['Part Number Clean']
         ip = pd.to_numeric(row.get('Isi 1 Pallet (pcs)', 0), errors='coerce')
         pb = pd.to_numeric(row.get('Box / Pallet', 0), errors='coerce')
         ps = pd.to_numeric(row.get('Sac / Pallet', 0), errors='coerce')
+        meta_text = " ".join([str(row.get(c, '')) for c in kat_cols if pd.notna(row.get(c, ''))]).upper()
         master_dict[pn] = {
             'ip': 0 if pd.isna(ip) else float(ip),
             'pb': 0 if pd.isna(pb) else float(pb),
-            'ps': 0 if pd.isna(ps) else float(ps)
+            'ps': 0 if pd.isna(ps) else float(ps),
+            'meta': meta_text
         }
 
 # ==========================================================
-# FUNGSI HELPER & GENERATOR KARTU RACKING
+# FUNGSI HELPER & KLASIFIKASI PRODUK
 # ==========================================================
 def get_waktu_jkt():
     return datetime.utcnow() + timedelta(hours=7)
@@ -143,6 +147,82 @@ def hitung_pcs_baris(row_ket, part_num):
     
     return (jml_utuh * master_info['ip']) + (val_pecahan * pss) + val_eceran
 
+def klasifikasi_kategori_palet(part_num, nama_produk, baris=0):
+    """
+    Mengklasifikasikan 1 palet terisi ke dalam 4 kategori utama:
+    - All Preform
+    - Cup Printing
+    - Cup Natural (keluarkan Mountea 2.9gr & 3.1gr)
+    - Cup Color (tambahkan Mountea 2.9gr & 3.1gr)
+    """
+    pn = str(part_num).strip().upper()
+    prod = str(nama_produk).strip().upper()
+    meta = master_dict.get(pn, {}).get('meta', '')
+    combined = f"{pn} {prod} {meta}"
+
+    # 1. Aturan Khusus Mountea 2.9gr & 3.1gr -> Masuk Cup Color
+    if "MOUNTEA" in combined and re.search(r'2[.,]9|3[.,]1', combined):
+        return "Cup Color"
+
+    # 2. All Preform
+    if "PREFORM" in combined or "PFM" in combined or (1 <= int(baris) <= 16 and "CUP" not in combined):
+        return "All Preform"
+
+    # 3. Cup Printing
+    if "PRINTING" in combined or "PRINT" in combined or "PRT" in combined:
+        return "Cup Printing"
+
+    # 4. Cup Color (berdasarkan kata kunci warna)
+    warna_keywords = [
+        "COLOR", "COLOUR", "MERAH", "BIRU", "HIJAU", "KUNING", 
+        "COKLAT", "COKELAT", "PUTIH", "HITAM", "ORANGE", "UNGU", 
+        "PINK", "GOLD", "SILVER", "TOSCA", "MAROON", "RED", "BLUE", "GREEN", "YELLOW"
+    ]
+    if any(re.search(rf'\b{w}\b', combined) for w in warna_keywords):
+        return "Cup Color"
+
+    # 5. Cup Natural (default untuk Cup non-printing & non-color)
+    return "Cup Natural"
+
+@st.cache_data(ttl=300)
+def hitung_distribusi_produk_palet(df, prod_col, kapasitas_total=6548):
+    if df.empty or 'Part Number' not in df.columns:
+        return pd.DataFrame({
+            'Kategori': ['Free Space'],
+            'Jumlah Palet': [kapasitas_total]
+        }), 0
+
+    valid_mask = ~df['Part Number'].astype(str).str.strip().str.lower().isin(["", "nan", "none", "<na>"])
+    df_valid = df[valid_mask].copy()
+    total_terisi = len(df_valid)
+
+    if total_terisi == 0:
+        return pd.DataFrame({
+            'Kategori': ['Free Space'],
+            'Jumlah Palet': [kapasitas_total]
+        }), 0
+
+    kategori_series = [
+        klasifikasi_kategori_palet(
+            row.get('Part Number', ''),
+            row.get(prod_col, '') if prod_col in df_valid.columns else '',
+            row.get('Baris', 0)
+        )
+        for _, row in df_valid.iterrows()
+    ]
+
+    counts = pd.Series(kategori_series).value_counts().to_dict()
+    free_space = max(0, kapasitas_total - total_terisi)
+
+    urutan_label = ['All Preform', 'Cup Printing', 'Cup Natural', 'Cup Color', 'Free Space']
+    data_pie = []
+    for lbl in urutan_label:
+        val = free_space if lbl == 'Free Space' else counts.get(lbl, 0)
+        if val > 0:
+            data_pie.append({'Kategori': lbl, 'Jumlah Palet': int(val)})
+
+    return pd.DataFrame(data_pie), total_terisi
+
 def build_picking_cards(kolom, baris, df_sub, prod_col):
     """
     Menyusun kartu racking: 1 kartu per Part Number (item sejenis).
@@ -170,7 +250,6 @@ def build_picking_cards(kolom, baris, df_sub, prod_col):
     if 'Pallet Ke' in valid_df.columns:
         valid_df = valid_df.sort_values(by='Pallet Ke', ascending=True)
 
-    # Urutkan kemunculan Part Number berdasarkan posisi terdepan (Pallet Ke terkecil)
     pn_order = valid_df.groupby('PN_Clean')['Pallet Ke'].min().sort_values().index.tolist()
     cards = []
 
@@ -826,7 +905,6 @@ def show_rack_detail(k, b, info):
     else:
         st.success("✅ Rak Kosong. Aman untuk diisi.")
 
-    # Pratinjau & Cetak Kartu Racking langsung untuk lokasi ini
     st.divider()
     with st.expander(f"🖨️ Cetak Kartu Racking Rak {k}-{b} ({max(1, info['sku_cnt'])} Kartu)"):
         kartu_single = build_picking_cards(k, b, info['df_sub'], product_col)
@@ -834,7 +912,7 @@ def show_rack_detail(k, b, info):
         components.html(html_single, height=380, scrolling=True)
 
 # ==========================================================
-# 8. RENDER METRIK, CHART, & GRID UI
+# 8. RENDER METRIK, DUAL PIE CHART, & GRID UI
 # ==========================================================
 col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
 total_baris_hitung = total_ideal + total_warning + total_critical + total_kosong
@@ -845,10 +923,12 @@ col_m3.metric("🟡 Rak Campur (2 SKU)", f"{total_warning} Baris", f"{total_slot
 col_m4.metric("🔴 Rak Kritis (>= 3 SKU)", f"{total_critical} Baris", "Hindari Inbound", delta_color="off")
 col_m5.metric("⚪ Rak Kosong Bersih", f"{total_kosong} Baris")
 
-# --- DONUT CHART ---
+# --- DUAL CHART SEJAJAR: STATUS RAK vs KOMPOSISI PRODUK & FREE SPACE ---
 st.write("")
-col_chart1, col_chart2, col_chart3 = st.columns([1, 2, 1])
-with col_chart2:
+col_chart_kiri, col_chart_kanan = st.columns(2)
+
+with col_chart_kiri:
+    st.markdown("<div style='text-align:center; font-weight:800; font-size:15px; color:#334155;'>📊 Proporsi Status Baris Rak</div>", unsafe_allow_html=True)
     df_pie = pd.DataFrame({
         'Status': ['🟢 Ideal', '🟡 Campur', '🔴 Kritis', '⚪ Kosong'],
         'Jumlah': [total_ideal, total_warning, total_critical, total_kosong]
@@ -861,7 +941,7 @@ with col_chart2:
         '⚪ Kosong': 'gainsboro'
     }
 
-    fig = px.pie(
+    fig_status = px.pie(
         df_pie, 
         values='Jumlah', 
         names='Status', 
@@ -870,23 +950,67 @@ with col_chart2:
         hole=0.4
     )
     
-    fig.update_traces(
+    fig_status.update_traces(
         textposition='inside', 
         textinfo='percent+label',
         hovertemplate="<b>%{label}</b><br>Jumlah: %{value} Rak<br>Persentase: %{percent}<extra></extra>",
-        textfont_size=14, 
+        textfont_size=13, 
         textfont_color='black'
     )
     
-    fig.update_layout(
-        margin=dict(t=20, b=20, l=0, r=0), 
-        height=280, 
+    fig_status.update_layout(
+        margin=dict(t=15, b=15, l=10, r=10), 
+        height=300, 
         showlegend=False,
         plot_bgcolor='rgba(0,0,0,0)', 
         paper_bgcolor='rgba(0,0,0,0)'
     )
+    st.plotly_chart(fig_status, use_container_width=True)
 
-    st.plotly_chart(fig, use_container_width=True)
+with col_chart_kanan:
+    KAPASITAS_IDEAL_TOTAL = 6548
+    df_prod_pie, total_palet_terisi = hitung_distribusi_produk_palet(df, product_col, KAPASITAS_IDEAL_TOTAL)
+    st.markdown(
+        f"<div style='text-align:center; font-weight:800; font-size:15px; color:#334155;'>"
+        f"📦 Komposisi Palet Produk vs Free Space (Basis {KAPASITAS_IDEAL_TOTAL:,} Plt)"
+        f"</div>".replace(',', '.'), 
+        unsafe_allow_html=True
+    )
+
+    warna_produk = {
+        'All Preform': '#3b82f6',
+        'Cup Printing': '#f59e0b',
+        'Cup Natural': '#10b981',
+        'Cup Color': '#ec4899',
+        'Free Space': '#e2e8f0'
+    }
+
+    fig_prod = px.pie(
+        df_prod_pie,
+        values='Jumlah Palet',
+        names='Kategori',
+        color='Kategori',
+        color_discrete_map=warna_produk,
+        hole=0.4
+    )
+
+    fig_prod.update_traces(
+        textposition='inside',
+        textinfo='percent+label',
+        hovertemplate="<b>%{label}</b><br>Jumlah: %{value:,} Palet<br>Persentase: %{percent}<extra></extra>",
+        textfont_size=12,
+        textfont_color='black'
+    )
+
+    fig_prod.update_layout(
+        margin=dict(t=15, b=15, l=10, r=10),
+        height=300,
+        showlegend=True,
+        legend=dict(orientation="v", yanchor="middle", y=0.5, xanchor="left", x=1.0),
+        plot_bgcolor='rgba(0,0,0,0)',
+        paper_bgcolor='rgba(0,0,0,0)'
+    )
+    st.plotly_chart(fig_prod, use_container_width=True)
 
 st.divider()
 
