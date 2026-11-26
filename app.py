@@ -82,25 +82,38 @@ def load_log_inbound_shift_wib(tgl_operasional_str):
     - Shift 1: T 06:00:00 s/d T 13:59:59
     - Shift 2: T 14:00:00 s/d T 21:59:59
     - Shift 3: T 22:00:00 s/d (T+1) 05:59:59
-    Kompatibel dengan struktur field log_mutasi_rak WMS (baik format lama maupun baru).
     """
     tgl_dt = datetime.strptime(tgl_operasional_str, "%Y-%m-%d")
     start_wib = datetime.combine(tgl_dt.date(), time(6, 0, 0))
     end_wib = datetime.combine((tgl_dt + timedelta(days=1)).date(), time(6, 0, 0))
 
-    # Ambil dokumen terbaru (max 600 log terakhir) agar aman terhadap perbedaan nama/tipe field waktu di Firestore
-    docs = (
-        db.collection("log_mutasi_rak")
-        .order_by(firestore.FieldPath.document_id(), direction=firestore.Query.DESCENDING)
-        .limit(600)
-        .stream()
-    )
+    # Ambil log terbaru dengan fallback aman jika index field Timestamp berbeda
+    try:
+        docs = list(
+            db.collection("log_mutasi_rak")
+            .order_by("Timestamp", direction=firestore.Query.DESCENDING)
+            .limit(600)
+            .stream()
+        )
+    except Exception:
+        docs = []
+
+    if not docs:
+        try:
+            docs = list(
+                db.collection("log_mutasi_rak")
+                .order_by("__name__", direction=firestore.Query.DESCENDING)
+                .limit(600)
+                .stream()
+            )
+        except Exception:
+            docs = list(db.collection("log_mutasi_rak").limit(600).stream())
 
     rows = []
     for doc in docs:
         d = doc.to_dict() or {}
 
-        # 1. Cek Jenis Transaksi (dukung berbagai variasi nama field di log_mutasi_rak)
+        # 1. Cek Jenis Transaksi
         jenis = str(
             d.get("Jenis Transaksi")
             or d.get("Jenis_Mutasi")
@@ -110,11 +123,10 @@ def load_log_inbound_shift_wib(tgl_operasional_str):
         ).strip()
         jenis_up = jenis.upper()
 
-        # Ambil hanya INBOUND dan kecualikan PEMBATALAN / UNDO
         if "INBOUND" not in jenis_up or "UNDO" in jenis_up or "PEMBATALAN" in jenis_up:
             continue
 
-        # 2. Parse Waktu Transaksi (dukung String maupun Firestore Timestamp)
+        # 2. Parse Waktu Transaksi (String maupun Firestore Timestamp)
         ts_val = (
             d.get("Timestamp")
             or d.get("Waktu Transaksi")
@@ -124,7 +136,6 @@ def load_log_inbound_shift_wib(tgl_operasional_str):
         )
         ts_dt = None
         if hasattr(ts_val, "strftime"):
-            # Jika berupa objek datetime/Firestore Timestamp (UTC -> konversi ke WIB +7)
             if getattr(ts_val, "tzinfo", None) is not None:
                 ts_dt = (ts_val + timedelta(hours=7)).replace(tzinfo=None)
             else:
@@ -153,7 +164,7 @@ def load_log_inbound_shift_wib(tgl_operasional_str):
         else:
             shift_lbl = "Shift 3 (22:00–06:00)"
 
-        # 3. Ambil atribut produk & kuantitas (dukung skema field lama & skema field WMS terbaru)
+        # 3. Ambil atribut produk & kuantitas
         ket_str = str(d.get("Detail Sistem") or d.get("Keterangan") or "").strip()
         op_match = re.search(r'Op:\s*([^|]+)', ket_str)
         operator_nama = op_match.group(1).strip() if op_match else str(d.get("Operator") or d.get("User") or "-").strip()
@@ -900,7 +911,10 @@ def show_rack_detail(k, b, info):
             elif 'BOOKED' in cat: return ['background-color: #eff6ff; color: #1e3a8a; font-weight: bold; border-left: 4px solid #2563eb;'] * len(row)
             return [''] * len(row)
             
-        st.dataframe(df_tampil.style.apply(highlight_bayangan, axis=1), use_container_width=True, hide_index=True)
+        try:
+            st.dataframe(df_tampil.style.apply(highlight_bayangan, axis=1), use_container_width=True, hide_index=True)
+        except Exception:
+            st.dataframe(df_tampil, use_container_width=True, hide_index=True)
     else:
         st.success("✅ Rak Kosong. Aman untuk diisi.")
 
