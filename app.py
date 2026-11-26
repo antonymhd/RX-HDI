@@ -82,32 +82,67 @@ def load_log_inbound_shift_wib(tgl_operasional_str):
     - Shift 1: T 06:00:00 s/d T 13:59:59
     - Shift 2: T 14:00:00 s/d T 21:59:59
     - Shift 3: T 22:00:00 s/d (T+1) 05:59:59
+    Kompatibel dengan struktur field log_mutasi_rak WMS (baik format lama maupun baru).
     """
     tgl_dt = datetime.strptime(tgl_operasional_str, "%Y-%m-%d")
     start_wib = datetime.combine(tgl_dt.date(), time(6, 0, 0))
     end_wib = datetime.combine((tgl_dt + timedelta(days=1)).date(), time(6, 0, 0))
 
-    start_str = start_wib.strftime("%Y-%m-%d %H:%M:%S")
-    end_str = end_wib.strftime("%Y-%m-%d %H:%M:%S")
-
-    q = (
+    # Ambil dokumen terbaru (max 600 log terakhir) agar aman terhadap perbedaan nama/tipe field waktu di Firestore
+    docs = (
         db.collection("log_mutasi_rak")
-        .where("Timestamp", ">=", start_str)
-        .where("Timestamp", "<", end_str)
+        .order_by(firestore.FieldPath.document_id(), direction=firestore.Query.DESCENDING)
+        .limit(600)
         .stream()
     )
 
     rows = []
-    for doc in q:
+    for doc in docs:
         d = doc.to_dict() or {}
-        jenis = str(d.get("Jenis_Mutasi") or d.get("Jenis") or d.get("Aktivitas") or "").strip()
-        if "INBOUND" not in jenis.upper():
+
+        # 1. Cek Jenis Transaksi (dukung berbagai variasi nama field di log_mutasi_rak)
+        jenis = str(
+            d.get("Jenis Transaksi")
+            or d.get("Jenis_Mutasi")
+            or d.get("Jenis")
+            or d.get("Aktivitas")
+            or ""
+        ).strip()
+        jenis_up = jenis.upper()
+
+        # Ambil hanya INBOUND dan kecualikan PEMBATALAN / UNDO
+        if "INBOUND" not in jenis_up or "UNDO" in jenis_up or "PEMBATALAN" in jenis_up:
             continue
 
-        ts_raw = str(d.get("Timestamp", "")).strip()
-        try:
-            ts_dt = datetime.strptime(ts_raw[:19], "%Y-%m-%d %H:%M:%S")
-        except Exception:
+        # 2. Parse Waktu Transaksi (dukung String maupun Firestore Timestamp)
+        ts_val = (
+            d.get("Timestamp")
+            or d.get("Waktu Transaksi")
+            or d.get("timestamp")
+            or d.get("Waktu")
+            or ""
+        )
+        ts_dt = None
+        if hasattr(ts_val, "strftime"):
+            # Jika berupa objek datetime/Firestore Timestamp (UTC -> konversi ke WIB +7)
+            if getattr(ts_val, "tzinfo", None) is not None:
+                ts_dt = (ts_val + timedelta(hours=7)).replace(tzinfo=None)
+            else:
+                ts_dt = ts_val.replace(tzinfo=None)
+        else:
+            ts_raw = str(ts_val).strip()
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d-%m-%Y %H:%M:%S", "%Y/%m/%d %H:%M:%S"):
+                try:
+                    ts_dt = datetime.strptime(ts_raw[:19], fmt)
+                    break
+                except Exception:
+                    continue
+
+        if ts_dt is None:
+            continue
+
+        # Filter rentang shift operasional WIB (06:00 hari H s/d 05:59:59 hari H+1)
+        if not (start_wib <= ts_dt < end_wib):
             continue
 
         jam = ts_dt.hour
@@ -118,25 +153,33 @@ def load_log_inbound_shift_wib(tgl_operasional_str):
         else:
             shift_lbl = "Shift 3 (22:00–06:00)"
 
-        ket_str = str(d.get("Keterangan", "")).strip()
+        # 3. Ambil atribut produk & kuantitas (dukung skema field lama & skema field WMS terbaru)
+        ket_str = str(d.get("Detail Sistem") or d.get("Keterangan") or "").strip()
         op_match = re.search(r'Op:\s*([^|]+)', ket_str)
-        operator_nama = op_match.group(1).strip() if op_match else str(d.get("Operator", "-")).strip()
+        operator_nama = op_match.group(1).strip() if op_match else str(d.get("Operator") or d.get("User") or "-").strip()
 
         pn_val = str(d.get("Part Number") or d.get("Part_Number") or "-").strip().upper()
-        nm_val = str(d.get("Nama Barang") or d.get("Nama Produk") or d.get("Nama_Barang") or "-").strip()
-        lot_val = str(d.get("Lot Number") or d.get("Lot_Number") or "-").strip()
-        kol_val = str(d.get("Kolom", "-")).strip().upper()
-        bar_val = int(pd.to_numeric(d.get("Baris", 0), errors='coerce') or 0)
-        plt_val = int(pd.to_numeric(d.get("Pallet", 0), errors='coerce') or 0)
-        dus_val = int(pd.to_numeric(d.get("Dus", 0), errors='coerce') or 0)
-        pcs_val = int(pd.to_numeric(d.get("Total_Pcs", 0), errors='coerce') or 0)
+        nm_val = str(d.get("Nama Produk") or d.get("Nama Barang") or d.get("Nama_Barang") or "-").strip()
+        lot_val = str(d.get("No Lot") or d.get("Lot Number") or d.get("Lot_Number") or "-").strip()
+
+        lok_raw = str(d.get("Lokasi Rak") or "").strip().upper()
+        if lok_raw and "-" in lok_raw:
+            lokasi_rak = lok_raw
+        else:
+            kol_val = str(d.get("Kolom", "-")).strip().upper()
+            bar_val = int(pd.to_numeric(d.get("Baris", 0), errors='coerce') or 0)
+            lokasi_rak = f"{kol_val}-{bar_val}" if bar_val > 0 else kol_val
+
+        plt_val = int(pd.to_numeric(d.get("Mutasi Pallet") if "Mutasi Pallet" in d else d.get("Pallet", 0), errors='coerce') or 0)
+        dus_val = int(pd.to_numeric(d.get("Mutasi Pecahan (Dus/Sak)") if "Mutasi Pecahan (Dus/Sak)" in d else d.get("Dus", 0), errors='coerce') or 0)
+        pcs_val = int(pd.to_numeric(d.get("Total Pcs (Master Terbaru)") if "Total Pcs (Master Terbaru)" in d else d.get("Total_Pcs", 0), errors='coerce') or 0)
         satuan_val = "Dus" if pn_val.endswith(('D', 'G')) else "Sak"
 
         rows.append({
             "Waktu (WIB)": ts_dt.strftime("%Y-%m-%d %H:%M:%S"),
             "Shift": shift_lbl,
             "Jenis": jenis,
-            "Lokasi Rak": f"{kol_val}-{bar_val}" if bar_val > 0 else kol_val,
+            "Lokasi Rak": lokasi_rak,
             "Part Number": pn_val,
             "Nama Produk": nm_val,
             "Lot Number": lot_val,
